@@ -104,6 +104,7 @@ func (p *copilotAdapter) Info(_ context.Context, _ *v2.InfoRequest) (*v2.InfoRes
 		Name:      adapterName,
 		Version:   adapterVersion,
 		SourceUrl: "https://github.com/brokenbots/criteria-adapter-copilot",
+		Platforms: []string{"linux/amd64"},
 		Capabilities: []string{
 			"multi_turn",
 			"structured_events",
