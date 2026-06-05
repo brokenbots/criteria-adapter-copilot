@@ -101,8 +101,9 @@ type copilotAdapter struct {
 
 func (p *copilotAdapter) Info(_ context.Context, _ *v2.InfoRequest) (*v2.InfoResponse, error) {
 	return &v2.InfoResponse{
-		Name:    adapterName,
-		Version: adapterVersion,
+		Name:      adapterName,
+		Version:   adapterVersion,
+		SourceUrl: "https://github.com/brokenbots/criteria-adapter-copilot",
 		Capabilities: []string{
 			"multi_turn",
 			"structured_events",
