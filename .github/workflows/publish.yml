@@ -30,14 +30,15 @@ jobs:
           go-version-file: go.mod
 
       # Pure-Go adapter: cross-compile every supported platform from this one
-      # linux runner into a bin/<os>/<arch>/ tree. `criteria adapter publish`
-      # packages the whole tree into a single multi-platform OCI artifact.
+      # linux runner into artifact/bin/<os>/<arch>/. `criteria adapter publish`
+      # scans the bin/ tree under the directory it is given (artifact/) and
+      # packages all platforms into a single multi-platform OCI artifact.
       - name: Cross-build adapter binaries
         run: |
           set -euo pipefail
           for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             os="${platform%/*}"; arch="${platform#*/}"
-            outdir="bin/${os}/${arch}"
+            outdir="artifact/bin/${os}/${arch}"
             mkdir -p "$outdir"
             echo "building ${platform}"
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
@@ -59,6 +60,6 @@ jobs:
       - name: Publish
         uses: brokenbots/publish-adapter@v0
         with:
-          # Multi-platform bin tree (bin/<os>/<arch>/criteria-adapter-copilot).
-          binary: ${{ github.workspace }}/bin
+          # Directory containing the multi-platform bin/<os>/<arch>/ tree.
+          binary: ${{ github.workspace }}/artifact
           registry: ghcr.io/${{ github.repository_owner }}/criteria-adapter-copilot:${{ steps.ver.outputs.tag }}
