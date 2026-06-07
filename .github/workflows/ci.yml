@@ -22,17 +22,15 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
-  # WS49 — vulnerability gate (osv-scanner).
+  # WS49 — vulnerability gate (osv-scanner). BLOCKING.
   #
-  # Landed REPORT-ONLY: the initial scan is not clean — stdlib 1.26.3 carries
-  # GO-2026-5037 / GO-2026-5039 (fixed in 1.26.4), handed to the catch-up upgrade
-  # (WS51). Once that lands, the go directive moves to 1.26.4, the scan goes
-  # clean, and this job flips to blocking: drop `continue-on-error` and add
-  # `osv-scan` to the `all-checks` needs: list.
+  # The WS51 catch-up upgrade cleared the backlog (go directive -> 1.26.4 cleared
+  # GO-2026-5037 / GO-2026-5039), so this gate is now required (in all-checks). A
+  # PR introducing a dependency with a known OSV advisory fails CI until upgraded
+  # or time-boxed in osv-scanner.toml.
   osv-scan:
     name: Vulnerability scan (osv-scanner)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -62,17 +60,18 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Aggregate required check. osv-scan is intentionally NOT here yet (report-only
-  # per WS49); the WS51 upgrade adds it once the tree is clean.
+  # Aggregate required check. osv-scan is blocking as of WS51 (tree is clean).
   all-checks:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test]
+    needs: [build-test, osv-scan]
     if: always()
     steps:
       - name: Verify required jobs succeeded
         run: |
           if [ "${{ needs.build-test.result }}" != "success" ]; then
-            echo "build-test did not succeed"
-            exit 1
+            echo "build-test did not succeed"; exit 1
+          fi
+          if [ "${{ needs.osv-scan.result }}" != "success" ]; then
+            echo "osv-scan did not succeed"; exit 1
           fi
