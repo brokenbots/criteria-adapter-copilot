@@ -10,15 +10,69 @@ permissions:
 
 jobs:
   build-test:
+    name: Build & test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Build
-        run: go build ./...
-      - name: Vet
-        run: go vet ./...
-      - name: Test
-        run: go test ./...
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  # WS49 — vulnerability gate (osv-scanner).
+  #
+  # Landed REPORT-ONLY: the initial scan is not clean — stdlib 1.26.3 carries
+  # GO-2026-5037 / GO-2026-5039 (fixed in 1.26.4), handed to the catch-up upgrade
+  # (WS51). Once that lands, the go directive moves to 1.26.4, the scan goes
+  # clean, and this job flips to blocking: drop `continue-on-error` and add
+  # `osv-scan` to the `all-checks` needs: list.
+  osv-scan:
+    name: Vulnerability scan (osv-scanner)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run osv-scanner (pinned; local parity with `make vuln-scan`)
+        run: make vuln-scan
+
+  # WS50 — non-blocking dependency-freshness report. Surfaces drift on every PR
+  # without flaking the build; enforcement stays with review + catch-up upgrades.
+  deps-report:
+    name: Dependency freshness (report-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Report outdated direct deps
+        run: |
+          {
+            echo '### Outdated direct dependencies'
+            echo '```'
+            make deps-outdated || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Aggregate required check. osv-scan is intentionally NOT here yet (report-only
+  # per WS49); the WS51 upgrade adds it once the tree is clean.
+  all-checks:
+    name: All checks passed
+    runs-on: ubuntu-latest
+    needs: [build-test]
+    if: always()
+    steps:
+      - name: Verify required jobs succeeded
+        run: |
+          if [ "${{ needs.build-test.result }}" != "success" ]; then
+            echo "build-test did not succeed"
+            exit 1
+          fi
