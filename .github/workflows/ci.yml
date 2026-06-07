@@ -13,7 +13,7 @@ jobs:
     name: Build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -48,7 +48,7 @@ jobs:
     name: Dependency freshness (report-only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
