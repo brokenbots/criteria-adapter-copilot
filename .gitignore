@@ -1,3 +1,6 @@
 bin/
 *.test
 coverage.out
+
+# Built adapter binary (publish via CI; never commit)
+/criteria-adapter-copilot
