@@ -13,7 +13,7 @@ jobs:
     name: Build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -32,7 +32,7 @@ jobs:
     name: Vulnerability scan (osv-scanner)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -46,7 +46,7 @@ jobs:
     name: Dependency freshness (report-only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
