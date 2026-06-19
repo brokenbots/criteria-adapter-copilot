@@ -133,8 +133,9 @@ func (p *copilotAdapter) Info(_ context.Context, _ *v2.InfoRequest) (*v2.InfoRes
 			"reasoning_effort": {Type: "string", Description: "Per-step override for reasoning effort. Resets to the session default after this step. Valid: low, medium, high, xhigh."},
 		}},
 		// Declared so the host resolves these from the workflow's secret stack
-		// and delivers them over the secret channel (D69); copilot no longer
-		// reads the GitHub token from the process environment.
+		// and delivers them over the secret channel (D69). When supplied, an
+		// adapter secret is authoritative; when none is delivered, ensureClient
+		// falls back to Copilot's standard auth (env vars / credential caches).
 		Secrets: declaredGitHubTokenSecrets(),
 	}, nil
 }
@@ -228,27 +229,16 @@ func (p *copilotAdapter) ensureClient(ctx context.Context, secrets *adapterhost.
 		return p.client, nil
 	}
 
-	// The GitHub token must arrive over the secret channel (D69). Fail closed
-	// with a clear, actionable message rather than starting an unauthenticated
-	// client that fails later with a cryptic CLI error.
-	token := resolveGitHubToken(secrets)
-	if token == "" {
-		return nil, fmt.Errorf("copilot: no GitHub token delivered via the secret channel; "+
-			"supply one of %v in the adapter's secrets, e.g. "+
-			"adapter.copilot.default.secrets { GITHUB_TOKEN = ... }", githubTokenSecretNames)
-	}
-
 	cliPath := os.Getenv(defaultBinEnv)
 	if strings.TrimSpace(cliPath) == "" {
 		cliPath = defaultBin
 	}
 
 	options := &copilot.ClientOptions{
-		Connection:      copilot.StdioConnection{Path: cliPath},
-		LogLevel:        "info",
-		GitHubToken:     token,
-		UseLoggedInUser: copilot.Bool(false),
+		Connection: copilot.StdioConnection{Path: cliPath},
+		LogLevel:   "info",
 	}
+	applyAuthOptions(options, secrets)
 
 	client := copilot.NewClient(options)
 	if err := client.Start(ctx); err != nil {
@@ -276,10 +266,33 @@ func declaredGitHubTokenSecrets() map[string]string {
 	}
 }
 
+// applyAuthOptions configures the client's authentication on opts according to
+// the adapter's precedence:
+//
+//   - A token delivered over the secret channel (D69) is authoritative: it is
+//     set explicitly and auto-login is disabled so only that token is honored.
+//   - Otherwise the adapter falls back to Copilot's own standard auth
+//     mechanisms — environment variables (GH_TOKEN / GITHUB_TOKEN /
+//     COPILOT_SDK_AUTH_TOKEN) and local credential caches (gh CLI / stored OAuth
+//     via the logged-in user). The process environment is passed through so the
+//     runtime can read those vars; in a sandboxed adapter the env is scrubbed
+//     (D29/D32), so nothing leaks and auto-login simply finds no credentials.
+func applyAuthOptions(opts *copilot.ClientOptions, secrets *adapterhost.Secrets) {
+	if token := resolveGitHubToken(secrets); token != "" {
+		opts.GitHubToken = token
+		opts.UseLoggedInUser = copilot.Bool(false)
+		return
+	}
+	opts.UseLoggedInUser = copilot.Bool(true)
+	opts.Env = os.Environ()
+}
+
 // resolveGitHubToken returns the GitHub token from the secret channel, trying
 // the accepted names in precedence order. It never reads the process
-// environment: in a sandboxed adapter the env is scrubbed (D29/D32), so an env
-// fallback would silently lose auth (D69). Returns "" if none were delivered.
+// environment itself: an adapter-supplied secret is authoritative and takes
+// precedence (D69). Returns "" if none were delivered, in which case
+// [copilotAdapter.ensureClient] falls back to Copilot's own standard auth
+// (environment variables and local credential caches).
 func resolveGitHubToken(secrets *adapterhost.Secrets) string {
 	for _, name := range githubTokenSecretNames {
 		if token, ok := secrets.Get(name); ok {

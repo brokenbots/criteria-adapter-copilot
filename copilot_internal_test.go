@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -269,17 +270,45 @@ func TestResolveGitHubTokenIgnoresEnv(t *testing.T) {
 	}
 }
 
-// TestEnsureClientFailsClosedWithoutSecret verifies ensureClient returns a
-// clear missing-secret error (before any CLI is started) when no token was
-// delivered over the secret channel.
-func TestEnsureClientFailsClosedWithoutSecret(t *testing.T) {
+// TestApplyAuthOptionsSecretWins verifies that a token delivered over the
+// secret channel is authoritative: it is set explicitly, auto-login is
+// disabled, and the process environment is NOT passed through (the secret path
+// stays scrubbed).
+func TestApplyAuthOptionsSecretWins(t *testing.T) {
+	sec := adapterhost.NewSecrets(declaredGitHubTokenSecrets(), map[string]string{"GITHUB_TOKEN": "from-secret"})
+	opts := &copilot.ClientOptions{}
+	applyAuthOptions(opts, sec)
+
+	if opts.GitHubToken != "from-secret" {
+		t.Fatalf("GitHubToken = %q, want %q", opts.GitHubToken, "from-secret")
+	}
+	if opts.UseLoggedInUser == nil || *opts.UseLoggedInUser {
+		t.Fatalf("UseLoggedInUser = %v, want explicit false when a secret is supplied", opts.UseLoggedInUser)
+	}
+	if opts.Env != nil {
+		t.Fatalf("Env must not be passed through on the secret path; got %v", opts.Env)
+	}
+}
+
+// TestApplyAuthOptionsFallback verifies that when no token is delivered over
+// the secret channel, the adapter falls back to Copilot's standard auth: it
+// enables the logged-in user (gh CLI / stored OAuth credential caches) and
+// passes the process environment through so the runtime can read GH_TOKEN /
+// GITHUB_TOKEN / COPILOT_SDK_AUTH_TOKEN.
+func TestApplyAuthOptionsFallback(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "from-env") // present in env, absent from the channel
-	p := &copilotAdapter{}
 	sec := adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil)
-	if _, err := p.ensureClient(context.Background(), sec); err == nil {
-		t.Fatal("ensureClient must fail closed when no GitHub token is delivered")
-	} else if !strings.Contains(err.Error(), "secret channel") {
-		t.Fatalf("error should mention the secret channel; got %v", err)
+	opts := &copilot.ClientOptions{}
+	applyAuthOptions(opts, sec)
+
+	if opts.GitHubToken != "" {
+		t.Fatalf("GitHubToken must stay empty on the fallback path; got %q", opts.GitHubToken)
+	}
+	if opts.UseLoggedInUser == nil || !*opts.UseLoggedInUser {
+		t.Fatalf("UseLoggedInUser = %v, want explicit true to enable credential caches", opts.UseLoggedInUser)
+	}
+	if !slices.Contains(opts.Env, "GITHUB_TOKEN=from-env") {
+		t.Fatalf("Env must carry the process environment for the runtime to read; got %v", opts.Env)
 	}
 }
 

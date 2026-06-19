@@ -24,10 +24,10 @@ The compiled binary requires the GitHub Copilot CLI at runtime (`copilot` on
 
 ## Authentication (secret channel)
 
-The GitHub token is delivered over the Criteria **secret channel** (D69), never
-read from the process environment. The adapter declares `COPILOT_GITHUB_TOKEN`,
-`GH_TOKEN`, and `GITHUB_TOKEN` (precedence in that order) and **fails closed**
-with a clear error if none is supplied.
+The preferred way to authenticate is the Criteria **secret channel** (D69). The
+adapter declares `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, and `GITHUB_TOKEN`
+(precedence in that order); a token delivered over the channel is authoritative
+and disables Copilot's auto-login so only that token is used.
 
 ```hcl
 adapter "copilot" "default" {
@@ -36,6 +36,19 @@ adapter "copilot" "default" {
   }
 }
 ```
+
+When **no** secret is delivered over the channel, the adapter does not fail
+closed — it falls back to Copilot's standard authentication mechanisms:
+
+- **Environment variables** (`GH_TOKEN` / `GITHUB_TOKEN` /
+  `COPILOT_SDK_AUTH_TOKEN`) — the process environment is passed through to the
+  runtime.
+- **Local credential caches** — the logged-in user via `gh` CLI auth or stored
+  OAuth tokens.
+
+In a sandboxed adapter the environment is scrubbed (D29/D32), so nothing leaks
+and auto-login simply finds no credentials. Supply a secret to pin
+authentication explicitly.
 
 ## Setup (adapter configuration)
 
