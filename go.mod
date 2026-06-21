@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/brokenbots/criteria-adapter-proto v0.5.1
 	github.com/brokenbots/criteria-go-adapter-sdk v0.5.2
-	github.com/github/copilot-sdk/go v1.0.0
+	github.com/github/copilot-sdk/go v1.0.1
 	github.com/google/uuid v1.6.0
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
