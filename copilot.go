@@ -132,6 +132,16 @@ func (p *copilotAdapter) Info(_ context.Context, _ *v2.InfoRequest) (*v2.InfoRes
 			"max_turns":        {Type: "number", Description: "Per-step override for max assistant turns."},
 			"reasoning_effort": {Type: "string", Description: "Per-step override for reasoning effort. Resets to the session default after this step. Valid: low, medium, high, xhigh."},
 		}},
+		OutputSchema: &v2.AdapterSchemaProto{Fields: map[string]*v2.ConfigFieldProto{
+			// outcome is set by resultEvent in copilot_util.go for every terminal
+			// result, whether the model calls submit_outcome, the finalize loop
+			// exhausts, max_turns is reached, or a permission is denied.
+			"outcome": {Type: "string", Description: "Final step outcome reported by the adapter (e.g. success, failure, needs_review). Mirrors the step's ExecuteResult outcome."},
+			// reason is set by resultEvent in copilot_util.go. It is empty when
+			// the model did not supply one or the adapter imputed the outcome.
+			// The value can include user or repository content, so mark it sensitive.
+			"reason": {Type: "string", Sensitive: true, Description: "Optional human-readable explanation for the outcome. May contain user or repository content. Empty when no reason was supplied."},
+		}},
 		// Declared so the host resolves these from the workflow's secret stack
 		// and delivers them over the secret channel (D69). When supplied, an
 		// adapter secret is authoritative; when none is delivered, ensureClient

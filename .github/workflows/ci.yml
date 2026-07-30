@@ -24,10 +24,12 @@ jobs:
 
   # WS49 — vulnerability gate (osv-scanner). BLOCKING.
   #
-  # The go directive is on 1.26.4 (WS51 catch-up upgrade cleared GO-2026-5037 /
-  # GO-2026-5039), so the scan is clean and this job gates merges: a new advisory
-  # against any dependency fails CI until it is upgraded or explicitly deferred
-  # via an audited entry in osv-scanner.toml.
+  # The go directive is on 1.26.5 (WS51 catch-up upgrade cleared GO-2026-5037 /
+  # GO-2026-5039; declare-copilot-output-schema bumped grpc to 1.82.1 and the
+  # Go directive to 1.26.5 to clear GO-2026-6061 / GO-2026-5856), so the scan
+  # is clean and this job gates merges: a new advisory against any dependency
+  # fails CI until it is upgraded or explicitly deferred via an audited entry
+  # in osv-scanner.toml.
   osv-scan:
     name: Vulnerability scan (osv-scanner)
     runs-on: ubuntu-latest
