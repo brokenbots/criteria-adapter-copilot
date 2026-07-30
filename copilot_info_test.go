@@ -68,10 +68,11 @@ func TestInfo_OutputSchemaMatchesRuntimeOutputs(t *testing.T) {
 		}
 	}
 
-	// reason can contain user or repository content, so it must be marked
-	// sensitive for host redaction.
-	if !schema["reason"].GetSensitive() {
-		t.Errorf("schema[reason].Sensitive = false, want true")
+	// reason is agent-authored prose and is the adapter's primary human-readable
+	// output; it must NOT be marked sensitive so workflows can log it, feed it
+	// to prompts, and post it to review comments without taint errors.
+	if schema["reason"].GetSensitive() {
+		t.Errorf("schema[reason].Sensitive = true, want false")
 	}
 	// outcome is a controlled vocabulary token, not sensitive data.
 	if schema["outcome"].GetSensitive() {
@@ -139,8 +140,8 @@ func TestEmitManifest_OutputSchemaMatchesInfo(t *testing.T) {
 		if reason["description"] == "" {
 			t.Error("manifest reason.description is empty")
 		}
-		if s, _ := reason["sensitive"].(bool); !s {
-			t.Error("manifest reason.sensitive = false, want true")
+		if s, _ := reason["sensitive"].(bool); s {
+			t.Error("manifest reason.sensitive = true, want false")
 		}
 	} else {
 		t.Errorf("manifest reason field missing or malformed: %v", fields["reason"])

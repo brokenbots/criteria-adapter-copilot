@@ -68,14 +68,17 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 	s.finalizedOutcome = outcome
 	s.finalizedReason = trimmedReason
 	sink := s.sink
+	heldSecrets := s.heldSecrets
 	s.mu.Unlock()
 
 	// Forward an adapter event so operators see the finalize call in the event
-	// stream. Use the active sink captured in beginExecution.
+	// stream. Use the active sink captured in beginExecution. Redact any
+	// adapter-held secrets from the event payload as well as from the step
+	// output; this is best-effort hygiene, not a safety guarantee.
 	if sink != nil {
 		_ = sink.Send(adapterEvent("outcome.finalized", map[string]any{
 			"outcome": outcome,
-			"reason":  trimmedReason,
+			"reason":  redactSecrets(trimmedReason, heldSecrets),
 		}))
 	}
 
