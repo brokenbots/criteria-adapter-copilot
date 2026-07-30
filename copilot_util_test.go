@@ -3,6 +3,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -32,5 +33,52 @@ func TestAdapterEventEncodeErrorFallback(t *testing.T) {
 	}
 	if errField.GetStringValue() == "" {
 		t.Fatal("_encode_error must contain a non-empty error description")
+	}
+}
+
+// TestRedactSecrets_ReplacesHeldSecrets verifies that every non-empty secret is
+// replaced with a visible placeholder, including multiple occurrences.
+func TestRedactSecrets_ReplacesHeldSecrets(t *testing.T) {
+	secret := "ghp_abc123_super_secret"
+	got := redactSecrets("token: ghp_abc123_super_secret and again ghp_abc123_super_secret", []string{secret})
+	want := "token: [REDACTED] and again [REDACTED]"
+	if got != want {
+		t.Errorf("redactSecrets = %q, want %q", got, want)
+	}
+}
+
+// TestRedactSecrets_PassthroughWithoutSecrets verifies that ordinary prose is
+// returned byte-identical when no held secret appears in it.
+func TestRedactSecrets_PassthroughWithoutSecrets(t *testing.T) {
+	reason := "I reviewed the code and all checks passed."
+	got := redactSecrets(reason, []string{"ghp_unrelated"})
+	if got != reason {
+		t.Errorf("redactSecrets altered clean reason:\n  got:  %q\n  want: %q", got, reason)
+	}
+}
+
+// TestRedactSecrets_SkipsEmptySecrets verifies that empty or whitespace-only
+// secret values are ignored rather than corrupting output.
+func TestRedactSecrets_SkipsEmptySecrets(t *testing.T) {
+	reason := "nothing to hide"
+	got := redactSecrets(reason, []string{"", "   "})
+	if got != reason {
+		t.Errorf("redactSecrets = %q, want %q", got, reason)
+	}
+}
+
+// TestRedactSecrets_LongestFirst verifies that when one secret is a substring
+// of another, the longer secret is replaced first so its placeholder is not
+// corrupted by the shorter match.
+func TestRedactSecrets_LongestFirst(t *testing.T) {
+	short := "abc"
+	long := "abcdef"
+	got := redactSecrets("x abc def abcdef y", []string{short, long})
+	want := "x [REDACTED] def [REDACTED] y"
+	if got != want {
+		t.Errorf("redactSecrets = %q, want %q", got, want)
+	}
+	if strings.Contains(got, long) {
+		t.Errorf("redactSecrets left longer secret %q in output", long)
 	}
 }

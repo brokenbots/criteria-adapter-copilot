@@ -87,6 +87,11 @@ type sessionState struct {
 	finalizedReason       string
 	finalizeAttempts      int
 	finalizeFailureKind   string
+
+	// heldSecrets caches non-empty values the adapter received over the secret
+	// channel during OpenSession. These are the only secrets the adapter
+	// redacts from `reason` before emitting step outputs.
+	heldSecrets []string
 }
 
 func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionRequest) (*v2.OpenSessionResponse, error) {
@@ -109,7 +114,8 @@ func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionReq
 	}
 
 	s := &sessionState{
-		session: &sdkSession{inner: session},
+		session:     &sdkSession{inner: session},
+		heldSecrets: heldGitHubTokenSecrets(secrets),
 	}
 
 	p.mu.Lock()

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -29,6 +30,12 @@ func stateWithOutcomes(allowed ...string) *sessionState {
 		session:               &fakeSession{},
 		activeAllowedOutcomes: set,
 	}
+}
+
+func stateWithOutcomesAndSecrets(allowed []string, secrets []string) *sessionState {
+	s := stateWithOutcomes(allowed...)
+	s.heldSecrets = secrets
+	return s
 }
 
 // ── handleSubmitOutcome unit tests ───────────────────────────────────────────
@@ -550,6 +557,85 @@ func TestAwaitOutcome_FailurePathPopulatesOutcomeOutput(t *testing.T) {
 	}
 	if got, ok := outputs["reason"]; !ok || got != "" {
 		t.Errorf("outputs[reason] = (%q, present=%v), want (\"\", true)", got, ok)
+	}
+}
+
+// A secret delivered over the secret channel must not appear verbatim in the
+// returned `reason` output; it is replaced with a visible placeholder.
+func TestAwaitOutcome_RedactsHeldSecretFromReason(t *testing.T) {
+	secret := "ghp_delivered_over_secret_channel_12345"
+	s := stateWithOutcomesAndSecrets([]string{"success", "failure"}, []string{secret})
+	fake := s.session.(*fakeSession)
+	fake.emitOnSend = []copilot.SessionEvent{
+		{Data: &copilot.AssistantMessageData{MessageID: "m1", Content: "done"}},
+		{Data: &copilot.SessionIdleData{}},
+	}
+	p := outcomeAdapter(s)
+	fake.onSend = func(_ int, _ copilot.MessageOptions) {
+		reason := fmt.Sprintf("I used token %s to complete the task", secret)
+		if _, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success", Reason: reason}); err != nil {
+			t.Errorf("handleSubmitOutcome: unexpected error: %v", err)
+		}
+	}
+
+	sender := &recordingSender{}
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:       "s1",
+		Input:           map[string]string{"prompt": "do work"},
+		AllowedOutcomes: []string{"failure", "success"},
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	result := resultFromSender(sender)
+	if result == nil {
+		t.Fatal("no result event emitted")
+	}
+	outputs := outputsOf(t, result)
+	if got := outputs["outcome"]; got != "success" {
+		t.Errorf("outputs[outcome] = %q, want %q", got, "success")
+	}
+	if strings.Contains(outputs["reason"], secret) {
+		t.Errorf("outputs[reason] still contains secret; got %q", outputs["reason"])
+	}
+	want := fmt.Sprintf("I used token %s to complete the task", redactedPlaceholder)
+	if outputs["reason"] != want {
+		t.Errorf("outputs[reason] = %q, want %q", outputs["reason"], want)
+	}
+}
+
+// When `reason` contains no held secret, redaction must not alter it at all.
+func TestAwaitOutcome_ReasonPassThroughWithoutSecret(t *testing.T) {
+	reason := "all checks passed"
+	s := stateWithOutcomesAndSecrets([]string{"success", "failure"}, []string{"ghp_some_secret_value"})
+	fake := s.session.(*fakeSession)
+	fake.emitOnSend = []copilot.SessionEvent{
+		{Data: &copilot.AssistantMessageData{MessageID: "m1", Content: "done"}},
+		{Data: &copilot.SessionIdleData{}},
+	}
+	p := outcomeAdapter(s)
+	fake.onSend = func(_ int, _ copilot.MessageOptions) {
+		if _, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success", Reason: reason}); err != nil {
+			t.Errorf("handleSubmitOutcome: unexpected error: %v", err)
+		}
+	}
+
+	sender := &recordingSender{}
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:       "s1",
+		Input:           map[string]string{"prompt": "do work"},
+		AllowedOutcomes: []string{"failure", "success"},
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	result := resultFromSender(sender)
+	if result == nil {
+		t.Fatal("no result event emitted")
+	}
+	outputs := outputsOf(t, result)
+	if got := outputs["reason"]; got != reason {
+		t.Errorf("outputs[reason] = %q, want %q", got, reason)
 	}
 }
 

@@ -138,9 +138,12 @@ func (p *copilotAdapter) Info(_ context.Context, _ *v2.InfoRequest) (*v2.InfoRes
 			// exhausts, max_turns is reached, or a permission is denied.
 			"outcome": {Type: "string", Description: "Final step outcome reported by the adapter (e.g. success, failure, needs_review). Mirrors the step's ExecuteResult outcome."},
 			// reason is set by resultEvent in copilot_util.go. It is empty when
-			// the model did not supply one or the adapter imputed the outcome.
-			// The value can include user or repository content, so mark it sensitive.
-			"reason": {Type: "string", Sensitive: true, Description: "Optional human-readable explanation for the outcome. May contain user or repository content. Empty when no reason was supplied."},
+			// the model did not supply one or the adapter imputed the outcome. The
+			// value is agent-authored prose and may contain repository content.
+			// Values the adapter received over the secret channel are redacted
+			// before emission, but the field is not guaranteed to be free of
+			// sensitive material — consumers must decide where to route it.
+			"reason": {Type: "string", Description: "Optional human-readable explanation for the outcome, authored by the agent. May contain repository content. Adapter-held secrets received over the secret channel are redacted, but the field is not guaranteed to be free of sensitive material. Empty when no reason was supplied."},
 		}},
 		// Declared so the host resolves these from the workflow's secret stack
 		// and delivers them over the secret channel (D69). When supplied, an
@@ -312,6 +315,21 @@ func resolveGitHubToken(secrets *adapterhost.Secrets) string {
 		}
 	}
 	return ""
+}
+
+// heldGitHubTokenSecrets returns every non-empty GitHub token value delivered
+// over the secret channel. These are the only values the adapter promises to
+// redact from `reason`; they are not used for authentication ordering.
+func heldGitHubTokenSecrets(secrets *adapterhost.Secrets) []string {
+	out := make([]string, 0, len(githubTokenSecretNames))
+	for _, name := range githubTokenSecretNames {
+		if token, ok := secrets.Get(name); ok {
+			if t := strings.TrimSpace(token); t != "" {
+				out = append(out, t)
+			}
+		}
+	}
+	return out
 }
 
 // Log blocks until ctx is cancelled (when the host closes the Log stream after

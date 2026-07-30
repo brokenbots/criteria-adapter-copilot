@@ -149,7 +149,7 @@ func (ts *turnState) handleIdleTurn(ctx context.Context, s *sessionState, sink a
 	s.mu.Unlock()
 
 	if outcome != "" {
-		return true, sink.Send(resultEvent(outcome, reason))
+		return true, sink.Send(resultEvent(outcome, reason, s.heldSecrets...))
 	}
 
 	// No valid finalize this turn. Fail if exhausted.
