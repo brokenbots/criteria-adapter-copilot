@@ -27,9 +27,9 @@ USER criteria
 
 WORKDIR /app
 
-COPY --from=builder /bin/criteria-adapter-copilot /app/criteria-adapter-copilot
+COPY --from=builder /bin/criteria-adapter-copilot /usr/local/bin/criteria-adapter-copilot
 
 # The copilot CLI is on PATH via the global npm install above.
 ENV PATH="/usr/local/bin:${PATH}"
 
-ENTRYPOINT ["/app/criteria-adapter-copilot"]
+ENTRYPOINT ["/usr/local/bin/criteria-adapter-copilot"]
