@@ -54,8 +54,26 @@ jobs:
             echo "tag=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push container image
+        id: image
+        run: |
+          set -euo pipefail
+          tag="ghcr.io/${{ github.repository_owner }}/criteria-adapter-copilot:${{ steps.ver.outputs.tag }}"
+          digest_file="${{ github.workspace }}/image-digest.txt"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            --tag "${tag}" \
+            --iidfile "${digest_file}" \
+            .
+          digest="$(cat "${digest_file}")"
+          echo "image=${tag}@${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Publish
         uses: brokenbots/publish-adapter@v0
@@ -63,3 +81,4 @@ jobs:
           # Directory containing the multi-platform bin/<os>/<arch>/ tree.
           binary: ${{ github.workspace }}/artifact
           registry: ghcr.io/${{ github.repository_owner }}/criteria-adapter-copilot:${{ steps.ver.outputs.tag }}
+          image: ${{ steps.image.outputs.image }}

@@ -56,7 +56,7 @@ import (
 
 const (
 	adapterName    = "copilot"
-	adapterVersion = "0.1.0"
+	adapterVersion = "0.1.1"
 
 	defaultBinEnv = "CRITERIA_COPILOT_BIN"
 	defaultBin    = "copilot"
