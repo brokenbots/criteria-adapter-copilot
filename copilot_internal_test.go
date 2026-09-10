@@ -272,12 +272,14 @@ func TestResolveGitHubTokenIgnoresEnv(t *testing.T) {
 
 // TestApplyAuthOptionsSecretWins verifies that a token delivered over the
 // secret channel is authoritative: it is set explicitly, auto-login is
-// disabled, and the process environment is NOT passed through (the secret path
-// stays scrubbed).
+// disabled, the delivered GH_TOKEN / GITHUB_TOKEN values are forwarded into
+// opts.Env, and the process environment is preserved as the env base.
 func TestApplyAuthOptionsSecretWins(t *testing.T) {
 	sec := adapterhost.NewSecrets(declaredGitHubTokenSecrets(), map[string]string{"GITHUB_TOKEN": "from-secret"})
 	opts := &copilot.ClientOptions{}
-	applyAuthOptions(opts, sec)
+	if err := applyAuthOptions(opts, sec); err != nil {
+		t.Fatalf("applyAuthOptions() err = %v", err)
+	}
 
 	if opts.GitHubToken != "from-secret" {
 		t.Fatalf("GitHubToken = %q, want %q", opts.GitHubToken, "from-secret")
@@ -285,8 +287,94 @@ func TestApplyAuthOptionsSecretWins(t *testing.T) {
 	if opts.UseLoggedInUser == nil || *opts.UseLoggedInUser {
 		t.Fatalf("UseLoggedInUser = %v, want explicit false when a secret is supplied", opts.UseLoggedInUser)
 	}
-	if opts.Env != nil {
-		t.Fatalf("Env must not be passed through on the secret path; got %v", opts.Env)
+	if !slices.Contains(opts.Env, "GITHUB_TOKEN=from-secret") {
+		t.Fatalf("Env must contain the delivered GITHUB_TOKEN; got %v", opts.Env)
+	}
+	if !slices.ContainsFunc(opts.Env, func(s string) bool { return strings.HasPrefix(s, "PATH=") }) {
+		t.Fatalf("Env must carry the process environment (PATH); got %v", opts.Env)
+	}
+}
+
+// TestApplyAuthOptionsSecretForwardsBothTokens verifies that when both GH_TOKEN
+// and GITHUB_TOKEN are delivered over the secret channel, both are forwarded to
+// the runtime environment, while COPILOT_GITHUB_TOKEN is consumed only as the
+// SDK client auth token and is never forwarded as a child-process env var.
+func TestApplyAuthOptionsSecretForwardsBothTokens(t *testing.T) {
+	cases := []struct {
+		name      string
+		delivered map[string]string
+		wantToken string
+		wantEnv   []string
+		wantNoEnv string // prefix that must not appear in opts.Env
+	}{
+		{
+			name: "gh_and_github_tokens",
+			delivered: map[string]string{
+				"GH_TOKEN":     "gh-secret",
+				"GITHUB_TOKEN": "github-secret",
+			},
+			wantToken: "gh-secret",
+			wantEnv:   []string{"GH_TOKEN=gh-secret", "GITHUB_TOKEN=github-secret"},
+			wantNoEnv: "COPILOT_GITHUB_TOKEN=",
+		},
+		{
+			name: "copilot_token_not_forwarded_as_env",
+			delivered: map[string]string{
+				"COPILOT_GITHUB_TOKEN": "copilot-secret",
+				"GITHUB_TOKEN":         "github-secret",
+			},
+			wantToken: "copilot-secret",
+			wantEnv:   []string{"GITHUB_TOKEN=github-secret"},
+			wantNoEnv: "COPILOT_GITHUB_TOKEN=",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sec := adapterhost.NewSecrets(declaredGitHubTokenSecrets(), tc.delivered)
+			opts := &copilot.ClientOptions{}
+			if err := applyAuthOptions(opts, sec); err != nil {
+				t.Fatalf("applyAuthOptions() err = %v", err)
+			}
+
+			if opts.GitHubToken != tc.wantToken {
+				t.Fatalf("GitHubToken = %q, want %q", opts.GitHubToken, tc.wantToken)
+			}
+			if opts.UseLoggedInUser == nil || *opts.UseLoggedInUser {
+				t.Fatalf("UseLoggedInUser = %v, want explicit false when a secret is supplied", opts.UseLoggedInUser)
+			}
+			for _, want := range tc.wantEnv {
+				if !slices.Contains(opts.Env, want) {
+					t.Fatalf("Env must contain %q; got %v", want, opts.Env)
+				}
+			}
+			if slices.ContainsFunc(opts.Env, func(s string) bool { return strings.HasPrefix(s, tc.wantNoEnv) }) {
+				t.Fatalf("Env must not contain %q; got %v", tc.wantNoEnv, opts.Env)
+			}
+		})
+	}
+}
+
+// TestApplyAuthOptionsSecretTrimsWhitespace verifies that empty or
+// whitespace-only secret values are dropped from the forwarded env, and
+// surviving values are trimmed before being appended.
+func TestApplyAuthOptionsSecretTrimsWhitespace(t *testing.T) {
+	sec := adapterhost.NewSecrets(declaredGitHubTokenSecrets(), map[string]string{
+		"GH_TOKEN":     "  gh-secret  ",
+		"GITHUB_TOKEN": "   ",
+	})
+	opts := &copilot.ClientOptions{}
+	if err := applyAuthOptions(opts, sec); err != nil {
+		t.Fatalf("applyAuthOptions() err = %v", err)
+	}
+
+	if opts.GitHubToken != "gh-secret" {
+		t.Fatalf("GitHubToken = %q, want %q", opts.GitHubToken, "gh-secret")
+	}
+	if !slices.Contains(opts.Env, "GH_TOKEN=gh-secret") {
+		t.Fatalf("Env must contain trimmed GH_TOKEN; got %v", opts.Env)
+	}
+	if slices.ContainsFunc(opts.Env, func(s string) bool { return strings.HasPrefix(s, "GITHUB_TOKEN=") }) {
+		t.Fatalf("Env must not contain whitespace-only GITHUB_TOKEN; got %v", opts.Env)
 	}
 }
 
@@ -299,7 +387,9 @@ func TestApplyAuthOptionsFallback(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "from-env") // present in env, absent from the channel
 	sec := adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil)
 	opts := &copilot.ClientOptions{}
-	applyAuthOptions(opts, sec)
+	if err := applyAuthOptions(opts, sec); err != nil {
+		t.Fatalf("applyAuthOptions() err = %v", err)
+	}
 
 	if opts.GitHubToken != "" {
 		t.Fatalf("GitHubToken must stay empty on the fallback path; got %q", opts.GitHubToken)
