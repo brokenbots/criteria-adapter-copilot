@@ -251,7 +251,9 @@ func (p *copilotAdapter) ensureClient(ctx context.Context, secrets *adapterhost.
 		Connection: copilot.StdioConnection{Path: cliPath},
 		LogLevel:   "info",
 	}
-	applyAuthOptions(options, secrets)
+	if err := applyAuthOptions(options, secrets); err != nil {
+		return nil, fmt.Errorf("copilot: apply auth options: %w", err)
+	}
 
 	client := copilot.NewClient(options)
 	if err := client.Start(ctx); err != nil {
@@ -284,20 +286,49 @@ func declaredGitHubTokenSecrets() map[string]string {
 //
 //   - A token delivered over the secret channel (D69) is authoritative: it is
 //     set explicitly and auto-login is disabled so only that token is honored.
+//     The delivered GH_TOKEN and GITHUB_TOKEN values are also forwarded into
+//     opts.Env so the Copilot runtime (and any child processes such as gh or
+//     git) receive them even when the adapter's own process environment is
+//     scrubbed (D29/D32).
 //   - Otherwise the adapter falls back to Copilot's own standard auth
 //     mechanisms — environment variables (GH_TOKEN / GITHUB_TOKEN /
 //     COPILOT_SDK_AUTH_TOKEN) and local credential caches (gh CLI / stored OAuth
 //     via the logged-in user). The process environment is passed through so the
 //     runtime can read those vars; in a sandboxed adapter the env is scrubbed
 //     (D29/D32), so nothing leaks and auto-login simply finds no credentials.
-func applyAuthOptions(opts *copilot.ClientOptions, secrets *adapterhost.Secrets) {
+func applyAuthOptions(opts *copilot.ClientOptions, secrets *adapterhost.Secrets) error {
 	if token := resolveGitHubToken(secrets); token != "" {
 		opts.GitHubToken = token
 		opts.UseLoggedInUser = copilot.Bool(false)
-		return
+		// Forward only GH_TOKEN and GITHUB_TOKEN from the secret channel;
+		// COPILOT_GITHUB_TOKEN is consumed only as the SDK client token above.
+		spawned, err := secrets.SpawnEnv("GH_TOKEN", "GITHUB_TOKEN")
+		if err != nil {
+			return fmt.Errorf("copilot: spawn github token env: %w", err)
+		}
+		opts.Env = append(os.Environ(), cleanSpawnedEnv(spawned)...)
+		return nil
 	}
 	opts.UseLoggedInUser = copilot.Bool(true)
 	opts.Env = os.Environ()
+	return nil
+}
+
+// cleanSpawnedEnv trims values and drops entries whose value is empty or
+// whitespace-only. SpawnEnv itself does not trim, so this keeps the runtime
+// env authoritative and consistent with resolveGitHubToken / heldGitHubTokenSecrets.
+func cleanSpawnedEnv(entries []string) []string {
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, name+"="+trimmed)
+		}
+	}
+	return out
 }
 
 // resolveGitHubToken returns the GitHub token from the secret channel, trying
