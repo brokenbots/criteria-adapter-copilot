@@ -5,14 +5,16 @@ go 1.26.6
 require (
 	github.com/brokenbots/criteria-adapter-proto v0.5.1
 	github.com/brokenbots/criteria-go-adapter-sdk v0.5.3
-	github.com/github/copilot-sdk/go v1.0.0
+	github.com/github/copilot-sdk/go v1.0.11
 	github.com/google/uuid v1.6.0
 	google.golang.org/grpc v1.83.2
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
+	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
