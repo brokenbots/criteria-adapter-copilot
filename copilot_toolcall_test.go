@@ -22,6 +22,7 @@ import (
 	"unicode/utf8"
 
 	copilot "github.com/github/copilot-sdk/go"
+	"github.com/github/copilot-sdk/go/rpc"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	v2 "github.com/brokenbots/criteria-adapter-proto/criteria/v2"
@@ -356,18 +357,25 @@ func TestAdapterToolCallHostUnsupportedCached(t *testing.T) {
 
 	// The first call runs under a short caller deadline; deterministically
 	// wait for the grant to be processed (the bridge ACKs the allow-grant)
-	// before the deadline can fire.
+	// before the deadline can fire. Results are collected, not asserted, on
+	// the worker goroutine so a regression fails the test instead of hanging
+	// or panicking.
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	type callResult struct {
 		res copilot.ToolResult
+		err error
 	}
 	first := make(chan callResult, 1)
 	go func() {
-		first <- callResult{invokeAdapterTool(t, p, ctx, "adapter.shell.worker.tools.git_status", nil)}
+		res, err := p.handleAdapterToolCall(testAdapterToolSession, copilot.ToolInvocation{TraceContext: ctx}, AdapterToolArgs{Target: "adapter.shell.worker.tools.git_status"})
+		first <- callResult{res: res, err: err}
 	}()
 	waitForAcks(t, host, 1, 2*time.Second)
 	got := <-first
+	if got.err != nil {
+		t.Fatalf("first call returned a Go error (the handler must keep control of the turn): %v", got.err)
+	}
 	if got.res.ResultType != "failure" || !strings.Contains(got.res.Error, "host_unsupported") {
 		t.Fatalf("first call: got %q/%q, want failure ToolResult with the typed host_unsupported error", got.res.ResultType, got.res.Error)
 	}
@@ -584,6 +592,9 @@ func TestSessionConfigRegistersAdapterTool(t *testing.T) {
 // TestAdapterToolArgsPreview covers the bounded preview: short args pass
 // through, long args are truncated on a rune boundary and stay valid UTF-8.
 func TestAdapterToolArgsPreview(t *testing.T) {
+	if got := adapterToolArgsPreview(nil); got != "{}" {
+		t.Fatalf("nil-args preview = %q, want {} (matches the wire args object)", got)
+	}
 	if got := adapterToolArgsPreview(map[string]any{"path": "."}); got != `{"path":"."}` {
 		t.Fatalf("short preview = %q", got)
 	}
@@ -598,4 +609,145 @@ func TestAdapterToolArgsPreview(t *testing.T) {
 	if !strings.HasSuffix(got, "…") {
 		t.Fatalf("truncated preview %q missing ellipsis", got)
 	}
+}
+
+// TestAdapterToolPermissionRequestApprovedLocally covers the permission
+// short-circuit for the adapter_tool custom tool itself (CRI-178): the SDK's
+// tool-permission request for adapter_tool is answered locally with
+// ApproveOnce and no error, and NO permission.request event reaches the sink,
+// on any session state — the wire call the handler issues is the gated event
+// (ADR-0004 §8), so the SDK's tool-permission layer must not add a second
+// gate. Enforcement lives in the tool handler (target shape, active session)
+// and on the host's per-call gate, not in this SDK callback.
+func TestAdapterToolPermissionRequestApprovedLocally(t *testing.T) {
+	activeSink := &recordingSender{}
+	cases := []struct {
+		name    string
+		p       *copilotAdapter
+		session string
+	}{
+		{
+			name: "active session",
+			p: func() *copilotAdapter {
+				return &copilotAdapter{sessions: map[string]*sessionState{
+					"s1": {session: &fakeSession{}, active: true, activeCh: make(chan struct{}), sink: activeSink},
+				}}
+			}(),
+			session: "s1",
+		},
+		{
+			name:    "unknown session",
+			p:       &copilotAdapter{sessions: map[string]*sessionState{}},
+			session: "nonexistent",
+		},
+		{
+			name: "inactive session",
+			p: func() *copilotAdapter {
+				return &copilotAdapter{sessions: map[string]*sessionState{
+					"s1": {session: &fakeSession{}, active: false, sink: &recordingSender{}},
+				}}
+			}(),
+			session: "s1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A watchdog keeps the failure loud if the short-circuit is ever
+			// dropped: the active-session case would otherwise block forever
+			// on the pending-perm channel instead of returning locally.
+			type decision struct {
+				kind rpc.PermissionDecisionKind
+				err  error
+			}
+			done := make(chan decision, 1)
+			go func() {
+				result, err := tc.p.handlePermissionRequest(tc.session, copilot.PermissionRequestCustomTool{ToolName: adapterToolToolName})
+				if result == nil {
+					done <- decision{err: err}
+					return
+				}
+				done <- decision{kind: result.Kind(), err: err}
+			}()
+			var got decision
+			select {
+			case got = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("handlePermissionRequest did not return: adapter_tool was not answered locally")
+			}
+			if got.err != nil {
+				t.Fatalf("unexpected error: %v", got.err)
+			}
+			if got.kind != rpc.PermissionDecisionKindApproveOnce {
+				t.Fatalf("result.Kind = %q, want %q (answered locally, independent of session state)", got.kind, rpc.PermissionDecisionKindApproveOnce)
+			}
+		})
+	}
+	// No permission.request may be emitted to a wired sink by the local approve.
+	if got := activeSink.snapshot(); len(got) != 0 {
+		t.Fatalf("local approve emitted %d event(s) to the sink, want 0 (no second gate)", len(got))
+	}
+}
+
+// TestAdapterToolPermissionRequestDoesNotCatchOtherTools is the
+// regression-sensitive negative: only the adapter_tool custom tool is
+// answered locally. Any other custom tool takes the normal path — forwarded
+// to the host gate for an active session (a permission.request event is
+// emitted), UserNotAvailable for an unknown session.
+func TestAdapterToolPermissionRequestDoesNotCatchOtherTools(t *testing.T) {
+	t.Run("unknown session takes the normal path", func(t *testing.T) {
+		p := &copilotAdapter{sessions: map[string]*sessionState{}}
+		result, err := p.handlePermissionRequest("nonexistent", copilot.PermissionRequestCustomTool{ToolName: "some_other_tool"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Kind() != rpc.PermissionDecisionKindUserNotAvailable {
+			t.Fatalf("result.Kind = %q, want %q (a non-adapter_tool request must not be locally approved)", result.Kind(), rpc.PermissionDecisionKindUserNotAvailable)
+		}
+	})
+
+	t.Run("active session forwards to the host gate", func(t *testing.T) {
+		sender := &recordingSender{}
+		s := &sessionState{
+			session:  &fakeSession{},
+			active:   true,
+			activeCh: make(chan struct{}),
+			sink:     sender,
+		}
+		p := &copilotAdapter{sessions: map[string]*sessionState{"s1": s}}
+
+		// The normal path blocks until the host resolves the pending perm;
+		// simulate the host approving once the event is emitted.
+		go func() {
+			deadline := time.After(2 * time.Second)
+			for {
+				for _, ev := range sender.snapshot() {
+					if a := ev.GetAdapter(); a != nil && a.GetEventKind() == "permission.request" && a.GetPayload() != nil {
+						if requestID, ok := a.GetPayload().AsMap()["request_id"].(string); ok && requestID != "" {
+							if ch := p.resolvePendingPerm(requestID); ch != nil {
+								ch <- "allow"
+								return
+							}
+						}
+					}
+				}
+				select {
+				case <-deadline:
+					return
+				default:
+					time.Sleep(time.Millisecond)
+				}
+			}
+		}()
+
+		result, err := p.handlePermissionRequest("s1", copilot.PermissionRequestCustomTool{ToolName: "some_other_tool"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Kind() != rpc.PermissionDecisionKindApproveOnce {
+			t.Fatalf("result.Kind = %q, want %q (host-approved on the normal path)", result.Kind(), rpc.PermissionDecisionKindApproveOnce)
+		}
+		if got := sender.snapshot(); len(got) != 1 {
+			t.Fatalf("normal path emitted %d event(s), want exactly 1 permission.request", len(got))
+		}
+	})
 }

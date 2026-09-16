@@ -127,6 +127,9 @@ func isBarewordTargetLabel(s string) bool {
 // adapterToolArgsPreview renders the bounded printable preview carried as the
 // payload's optional args_preview key, for human-readable audit trails.
 func adapterToolArgsPreview(args map[string]any) string {
+	if args == nil {
+		args = map[string]any{} // nil marshals as "null"; the wire args object is {}
+	}
 	encoded, err := json.Marshal(args)
 	if err != nil {
 		return ""
