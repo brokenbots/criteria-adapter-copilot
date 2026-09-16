@@ -611,15 +611,75 @@ func TestAdapterToolArgsPreview(t *testing.T) {
 	}
 }
 
+// decodedPermissionRequest unmarshals a permission.requested SessionEvent
+// whose permissionRequest payload is the given JSON object through the SDK's
+// real decoder. This is the exact form the pinned copilot SDK hands
+// OnPermissionRequest: unmarshalPermissionRequest (rpc/zsession_encoding.go)
+// returns *PermissionRequestCustomTool for kind=custom-tool, never the value
+// type, so tests must drive the discriminator from this shape.
+func decodedPermissionRequest(t *testing.T, payload string) copilot.PermissionRequest {
+	t.Helper()
+	var ev copilot.SessionEvent
+	eventJSON := `{"id":"evt-perm-1","timestamp":"2026-01-01T00:00:00Z","type":"permission.requested","data":{"permissionRequest":` + payload + `}}`
+	if err := json.Unmarshal([]byte(eventJSON), &ev); err != nil {
+		t.Fatalf("decoding permission.requested SessionEvent: %v", err)
+	}
+	data, ok := ev.Data.(*copilot.PermissionRequestedData)
+	if !ok {
+		t.Fatalf("decoded event data is %T, want *copilot.PermissionRequestedData", ev.Data)
+	}
+	if data.PermissionRequest == nil {
+		t.Fatal("decoded event carries no permissionRequest")
+	}
+	return data.PermissionRequest
+}
+
+// TestIsAdapterToolPermissionRequestMatchesBothSDKForms pins the adapter_tool
+// discriminator against both shapes the SDK boundary can deliver. The pinned
+// SDK decodes kind=custom-tool permission.requested events into
+// *PermissionRequestCustomTool, so the decoded pointer is the form that must
+// match; the value form is covered for completeness because the type switch
+// handles both. Any other tool name or permission kind must not match.
+func TestIsAdapterToolPermissionRequestMatchesBothSDKForms(t *testing.T) {
+	cases := []struct {
+		name    string
+		request copilot.PermissionRequest
+		want    bool
+	}{
+		{"decoded pointer form, adapter_tool", decodedPermissionRequest(t, `{"kind":"custom-tool","toolName":"adapter_tool"}`), true},
+		{"value form, adapter_tool", copilot.PermissionRequestCustomTool{ToolName: adapterToolToolName}, true},
+		{"decoded pointer form, other tool", decodedPermissionRequest(t, `{"kind":"custom-tool","toolName":"some_other_tool"}`), false},
+		{"value form, other tool", copilot.PermissionRequestCustomTool{ToolName: "some_other_tool"}, false},
+		{"decoded pointer form, shell kind", decodedPermissionRequest(t, `{"kind":"shell"}`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAdapterToolPermissionRequest(tc.request); got != tc.want {
+				t.Fatalf("isAdapterToolPermissionRequest(%T) = %v, want %v", tc.request, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestAdapterToolPermissionRequestApprovedLocally covers the permission
-// short-circuit for the adapter_tool custom tool itself (CRI-178): the SDK's
+// short-circuit for the adapter_tool custom tool (CRI-178): the SDK's
 // tool-permission request for adapter_tool is answered locally with
 // ApproveOnce and no error, and NO permission.request event reaches the sink,
 // on any session state — the wire call the handler issues is the gated event
 // (ADR-0004 §8), so the SDK's tool-permission layer must not add a second
-// gate. Enforcement lives in the tool handler (target shape, active session)
-// and on the host's per-call gate, not in this SDK callback.
+// gate. The request is constructed through the SDK's real decoder (a decoded
+// permission.requested SessionEvent), matching what OnPermissionRequest
+// actually receives. Enforcement lives in the tool handler (target shape,
+// active session) and on the host's per-call gate, not in this SDK callback.
 func TestAdapterToolPermissionRequestApprovedLocally(t *testing.T) {
+	// Decode once through the SDK's real decoder and pin the contract: the
+	// pinned SDK delivers the *pointer* form to OnPermissionRequest, not the
+	// value type.
+	adapterToolRequest := decodedPermissionRequest(t, `{"kind":"custom-tool","toolName":"adapter_tool"}`)
+	if _, ok := adapterToolRequest.(*copilot.PermissionRequestCustomTool); !ok {
+		t.Fatalf("decoded permission request is %T, want *copilot.PermissionRequestCustomTool (the form the pinned SDK delivers)", adapterToolRequest)
+	}
+
 	activeSink := &recordingSender{}
 	cases := []struct {
 		name    string
@@ -661,7 +721,7 @@ func TestAdapterToolPermissionRequestApprovedLocally(t *testing.T) {
 			}
 			done := make(chan decision, 1)
 			go func() {
-				result, err := tc.p.handlePermissionRequest(tc.session, copilot.PermissionRequestCustomTool{ToolName: adapterToolToolName})
+				result, err := tc.p.handlePermissionRequest(tc.session, adapterToolRequest)
 				if result == nil {
 					done <- decision{err: err}
 					return
@@ -694,60 +754,78 @@ func TestAdapterToolPermissionRequestApprovedLocally(t *testing.T) {
 // to the host gate for an active session (a permission.request event is
 // emitted), UserNotAvailable for an unknown session.
 func TestAdapterToolPermissionRequestDoesNotCatchOtherTools(t *testing.T) {
+	// Both SDK shapes must behave identically: the pinned SDK delivers the
+	// decoded pointer form, the value form is covered for completeness.
+	shapes := []struct {
+		name    string
+		request copilot.PermissionRequest
+	}{
+		{"value form", copilot.PermissionRequestCustomTool{ToolName: "some_other_tool"}},
+		{"decoded pointer form", decodedPermissionRequest(t, `{"kind":"custom-tool","toolName":"some_other_tool"}`)},
+	}
+
 	t.Run("unknown session takes the normal path", func(t *testing.T) {
-		p := &copilotAdapter{sessions: map[string]*sessionState{}}
-		result, err := p.handlePermissionRequest("nonexistent", copilot.PermissionRequestCustomTool{ToolName: "some_other_tool"})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result.Kind() != rpc.PermissionDecisionKindUserNotAvailable {
-			t.Fatalf("result.Kind = %q, want %q (a non-adapter_tool request must not be locally approved)", result.Kind(), rpc.PermissionDecisionKindUserNotAvailable)
+		for _, tc := range shapes {
+			t.Run(tc.name, func(t *testing.T) {
+				p := &copilotAdapter{sessions: map[string]*sessionState{}}
+				result, err := p.handlePermissionRequest("nonexistent", tc.request)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if result.Kind() != rpc.PermissionDecisionKindUserNotAvailable {
+					t.Fatalf("result.Kind = %q, want %q (a non-adapter_tool request must not be locally approved)", result.Kind(), rpc.PermissionDecisionKindUserNotAvailable)
+				}
+			})
 		}
 	})
 
 	t.Run("active session forwards to the host gate", func(t *testing.T) {
-		sender := &recordingSender{}
-		s := &sessionState{
-			session:  &fakeSession{},
-			active:   true,
-			activeCh: make(chan struct{}),
-			sink:     sender,
-		}
-		p := &copilotAdapter{sessions: map[string]*sessionState{"s1": s}}
+		for _, tc := range shapes {
+			t.Run(tc.name, func(t *testing.T) {
+				sender := &recordingSender{}
+				s := &sessionState{
+					session:  &fakeSession{},
+					active:   true,
+					activeCh: make(chan struct{}),
+					sink:     sender,
+				}
+				p := &copilotAdapter{sessions: map[string]*sessionState{"s1": s}}
 
-		// The normal path blocks until the host resolves the pending perm;
-		// simulate the host approving once the event is emitted.
-		go func() {
-			deadline := time.After(2 * time.Second)
-			for {
-				for _, ev := range sender.snapshot() {
-					if a := ev.GetAdapter(); a != nil && a.GetEventKind() == "permission.request" && a.GetPayload() != nil {
-						if requestID, ok := a.GetPayload().AsMap()["request_id"].(string); ok && requestID != "" {
-							if ch := p.resolvePendingPerm(requestID); ch != nil {
-								ch <- "allow"
-								return
+				// The normal path blocks until the host resolves the pending perm;
+				// simulate the host approving once the event is emitted.
+				go func() {
+					deadline := time.After(2 * time.Second)
+					for {
+						for _, ev := range sender.snapshot() {
+							if a := ev.GetAdapter(); a != nil && a.GetEventKind() == "permission.request" && a.GetPayload() != nil {
+								if requestID, ok := a.GetPayload().AsMap()["request_id"].(string); ok && requestID != "" {
+									if ch := p.resolvePendingPerm(requestID); ch != nil {
+										ch <- "allow"
+										return
+									}
+								}
 							}
 						}
+						select {
+						case <-deadline:
+							return
+						default:
+							time.Sleep(time.Millisecond)
+						}
 					}
-				}
-				select {
-				case <-deadline:
-					return
-				default:
-					time.Sleep(time.Millisecond)
-				}
-			}
-		}()
+				}()
 
-		result, err := p.handlePermissionRequest("s1", copilot.PermissionRequestCustomTool{ToolName: "some_other_tool"})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result.Kind() != rpc.PermissionDecisionKindApproveOnce {
-			t.Fatalf("result.Kind = %q, want %q (host-approved on the normal path)", result.Kind(), rpc.PermissionDecisionKindApproveOnce)
-		}
-		if got := sender.snapshot(); len(got) != 1 {
-			t.Fatalf("normal path emitted %d event(s), want exactly 1 permission.request", len(got))
+				result, err := p.handlePermissionRequest("s1", tc.request)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if result.Kind() != rpc.PermissionDecisionKindApproveOnce {
+					t.Fatalf("result.Kind = %q, want %q (host-approved on the normal path)", result.Kind(), rpc.PermissionDecisionKindApproveOnce)
+				}
+				if got := sender.snapshot(); len(got) != 1 {
+					t.Fatalf("normal path emitted %d event(s), want exactly 1 permission.request", len(got))
+				}
+			})
 		}
 	})
 }

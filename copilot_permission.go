@@ -77,8 +77,19 @@ func (p *copilotAdapter) handlePermissionRequest(sessionID string, request copil
 // arguments ride the wire call's own permission.request payload, so they are
 // never forwarded twice.
 func isAdapterToolPermissionRequest(request copilot.PermissionRequest) bool {
-	req, ok := request.(copilot.PermissionRequestCustomTool)
-	return ok && req.ToolName == adapterToolToolName
+	// The pinned SDK delivers a pointer for every discriminated variant:
+	// rpc/zsession_encoding.go's unmarshalPermissionRequest returns &d for
+	// kind=custom-tool (and the e2e tests assert the pointer form), so both
+	// shapes are matched here. The value form never arrives today but is kept
+	// alongside the pointer form because the type switch costs nothing and the
+	// rest of this file historically switched on the value type.
+	switch req := request.(type) {
+	case copilot.PermissionRequestCustomTool:
+		return req.ToolName == adapterToolToolName
+	case *copilot.PermissionRequestCustomTool:
+		return req.ToolName == adapterToolToolName
+	}
+	return false
 }
 
 // buildPermEventPayload converts the Copilot SDK request into the detailsAny
