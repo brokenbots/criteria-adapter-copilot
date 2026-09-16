@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	v2 "github.com/brokenbots/criteria-adapter-proto/criteria/v2"
+	adapterhost "github.com/brokenbots/criteria-go-adapter-sdk/adapterhost"
 )
 
 // TestInfo_OutputSchemaMatchesRuntimeOutputs asserts that Info declares an
@@ -181,4 +182,21 @@ func sortedStrings(m map[string]struct{}) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// TestInfo_CapabilitiesIncludeAdapterTools asserts the CRI-153 matrix entry:
+// the adapter advertises adapter_tools so the host can gate per-call calls
+// from the agent-invocable adapter_tool tool.
+func TestInfo_CapabilitiesIncludeAdapterTools(t *testing.T) {
+	var a copilotAdapter
+	info, err := a.Info(context.Background(), &v2.InfoRequest{})
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	for _, cap := range info.GetCapabilities() {
+		if cap == adapterhost.CapabilityAdapterTools {
+			return
+		}
+	}
+	t.Fatalf("capabilities %v do not include %q", info.GetCapabilities(), adapterhost.CapabilityAdapterTools)
 }

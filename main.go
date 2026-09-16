@@ -17,7 +17,8 @@ func main() {
 
 func newCopilotAdapter() *copilotAdapter {
 	return &copilotAdapter{
-		sessions: map[string]*sessionState{},
+		sessions:   map[string]*sessionState{},
+		toolBridge: adapterhost.NewToolCallBridge(),
 	}
 }
 

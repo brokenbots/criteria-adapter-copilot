@@ -3,8 +3,8 @@ module github.com/brokenbots/criteria-adapter-copilot
 go 1.26.6
 
 require (
-	github.com/brokenbots/criteria-adapter-proto v0.5.1
-	github.com/brokenbots/criteria-go-adapter-sdk v0.5.3
+	github.com/brokenbots/criteria-adapter-proto v0.5.3
+	github.com/brokenbots/criteria-go-adapter-sdk v0.5.4
 	github.com/github/copilot-sdk/go v1.0.0
 	github.com/google/uuid v1.6.0
 	google.golang.org/grpc v1.83.2

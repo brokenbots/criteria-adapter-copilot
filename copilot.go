@@ -31,6 +31,8 @@
 //   - copilot_session.go — session lifecycle: copilotSession interface, sdkSession, sessionState, Open/CloseSession
 //   - copilot_turn.go    — Execute, turnState, event handlers
 //   - copilot_outcome.go — submit_outcome tool: SubmitOutcomeArgs, handleSubmitOutcome, helpers
+//   - copilot_toolcall.go — adapter_tool tool: AdapterToolArgs, handleAdapterToolCall, target parsing
+//   - copilot_toolpipe.go — permissionPipe: in-memory stream feeding the ToolCallBridge dispatch loop
 //   - copilot_model.go   — model/effort helpers: applyRequestModel, applyRequestEffort, validateReasoningEffort
 //   - copilot_permission.go — Permit, handlePermissionRequest, permissionDetails
 //   - copilot_util.go    — resultEvent, logEvent, adapterEvent, stringifyAny
@@ -56,7 +58,7 @@ import (
 
 const (
 	adapterName    = "copilot"
-	adapterVersion = "0.1.0"
+	adapterVersion = "0.2.0"
 
 	defaultBinEnv = "CRITERIA_COPILOT_BIN"
 	defaultBin    = "copilot"
@@ -65,10 +67,22 @@ const (
 
 	submitOutcomeToolName = "submit_outcome"
 
+	// adapterToolToolName is the agent-invocable custom tool the adapter
+	// registers so the model can call a tool exposed by another adapter in the
+	// workflow (CRI-178). The handler issues the call over the adapter-tools
+	// wire (ADR-0004 / CRI-152) via the SDK's ToolCallBridge.
+	adapterToolToolName = "adapter_tool"
+
 	// submitOutcomeToolDescription is the description surfaced to the model for
 	// the submit_outcome tool. It conveys the contract: call exactly once with
 	// a valid outcome before ending the turn, or the step fails.
 	submitOutcomeToolDescription = "Finalize the outcome for the current step. Call this exactly once with one of the allowed outcomes for the step. The list of allowed outcomes is provided in the user prompt. Failure to call this tool with a valid outcome will fail the step."
+
+	// adapterToolToolDescription is the description surfaced to the model for
+	// the adapter_tool tool. It conveys when to call it, which targets are
+	// allowed, and that failures are data to surface — never a step failure
+	// (ADR-0004 §5) — and must not be retried blindly.
+	adapterToolToolDescription = "Call a tool exposed by another adapter in this workflow. Use it when the step's prompt requires a capability another adapter exposes and the step's tools list allows that target: pass `target` as the full `adapter.<type>.<name>.tools.<tool>` string naming the callee tool, and `args` matching the callee's input. Which targets are allowed is defined by the workflow's step-level tools list, not by this tool. An unknown target or a denied call returns a typed error (e.g. unknown_adapter, permission denied): surface it in your reply, do not retry blindly. A tool call that fails — denied, typed error, or callee failure — is returned as an error result and is NOT a step failure; only submit_outcome decides the step outcome."
 )
 
 var errMaxTurnsReached = errors.New("copilot: max_turns reached")
@@ -86,6 +100,15 @@ type copilotAdapter struct {
 	adapterhost.UnimplementedPermissions
 	mu       sync.Mutex
 	sessions map[string]*sessionState
+
+	// toolBridge owns the ADR-0004 adapter-tool-call flow (CRI-152): the
+	// agent-invocable adapter_tool tool issues its calls through
+	// CallAdapterTool, and the per-session Permissions stream feeds the
+	// bridge's dispatch loop the correlated PermissionEvents (bare
+	// allow-grant, cancel, tool_call_result) via an in-memory pipe. One
+	// bridge serves the whole adapter process; calls are correlated by
+	// request_id and the host-unsupported cache is keyed by session.
+	toolBridge *adapterhost.ToolCallBridge
 
 	clientMu sync.Mutex
 	client   *copilot.Client
@@ -109,6 +132,7 @@ func (p *copilotAdapter) Info(_ context.Context, _ *v2.InfoRequest) (*v2.InfoRes
 			"multi_turn",
 			"structured_events",
 			"permission_gating",
+			adapterhost.CapabilityAdapterTools,
 		},
 		ConfigSchema: &v2.AdapterSchemaProto{Fields: map[string]*v2.ConfigFieldProto{
 			"model":             {Type: "string", Description: "Copilot model to use for this session."},
@@ -193,8 +217,26 @@ func (p *copilotAdapter) drainPendingPerms() {
 // sends PermissionEvent messages (request=allow, cancel=deny); the adapter
 // resolves the corresponding pending channel so that handlePermissionRequest
 // can unblock the Copilot SDK callback and return the correct result.
+//
+// Adapter tool calls (CRI-178): the same stream carries the replies to
+// adapter tool calls issued by the adapter_tool tool. Those correlated events
+// (bare allow-grant, cancel, tool_call_result) are forwarded through an
+// in-memory permissionPipe into the ToolCallBridge's dispatch loop, which
+// runs alongside the plain-permission loop for the lifetime of the stream and
+// sends its ACKs back onto the real stream. The bridge resolves every pending
+// call when the stream ends, so a dying stream can never hang a caller.
 func (p *copilotAdapter) Permissions(ctx context.Context, stream adapterhost.PermissionsStream) error {
 	defer p.drainPendingPerms()
+
+	pipe := newPermissionPipe(stream)
+	pipe.run(ctx, p.toolBridge)
+	// Closing the pipe's feed ends the bridge's Recv loop (resolving pending
+	// calls); waiting for the bridge goroutine keeps teardown deterministic.
+	defer func() {
+		pipe.close()
+		<-pipe.done
+	}()
+
 	for {
 		ev, err := stream.Recv()
 		if err != nil {
@@ -203,25 +245,35 @@ func (p *copilotAdapter) Permissions(ctx context.Context, stream adapterhost.Per
 			}
 			return err
 		}
-		p.dispatchPermEvent(ev, stream)
+		p.dispatchPermEvent(ev, pipe)
 	}
 }
 
 // dispatchPermEvent routes a single PermissionEvent to the appropriate pending
-// channel and, for allow events, acknowledges back to the host.
-func (p *copilotAdapter) dispatchPermEvent(ev *v2.PermissionEvent, stream adapterhost.PermissionsStream) {
+// channel and forwards it to the ToolCallBridge's dispatch loop.
+//
+// Plain permission requests (Copilot SDK callbacks) resolve the pendingPerms
+// channel; tool-call-correlated events resolve the bridge's pending entry.
+// Forwarding is total and idempotent: the bridge ACKs the allow-grants it
+// sees, routes cancels and results correlated with an in-flight call, and
+// drops ids it does not know — so a plain request is never double-ACKed and a
+// plain cancel resolves both flows without interference.
+func (p *copilotAdapter) dispatchPermEvent(ev *v2.PermissionEvent, pipe *permissionPipe) {
 	if req := ev.GetRequest(); req != nil {
 		id := req.GetRequestId()
 		p.sendPermDecision(id, "allow")
-		// Acknowledge the decision back to the host.
-		_ = stream.Send(&v2.PermissionDecision{
-			RequestId: id,
-			Decision:  "allow",
-		})
+		// The bridge ACKs the decision back to the host (and records the
+		// old-host bare allow-grant signature for tool-call ids).
+		pipe.forward(ev)
 		return
 	}
 	if cancel := ev.GetCancel(); cancel != nil {
 		p.sendPermDecision(cancel.GetRequestId(), "deny")
+		pipe.forward(ev)
+		return
+	}
+	if tcr := ev.GetToolCallResult(); tcr != nil {
+		pipe.forward(ev)
 	}
 }
 
