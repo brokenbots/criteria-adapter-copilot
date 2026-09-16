@@ -17,13 +17,20 @@ import (
 )
 
 // handlePermissionRequest is the SDK OnPermissionRequest callback. It:
-//  1. Assembles the permission event payload (including a request_id).
-//  2. Registers a pending channel with copilotAdapter.pendingPerms.
-//  3. Forwards the permission.request event upstream via the Execute stream sink.
-//  4. Blocks until the host sends a decision via the Permissions bidi stream
+//  1. Answers the adapter_tool tool's own permission request locally (the
+//     adapter-tools wire call the handler issues is the gated event, so the
+//     SDK's tool-permission layer adds no second gate — CRI-178).
+//  2. Assembles the permission event payload (including a request_id).
+//  3. Registers a pending channel with copilotAdapter.pendingPerms.
+//  4. Forwards the permission.request event upstream via the Execute stream sink.
+//  5. Blocks until the host sends a decision via the Permissions bidi stream
 //     or the active Execute call ends.
-//  5. Returns Approved or Rejected to the Copilot SDK based on the host decision.
+//  6. Returns Approved or Rejected to the Copilot SDK based on the host decision.
 func (p *copilotAdapter) handlePermissionRequest(sessionID string, request copilot.PermissionRequest) (rpc.PermissionDecision, error) {
+	if isAdapterToolPermissionRequest(request) {
+		return &rpc.PermissionDecisionApproveOnce{}, nil
+	}
+
 	s := p.getSession(sessionID)
 	if s == nil {
 		return &rpc.PermissionDecisionUserNotAvailable{}, nil
@@ -59,6 +66,19 @@ func (p *copilotAdapter) handlePermissionRequest(sessionID string, request copil
 		p.resolvePendingPerm(requestID)
 		return &rpc.PermissionDecisionReject{}, nil
 	}
+}
+
+// isAdapterToolPermissionRequest reports whether the SDK permission request
+// is the invocation gate for the adapter_tool custom tool itself (CRI-178).
+// The actual gated side effect is the ADR-0004 wire call the tool handler
+// issues, which the host gates per call — capability, step-level tools
+// grants, policy — so the SDK's tool-permission request is answered locally
+// instead of being forwarded to the host (no second gate). The callee's
+// arguments ride the wire call's own permission.request payload, so they are
+// never forwarded twice.
+func isAdapterToolPermissionRequest(request copilot.PermissionRequest) bool {
+	req, ok := request.(copilot.PermissionRequestCustomTool)
+	return ok && req.ToolName == adapterToolToolName
 }
 
 // buildPermEventPayload converts the Copilot SDK request into the detailsAny

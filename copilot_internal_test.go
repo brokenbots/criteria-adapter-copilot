@@ -373,7 +373,15 @@ func TestApplyAuthOptionsSecretTrimsWhitespace(t *testing.T) {
 	if !slices.Contains(opts.Env, "GH_TOKEN=gh-secret") {
 		t.Fatalf("Env must contain trimmed GH_TOKEN; got %v", opts.Env)
 	}
-	if slices.ContainsFunc(opts.Env, func(s string) bool { return strings.HasPrefix(s, "GITHUB_TOKEN=") }) {
+	// The whitespace-only delivered GITHUB_TOKEN must be dropped from the
+	// forwarded env. A GITHUB_TOKEN entry inherited from the process
+	// environment may legitimately remain (applyAuthOptions passes the
+	// process env through), so the invariant is "no whitespace-only value",
+	// not "absent".
+	if slices.ContainsFunc(opts.Env, func(s string) bool {
+		name, value, _ := strings.Cut(s, "=")
+		return name == "GITHUB_TOKEN" && strings.TrimSpace(value) == ""
+	}) {
 		t.Fatalf("Env must not contain whitespace-only GITHUB_TOKEN; got %v", opts.Env)
 	}
 }

@@ -143,13 +143,29 @@ func (p *copilotAdapter) buildSessionConfig(cfg map[string]string, adapterSessio
 	)
 	submitTool.SkipPermission = true
 
+	// Register adapter_tool (CRI-178): the agent-invocable channel for calls
+	// to other adapters' tools. SkipPermission stays false — the call the
+	// handler issues is itself the gated event end to end (ADR-0004: a tool
+	// call IS a permission request) — and the SDK's own tool-permission
+	// request for this tool is answered locally in handlePermissionRequest so
+	// it adds no second host gate on top of the wire call. submit_outcome is
+	// the opposite case: SkipPermission=true because it is the outcome
+	// channel, not a gated side effect.
+	adapterTool := copilot.DefineTool(
+		adapterToolToolName,
+		adapterToolToolDescription,
+		func(args AdapterToolArgs, invocation copilot.ToolInvocation) (copilot.ToolResult, error) {
+			return p.handleAdapterToolCall(adapterSessionID, invocation, args)
+		},
+	)
+
 	sc := &copilot.SessionConfig{
 		Streaming: copilot.Bool(true),
 		Model:     cfg["model"],
 		OnPermissionRequest: func(r copilot.PermissionRequest, _ copilot.PermissionInvocation) (rpc.PermissionDecision, error) {
 			return p.handlePermissionRequest(adapterSessionID, r)
 		},
-		Tools: []copilot.Tool{submitTool},
+		Tools: []copilot.Tool{submitTool, adapterTool},
 	}
 	if wd := strings.TrimSpace(cfg["working_directory"]); wd != "" {
 		sc.WorkingDirectory = wd
