@@ -24,10 +24,57 @@ type copilotSession interface {
 	On(handler copilot.SessionEventHandler) func()
 	Send(ctx context.Context, options *copilot.MessageOptions) (string, error)
 	SetModel(ctx context.Context, model string, opts *copilot.SetModelOptions) error
+	// SessionID exposes the SDK session identifier (persisted so a respawned
+	// adapter or a restarted CLI child can resume the conversation).
+	SessionID() string
 	Disconnect() error
 	// Destroy is a force-close path used when Disconnect stalls; the real SDK
 	// implementation delegates to Disconnect, so we follow suit below.
 	Destroy() error
+}
+
+// copilotClient abstracts the Copilot SDK client lifecycle (start/stop the CLI
+// child, create or resume SDK sessions, liveness probe) so the CLI-restart
+// path is testable without spawning a real CLI (CRI-272).
+type copilotClient interface {
+	Start(ctx context.Context) error
+	Stop() error
+	// Ping probes the runtime; a non-nil error means the CLI child or its
+	// stdio connection is gone.
+	Ping(ctx context.Context, message string) error
+	CreateSession(ctx context.Context, config *copilot.SessionConfig) (copilotSession, error)
+	ResumeSessionWithOptions(ctx context.Context, sessionID string, config *copilot.ResumeSessionConfig) (copilotSession, error)
+}
+
+// sdkClient adapts the concrete *copilot.Client to copilotClient, wrapping
+// returned sessions in sdkSession.
+type sdkClient struct {
+	inner *copilot.Client
+}
+
+func (c *sdkClient) Start(ctx context.Context) error { return c.inner.Start(ctx) }
+
+func (c *sdkClient) Stop() error { return c.inner.Stop() }
+
+func (c *sdkClient) Ping(ctx context.Context, message string) error {
+	_, err := c.inner.Ping(ctx, message)
+	return err
+}
+
+func (c *sdkClient) CreateSession(ctx context.Context, config *copilot.SessionConfig) (copilotSession, error) {
+	session, err := c.inner.CreateSession(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return &sdkSession{inner: session}, nil
+}
+
+func (c *sdkClient) ResumeSessionWithOptions(ctx context.Context, sessionID string, config *copilot.ResumeSessionConfig) (copilotSession, error) {
+	session, err := c.inner.ResumeSessionWithOptions(ctx, sessionID, config)
+	if err != nil {
+		return nil, err
+	}
+	return &sdkSession{inner: session}, nil
 }
 
 // sdkSession wraps a real Copilot SDK session to satisfy copilotSession.
@@ -46,6 +93,8 @@ func (s *sdkSession) Send(ctx context.Context, options *copilot.MessageOptions) 
 func (s *sdkSession) SetModel(ctx context.Context, model string, opts *copilot.SetModelOptions) error {
 	return s.inner.SetModel(ctx, model, opts)
 }
+
+func (s *sdkSession) SessionID() string { return s.inner.SessionID }
 
 func (s *sdkSession) Disconnect() error {
 	return s.inner.Disconnect()
@@ -95,6 +144,157 @@ type sessionState struct {
 	// channel during OpenSession. These are the only secrets the adapter
 	// redacts from `reason` before emitting step outputs.
 	heldSecrets []string
+
+	// CRI-272 recovery state. owner is the adapter that opened this session
+	// (nil for bare unit-test states): sendWithRetry consults it to restart a
+	// dead CLI child, and it is the only path back to the adapter's mutexes.
+	owner *copilotAdapter
+
+	// adapterSessionID identifies this session on the adapter protocol; the
+	// Copilot SDK session ID is persisted under it.
+	adapterSessionID string
+
+	// sessionConfig and resumeConfig are retained so a CLI-child restart can
+	// re-open the SDK session with the same setup (model, provider/BYOK,
+	// tools, permission gating, streaming, system message). secrets is the
+	// resolved secret set for the same purpose. All three are written once at
+	// open and read-only afterwards.
+	sessionConfig *copilot.SessionConfig
+	resumeConfig  *copilot.ResumeSessionConfig
+	secrets       *adapterhost.Secrets
+
+	// fanout routes SDK session events to every active subscriber
+	// (Execute-level handlers registered via subscribeEvents). It is
+	// re-registered on each underlying SDK session by swapSession so an
+	// in-flight turn keeps receiving events across a CLI-child restart.
+	// eventUnregister removes fanout.handle from the current SDK session.
+	fanout          *eventFanout
+	eventUnregister func()
+	eventMu         sync.Mutex
+}
+
+// eventFanout fans SDK session events out to all subscribed handlers. It is
+// re-registered on every underlying SDK session (see swapSession) so an active
+// Execute keeps receiving events across a CLI-child restart (CRI-272).
+type eventFanout struct {
+	mu       sync.Mutex
+	handlers map[int]copilot.SessionEventHandler
+	nextID   int
+}
+
+func newEventFanout() *eventFanout {
+	return &eventFanout{handlers: map[int]copilot.SessionEventHandler{}}
+}
+
+// handle delivers one SDK event to every current subscriber.
+func (f *eventFanout) handle(event copilot.SessionEvent) {
+	f.mu.Lock()
+	handlers := make([]copilot.SessionEventHandler, 0, len(f.handlers))
+	for _, h := range f.handlers {
+		handlers = append(handlers, h)
+	}
+	f.mu.Unlock()
+	for _, h := range handlers {
+		if h != nil {
+			h(event)
+		}
+	}
+}
+
+// subscribe registers a handler; the returned func unsubscribes it.
+func (f *eventFanout) subscribe(h copilot.SessionEventHandler) func() {
+	if h == nil {
+		return func() {}
+	}
+	f.mu.Lock()
+	id := f.nextID
+	f.nextID++
+	f.handlers[id] = h
+	f.mu.Unlock()
+	return func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		delete(f.handlers, id)
+	}
+}
+
+// subscribeEvents routes a turn's event handler through the session's fanout
+// when one is attached (sessions opened through OpenSession), keeping the
+// subscription alive across CLI-child restarts; bare sessionStates (unit
+// tests) fall back to a direct SDK registration.
+func (s *sessionState) subscribeEvents(h copilot.SessionEventHandler) func() {
+	s.eventMu.Lock()
+	fanout := s.fanout
+	s.eventMu.Unlock()
+	if fanout == nil {
+		return s.session.On(h)
+	}
+	return fanout.subscribe(h)
+}
+
+// swapSession atomically replaces the SDK session backing an adapter session
+// after a CLI-child restart and re-attaches the event fanout to the new
+// session, so an in-flight turn keeps receiving events. The replaced session
+// is disconnected best-effort.
+func (s *sessionState) swapSession(sess copilotSession) {
+	s.eventMu.Lock()
+	old := s.session
+	if s.fanout != nil {
+		if s.eventUnregister != nil {
+			s.eventUnregister()
+		}
+		s.eventUnregister = sess.On(s.fanout.handle)
+	}
+	s.session = sess
+	s.eventMu.Unlock()
+	if old != nil {
+		_ = old.Disconnect()
+	}
+}
+
+// newSessionState builds the adapter's per-session state and attaches the
+// event fanout to the SDK session so a later CLI-child restart can re-register
+// it (CRI-272).
+func newSessionState(
+	adapterSessionID string,
+	sess copilotSession,
+	sessionConfig *copilot.SessionConfig,
+	resumeConfig *copilot.ResumeSessionConfig,
+	secrets *adapterhost.Secrets,
+	owner *copilotAdapter,
+) *sessionState {
+	fanout := newEventFanout()
+	s := &sessionState{
+		session:          sess,
+		owner:            owner,
+		adapterSessionID: adapterSessionID,
+		sessionConfig:    sessionConfig,
+		resumeConfig:     resumeConfig,
+		secrets:          secrets,
+		fanout:           fanout,
+	}
+	s.eventUnregister = sess.On(fanout.handle)
+	return s
+}
+
+// buildResumeConfig derives a ResumeSessionConfig from the session config so a
+// resumed SDK session keeps the same provider (BYOK), model, tools,
+// permission-gating callback, streaming and system-message setup as the
+// original session. Returns nil when there is no session config to derive from.
+func buildResumeConfig(sc *copilot.SessionConfig) *copilot.ResumeSessionConfig {
+	if sc == nil {
+		return nil
+	}
+	return &copilot.ResumeSessionConfig{
+		ClientName:          sc.ClientName,
+		Model:               sc.Model,
+		Tools:               sc.Tools,
+		SystemMessage:       sc.SystemMessage,
+		Provider:            sc.Provider,
+		Streaming:           sc.Streaming,
+		OnPermissionRequest: sc.OnPermissionRequest,
+		WorkingDirectory:    sc.WorkingDirectory,
+	}
 }
 
 // sdkSessionIDPath returns the file that persists the Copilot SDK session ID
@@ -152,39 +352,14 @@ func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionReq
 	cfg := req.GetConfig()
 	adapterSessionID := req.GetSessionId()
 	sessionConfig := p.buildSessionConfig(cfg, adapterSessionID)
-
-	// CRI-272: if this adapter session was opened before (adapter process
-	// respawned after a crash/OOM), resume the persisted Copilot SDK session
-	// instead of creating a fresh one — the SDK restores the full conversation
-	// history, so the developer is NOT reset. A fresh CreateSession is the
-	// fallback (first open) and when a resume fails.
-	var session *copilot.Session
-	if persistedID := loadPersistedSDKSessionID(adapterSessionID); persistedID != "" {
-		slog.Info("copilot: resuming persisted sdk session",
-			"adapterSession", adapterSessionID, "sdkSession", persistedID)
-		session, err = client.ResumeSessionWithOptions(ctx, persistedID, &copilot.ResumeSessionConfig{
-			ClientName: sessionConfig.ClientName,
-			Model:      sessionConfig.Model,
-			Tools:      sessionConfig.Tools,
-		})
-		if err != nil {
-			slog.Warn("copilot: sdk session resume failed; creating a fresh session",
-				"adapterSession", adapterSessionID, "sdkSession", persistedID, "err", err)
-			session = nil
-		}
-	}
-	if session == nil {
-		session, err = client.CreateSession(ctx, sessionConfig)
-		if err != nil {
-			return nil, fmt.Errorf("copilot: create session: %w", err)
-		}
-		persistSDKSessionID(adapterSessionID, session.SessionID)
+	resumeConfig := buildResumeConfig(sessionConfig)
+	session, _, err := p.openSDKSession(ctx, client, adapterSessionID, sessionConfig, resumeConfig)
+	if err != nil {
+		return nil, err
 	}
 
-	s := &sessionState{
-		session:     &sdkSession{inner: session},
-		heldSecrets: heldGitHubTokenSecrets(secrets),
-	}
+	s := newSessionState(adapterSessionID, session, sessionConfig, resumeConfig, secrets, p)
+	s.heldSecrets = heldGitHubTokenSecrets(secrets)
 
 	p.mu.Lock()
 	p.sessions[adapterSessionID] = s
@@ -195,6 +370,30 @@ func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionReq
 	}
 
 	return &v2.OpenSessionResponse{}, nil
+}
+
+// openSDKSession resumes the persisted SDK session for adapterSessionID when
+// one exists (CRI-272: a resumed session restores the full conversation
+// history), falling back to CreateSession on first open, when no ID is
+// persisted, or when resume fails. A newly created session's ID is persisted
+// for later respawns. Returns the session and whether it was resumed.
+func (p *copilotAdapter) openSDKSession(ctx context.Context, client copilotClient, adapterSessionID string, sessionConfig *copilot.SessionConfig, resumeConfig *copilot.ResumeSessionConfig) (copilotSession, bool, error) {
+	if persistedID := loadPersistedSDKSessionID(adapterSessionID); persistedID != "" {
+		slog.Info("copilot: resuming persisted sdk session",
+			"adapterSession", adapterSessionID, "sdkSession", persistedID)
+		sess, err := client.ResumeSessionWithOptions(ctx, persistedID, resumeConfig)
+		if err == nil {
+			return sess, true, nil
+		}
+		slog.Warn("copilot: sdk session resume failed; creating a fresh session",
+			"adapterSession", adapterSessionID, "sdkSession", persistedID, "err", err)
+	}
+	sess, err := client.CreateSession(ctx, sessionConfig)
+	if err != nil {
+		return nil, false, fmt.Errorf("copilot: create session: %w", err)
+	}
+	persistSDKSessionID(adapterSessionID, sess.SessionID())
+	return sess, false, nil
 }
 
 // buildSessionConfig constructs the SDK SessionConfig from agent-level config fields.

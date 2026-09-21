@@ -184,7 +184,7 @@ func (ts *turnState) reprompt(ctx context.Context, s *sessionState) error {
 		"You must call the `submit_outcome` tool with one of the allowed outcomes: %s. Do not return a final answer without calling the tool. Allowed outcomes: %s. Failure to call the tool will fail the step.",
 		list, list,
 	)
-	if _, err := s.session.Send(ctx, &copilot.MessageOptions{Prompt: msg}); err != nil {
+	if _, err := s.sendWithRetry(ctx, &copilot.MessageOptions{Prompt: msg}); err != nil {
 		return fmt.Errorf("copilot: reprompt: %w", err)
 	}
 	return nil
@@ -274,7 +274,10 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	}
 
 	state := newTurnState(maxTurns)
-	unsubscribe := s.session.On(state.handleEvent(sink))
+	// Route the handler through the session's event fanout (CRI-272): if the
+	// CLI child dies mid-turn and the session is re-opened, the swapped-in SDK
+	// session re-registers the same fanout and this turn keeps its events.
+	unsubscribe := s.subscribeEvents(state.handleEvent(sink))
 	defer unsubscribe()
 
 	restoreEffort, err := applyRequestEffort(ctx, s, s.session, req.GetInput())
@@ -287,7 +290,7 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 		return err
 	}
 
-	if _, err := s.session.Send(ctx, &copilot.MessageOptions{Prompt: prompt}); err != nil {
+	if _, err := s.sendWithRetry(ctx, &copilot.MessageOptions{Prompt: prompt}); err != nil {
 		return fmt.Errorf("copilot: send prompt: %w", err)
 	}
 
