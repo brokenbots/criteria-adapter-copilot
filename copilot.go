@@ -293,6 +293,12 @@ func (p *copilotAdapter) sendPermDecision(id, decision string) {
 	}
 }
 
+// githubTokenSecretNames are the accepted secret names for the Copilot GitHub
+// token, in precedence order. The adapter declares all three (see
+// [declaredGitHubTokenSecrets]) so a workflow can supply whichever it uses;
+// [resolveGitHubToken] returns the first one the host delivered.
+var githubTokenSecretNames = []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"}
+
 // declaredGitHubTokenSecrets is the adapter's InfoResponse.Secrets declaration:
 // the GitHub token names the host is allowed to resolve and deliver over the
 // secret channel. Declaring all three preserves the historical env precedence
@@ -399,9 +405,3 @@ func (p *copilotAdapter) getSession(sessionID string) *sessionState {
 	defer p.mu.Unlock()
 	return p.sessions[sessionID]
 }
-
-// githubTokenSecretNames are the accepted secret names for the Copilot GitHub
-// token, in precedence order. The adapter declares all three (see
-// [declaredGitHubTokenSecrets]) so a workflow can supply whichever it uses;
-// [resolveGitHubToken] returns the first one the host delivered.
-var githubTokenSecretNames = []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"}
