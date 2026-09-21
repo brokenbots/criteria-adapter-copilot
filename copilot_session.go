@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	copilot "github.com/github/copilot-sdk/go"
@@ -39,6 +40,12 @@ type copilotSession interface {
 type copilotClient interface {
 	Start(ctx context.Context) error
 	Stop() error
+	// ForceStop kills the CLI child without waiting for graceful teardown.
+	// SDK Stop disconnects every session before killing the child, and those
+	// disconnect RPCs are unbounded — a child that stays alive but stops
+	// servicing RPCs wedges Stop forever (CRI-274), so bounded recovery kills
+	// the child past the grace to fail the pending RPCs.
+	ForceStop()
 	// Ping probes the runtime; a non-nil error means the CLI child or its
 	// stdio connection is gone.
 	Ping(ctx context.Context, message string) error
@@ -55,6 +62,8 @@ type sdkClient struct {
 func (c *sdkClient) Start(ctx context.Context) error { return c.inner.Start(ctx) }
 
 func (c *sdkClient) Stop() error { return c.inner.Stop() }
+
+func (c *sdkClient) ForceStop() { c.inner.ForceStop() }
 
 func (c *sdkClient) Ping(ctx context.Context, message string) error {
 	_, err := c.inner.Ping(ctx, message)
@@ -182,6 +191,23 @@ type sessionState struct {
 	// at most once.
 	boundClientEpoch int
 	reopenMu         sync.Mutex
+
+	// CRI-274 watchdog state. lastActivityNs records the unix-nano time of the
+	// last observed provider-side activity (any SDK session event, a send
+	// attempt, a gate transition) and is read by waitTurnSignal to compute the
+	// inter-event silence window. gatedWaits counts adapter-side waits that
+	// legitimately suspend provider activity (host permission decisions,
+	// adapter tool calls, native tool executions): while positive, the silence
+	// window is replaced by watchdogGateWindow. stallNotify (cap 1) wakes a
+	// parked waitTurnSignal so it re-reads fresh state; it is nil on bare
+	// unit-test states, where every access is nil-safe by construction.
+	// toolGates holds one gate release func per open native-tool gate, keyed by
+	// tool call ID, so an abandoned call's gates can be force-closed.
+	lastActivityNs atomic.Int64
+	gatedWaits     atomic.Int64
+	stallNotify    chan struct{}
+	toolGateMu     sync.Mutex
+	toolGates      map[string]func()
 }
 
 // eventFanout fans SDK session events out to all subscribed handlers. It is
@@ -293,6 +319,7 @@ func newSessionState(
 		resumeConfig:     resumeConfig,
 		secrets:          secrets,
 		fanout:           fanout,
+		stallNotify:      make(chan struct{}, 1),
 	}
 	if owner != nil {
 		// Record the CLI-child runtime epoch at open so reopenSession can

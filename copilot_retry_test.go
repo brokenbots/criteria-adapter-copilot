@@ -54,6 +54,14 @@ type fakeClient struct {
 	startCount int
 	stopCount  int
 	pingErr    error
+	pingCount  int // total Ping probes observed (tests assert force skips the probe)
+
+	// stopBlock, when non-nil, wedges Stop like a child that stays alive but
+	// no longer services the disconnect RPCs Stop issues (CRI-274); tests
+	// close it in cleanup so the abandoned goroutine exits.
+	stopBlock chan struct{}
+	// forceStopCount counts ForceStop kills (the bounded-stop fallback).
+	forceStopCount int
 
 	createCount   int
 	createErr     error
@@ -81,14 +89,28 @@ func (c *fakeClient) Start(_ context.Context) error {
 
 func (c *fakeClient) Stop() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.stopCount++
+	block := c.stopBlock
+	c.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	return nil
+}
+
+// ForceStop kills the CLI child. It does not unblock a wedged Stop: like the
+// real SDK, the kill is issued while the graceful stop is still in flight, and
+// the blocked Stop goroutine may keep failing on its dead pipes for a while.
+func (c *fakeClient) ForceStop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.forceStopCount++
 }
 
 func (c *fakeClient) Ping(_ context.Context, _ string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.pingCount++
 	return c.pingErr
 }
 
@@ -492,7 +514,7 @@ func TestRecoverTransportReopensStaleSessionsIncludingActive(t *testing.T) {
 	p.sessions["adapter-2"] = s2
 	p.sessions["adapter-3"] = s3
 
-	p.recoverTransport(context.Background(), s1)
+	p.recoverTransport(context.Background(), s1, false)
 
 	// Non-trigger sessions first, triggering session last.
 	if len(fc.resumeIDs) != 2 || fc.resumeIDs[0] != "sdk-2" || fc.resumeIDs[1] != "sdk-1" {
@@ -519,7 +541,7 @@ func TestRecoverTransportReopensStaleSessionsIncludingActive(t *testing.T) {
 
 	// A second sweep over the same state must be a no-op: no restart (child
 	// is alive), no resumes, no swaps.
-	p.recoverTransport(context.Background(), nil)
+	p.recoverTransport(context.Background(), nil, false)
 	if len(fc.resumeIDs) != 2 || fc.createCount != 0 || fc.stopCount != 1 || fc.startCount != 1 {
 		t.Fatalf("second sweep changed state: resumes=%v create=%d stop=%d start=%d, want unchanged",
 			fc.resumeIDs, fc.createCount, fc.stopCount, fc.startCount)

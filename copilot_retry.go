@@ -111,11 +111,16 @@ func isTransportDeathError(err error) bool {
 // isRetryableSendError reports whether a Send failure is transient and worth a
 // bounded retry: provider HTTP 500/502/503/504/429 (surfaced by the CLI as a
 // JSON-RPC error whose message carries the status), rate-limit/overload
-// markers, and transport-level failures on the CLI stdio. Everything else —
-// including other 4xx — is surfaced as-is.
+// markers, transport-level failures on the CLI stdio, and watchdog stalls
+// (CRI-274): a hung send or a silent stream is a failed call to be retried,
+// not a wedge to wait on. Everything else — including other 4xx — is surfaced
+// as-is.
 func isRetryableSendError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if isProviderStallError(err) {
+		return true
 	}
 	if isTransportDeathError(err) {
 		return true
@@ -146,7 +151,13 @@ func (s *sessionState) sendWithRetry(ctx context.Context, opts *copilot.MessageO
 		// swaps in a re-opened session (recoverTransport), and the next
 		// attempt must target the new one. The accessor shares swapSession's
 		// lock, so the swap cannot race this read.
-		msgID, err := s.currentSession().Send(ctx, opts)
+		//
+		// Each attempt re-baselines the watchdog activity clock (CRI-274) so
+		// the turn-level inter-event watchdog measures from this send, and the
+		// send itself is timeboxed: the SDK's jsonrpc2 Request has no timeout
+		// of its own, so a CLI that never answers would park Send forever.
+		s.markActivity()
+		msgID, err := sendRPCTimeboxed(ctx, s.currentSession(), opts)
 		if err == nil {
 			return msgID, nil
 		}
@@ -163,8 +174,11 @@ func (s *sessionState) sendWithRetry(ctx context.Context, opts *copilot.MessageO
 		if s.owner != nil {
 			// The child may have died instead of returning a provider
 			// error; restore the transport (no-op when it is still alive)
-			// before giving the provider time to recover.
-			s.owner.recoverTransport(ctx, s)
+			// before giving the provider time to recover. A watchdog stall
+			// forces the restart: an alive-but-wedged child passes the Ping
+			// liveness probe, so the gated probe would never restart it
+			// (CRI-274).
+			s.owner.recoverTransport(ctx, s, isProviderStallError(err))
 		}
 		sleep := backoffDelay(attempt)
 		if deadline, ok := ctx.Deadline(); ok {
@@ -211,8 +225,11 @@ func startClientWithRetry(ctx context.Context, client copilotClient) error {
 }
 
 // recoverTransport restores the adapter's CLI child after a send failed on a
-// dead transport (CRI-272). The current client is probed and restarted only
-// when actually dead; every session still bound to a superseded runtime is
+// dead transport (CRI-272) or stalled (CRI-274). The current client is
+// restarted when dead, or unconditionally when force is set: a watchdog stall
+// proves the child is wedged even though it is alive enough to answer a Ping
+// probe, and killing it is what unblocks the abandoned in-flight Send and any
+// wedged provider stream. Every session still bound to a superseded runtime is
 // then re-opened — including sessions whose Execute is in flight: with the
 // guarded session accessor a swap is safe, and the in-flight retry loop picks
 // the re-opened session up on its next attempt. The triggering session is
@@ -222,8 +239,8 @@ func startClientWithRetry(ctx context.Context, client copilotClient) error {
 // staleness check keeps sessions a peer already re-opened from churning twice.
 // Errors are logged, not returned: the retry loop continues and surfaces the
 // last Send error if recovery fails.
-func (p *copilotAdapter) recoverTransport(ctx context.Context, trigger *sessionState) {
-	if _, _, err := p.restartClient(ctx); err != nil {
+func (p *copilotAdapter) recoverTransport(ctx context.Context, trigger *sessionState, force bool) {
+	if _, _, err := p.restartClient(ctx, force); err != nil {
 		slog.Warn("copilot: cli child restart failed", "err", err)
 		return
 	}
@@ -244,17 +261,29 @@ func (p *copilotAdapter) recoverTransport(ctx context.Context, trigger *sessionS
 	}
 }
 
-// restartClient probes the CLI child and restarts it when dead. Returns the
+// restartClient probes the CLI child and restarts it when dead. With force
+// set, the Ping probe is skipped and a live child is stopped unconditionally —
+// watchdog stall recovery must not be fooled by a child that answers liveness
+// probes while its provider stream is wedged (CRI-274). The forced stop is
+// bounded (stopClientBounded): SDK Stop can itself wedge on the child it is
+// stopping, since its per-session disconnect RPCs go unanswered, so the child
+// is killed via ForceStop past stopGrace and clientMu is never held past that
+// bound. The non-force path keeps its original semantics: a child that fails
+// Ping has a broken connection, so Stop returns promptly. Returns the
 // (possibly unchanged) client and whether a restart happened. Serialized with
 // ensureClient on clientMu.
-func (p *copilotAdapter) restartClient(ctx context.Context) (copilotClient, bool, error) {
+func (p *copilotAdapter) restartClient(ctx context.Context, force bool) (copilotClient, bool, error) {
 	p.clientMu.Lock()
 	defer p.clientMu.Unlock()
 	if p.client != nil {
-		if err := p.client.Ping(ctx, "liveness"); err == nil {
-			return p.client, false, nil
+		if !force {
+			if err := p.client.Ping(ctx, "liveness"); err == nil {
+				return p.client, false, nil
+			}
+			_ = p.client.Stop()
+		} else {
+			stopClientBounded(p.client)
 		}
-		_ = p.client.Stop()
 		p.client = nil
 	}
 	client, err := p.startClientLocked(ctx, nil)
