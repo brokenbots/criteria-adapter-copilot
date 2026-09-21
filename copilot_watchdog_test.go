@@ -393,10 +393,9 @@ func TestToolGatesKeyedByToolCallID(t *testing.T) {
 		t.Fatalf("gatedWaits = %d, want 0 after drainStaleSignals", s.gatedWaits.Load())
 	}
 
-	// Gates opened after the drain must survive the next drain… only stale
-	// ones are closed, and drainStaleSignals on an empty drain state is a no-op
-	// beyond closing gates: a gate opened afterwards stays open until its own
-	// completion or the next abandoned-call drain.
+	// drainStaleSignals closes EVERY open gate (it runs only when a call is
+	// abandoned and the wedged child will never emit completions), so a gate
+	// opened even after the first drain is closed by the next one.
 	handler(copilot.SessionEvent{Data: &copilot.ToolExecutionStartData{ToolCallID: "tc-fresh"}})
 	ts.drainStaleSignals(s)
 	if s.gatedWaits.Load() != 0 {
