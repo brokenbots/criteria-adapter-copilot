@@ -479,6 +479,12 @@ func TestRecoverTransportReopensStaleSessionsIncludingActive(t *testing.T) {
 	s1 := newSessionState("adapter-1", dead1, sc, buildResumeConfig(sc), secrets, p)
 	s2 := newSessionState("adapter-2", idle2, sc, buildResumeConfig(sc), secrets, p)
 	s3 := newSessionState("adapter-3", alive3, sc, buildResumeConfig(sc), secrets, p)
+	// s2 is the in-flight case the defect class requires: its Execute is in
+	// flight (active), yet its binding is stale after the CLI restart, so the
+	// sweep must re-open it — the pre-fix logic skipped active sessions.
+	s2.mu.Lock()
+	s2.active = true
+	s2.mu.Unlock()
 	s3.reopenMu.Lock()
 	s3.boundClientEpoch = 1
 	s3.reopenMu.Unlock()
@@ -571,6 +577,11 @@ func TestSendWithRetryPeerRestartHealsAllSessions(t *testing.T) {
 	gatedB := &gatedSendSession{copilotSession: deadB, gate: make(chan struct{})}
 	sA := newSessionState("adapter-a", deadA, sc, buildResumeConfig(sc), secrets, p)
 	sB := newSessionState("adapter-b", gatedB, sc, buildResumeConfig(sc), secrets, p)
+	// B is in flight (active) while its binding goes stale: the sweep must
+	// heal it anyway; the pre-fix logic skipped active sessions entirely.
+	sB.mu.Lock()
+	sB.active = true
+	sB.mu.Unlock()
 	p.sessions["adapter-a"] = sA
 	p.sessions["adapter-b"] = sB
 
