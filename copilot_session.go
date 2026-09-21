@@ -211,10 +211,9 @@ type sessionState struct {
 
 	// CRI-277 per-session watchdog windows parsed from the agent-level config
 	// (watchdog_window / watchdog_gate_window). Written once at OpenSession
-	// and read-only afterwards; zero fields fall back to the package defaults
-	// via the watchdogWindow / watchdogGateWindow accessors, so sessions
-	// opened without the keys — and bare unit-test states — keep the shipped
-	// windows.
+	// — already resolved, unset keys holding the shipped defaults — and
+	// read-only afterwards. The watchdogWindow / watchdogGateWindow
+	// accessors' zero-field fallback covers bare unit-test states.
 	watchdog watchdogSettings
 }
 

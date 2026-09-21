@@ -88,9 +88,10 @@ const (
 )
 
 // watchdogSettings is the per-session watchdog window configuration parsed
-// from the agent-level config (CRI-277). Zero fields fall back to the package
-// defaults (watchdogWindow / watchdogGateWindow) so sessions opened without
-// the config keys — and bare unit-test states — keep the shipped behavior.
+// from the agent-level config (CRI-277). OpenSession stores the windows
+// already resolved (parseWatchdogSettings fills unset keys with the package
+// defaults); zero fields are the bare unit-test state and fall back to the
+// package defaults via the watchdogWindow / watchdogGateWindow accessors.
 // Written once at OpenSession and read-only afterwards.
 type watchdogSettings struct {
 	window     time.Duration
