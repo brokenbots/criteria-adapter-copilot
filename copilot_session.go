@@ -5,6 +5,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -94,6 +97,48 @@ type sessionState struct {
 	heldSecrets []string
 }
 
+// sdkSessionIDPath returns the file that persists the Copilot SDK session ID
+// for the given adapter session, under CRITERIA_HOME (a PVC-backed path in k8s
+// per-scope topology). Persisting the ID lets a respawned adapter process
+// resume the SDK conversation (full history) instead of starting cold
+// (CRI-272: every session death was losing the whole conversation context).
+func sdkSessionIDPath(adapterSessionID string) string {
+	home := os.Getenv("CRITERIA_HOME")
+	if strings.TrimSpace(home) == "" {
+		home = os.Getenv("HOME")
+	}
+	if strings.TrimSpace(home) == "" {
+		home = "/tmp"
+	}
+	return filepath.Join(home, ".copilot-adapter", "sdk-sessions", adapterSessionID+".id")
+}
+
+// loadPersistedSDKSessionID returns the previously persisted Copilot SDK
+// session ID for the adapter session, or "" when none is recorded.
+func loadPersistedSDKSessionID(adapterSessionID string) string {
+	data, err := os.ReadFile(sdkSessionIDPath(adapterSessionID))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// persistSDKSessionID records the Copilot SDK session ID so a later adapter
+// process (respawn after OOM/crash) can resume the same conversation.
+func persistSDKSessionID(adapterSessionID, sdkSessionID string) {
+	if adapterSessionID == "" || sdkSessionID == "" {
+		return
+	}
+	path := sdkSessionIDPath(adapterSessionID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		slog.Warn("copilot: persist sdk session id: mkdir failed", "path", filepath.Dir(path), "err", err)
+		return
+	}
+	if err := os.WriteFile(path, []byte(sdkSessionID), 0o600); err != nil {
+		slog.Warn("copilot: persist sdk session id failed", "path", path, "err", err)
+	}
+}
+
 func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionRequest) (*v2.OpenSessionResponse, error) {
 	// Resolved secrets for this session, constrained to the names the adapter
 	// declared in Info().Secrets. The GitHub token is sourced from here, never
@@ -108,9 +153,32 @@ func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionReq
 	adapterSessionID := req.GetSessionId()
 	sessionConfig := p.buildSessionConfig(cfg, adapterSessionID)
 
-	session, err := client.CreateSession(ctx, sessionConfig)
-	if err != nil {
-		return nil, fmt.Errorf("copilot: create session: %w", err)
+	// CRI-272: if this adapter session was opened before (adapter process
+	// respawned after a crash/OOM), resume the persisted Copilot SDK session
+	// instead of creating a fresh one — the SDK restores the full conversation
+	// history, so the developer is NOT reset. A fresh CreateSession is the
+	// fallback (first open) and when a resume fails.
+	var session *copilot.Session
+	if persistedID := loadPersistedSDKSessionID(adapterSessionID); persistedID != "" {
+		slog.Info("copilot: resuming persisted sdk session",
+			"adapterSession", adapterSessionID, "sdkSession", persistedID)
+		session, err = client.ResumeSessionWithOptions(ctx, persistedID, &copilot.ResumeSessionConfig{
+			ClientName: sessionConfig.ClientName,
+			Model:      sessionConfig.Model,
+			Tools:      sessionConfig.Tools,
+		})
+		if err != nil {
+			slog.Warn("copilot: sdk session resume failed; creating a fresh session",
+				"adapterSession", adapterSessionID, "sdkSession", persistedID, "err", err)
+			session = nil
+		}
+	}
+	if session == nil {
+		session, err = client.CreateSession(ctx, sessionConfig)
+		if err != nil {
+			return nil, fmt.Errorf("copilot: create session: %w", err)
+		}
+		persistSDKSessionID(adapterSessionID, session.SessionID)
 	}
 
 	s := &sessionState{
