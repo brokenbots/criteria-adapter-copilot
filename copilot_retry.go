@@ -48,6 +48,11 @@ var retrySleep = func(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// retryNow is the clock used to compute the remaining context deadline when
+// clamping a backoff sleep; overridable in tests so deadline behaviour is
+// asserted deterministically instead of against wall-clock margins.
+var retryNow = time.Now
+
 // backoffDelay returns the wait preceding the retry after the failed attempt
 // (0-based): 1s → 4s → 16s, capped at retryMaxDelay.
 func backoffDelay(attempt int) time.Duration {
@@ -137,7 +142,11 @@ func isRetryableSendError(err error) bool {
 func (s *sessionState) sendWithRetry(ctx context.Context, opts *copilot.MessageOptions) (string, error) {
 	var lastErr error
 	for attempt := 0; attempt < retryMaxAttempts; attempt++ {
-		msgID, err := s.session.Send(ctx, opts)
+		// Re-read the session every attempt: a CLI-child restart mid-retry
+		// swaps in a re-opened session (recoverTransport), and the next
+		// attempt must target the new one. The accessor shares swapSession's
+		// lock, so the swap cannot race this read.
+		msgID, err := s.currentSession().Send(ctx, opts)
 		if err == nil {
 			return msgID, nil
 		}
@@ -159,7 +168,7 @@ func (s *sessionState) sendWithRetry(ctx context.Context, opts *copilot.MessageO
 		}
 		sleep := backoffDelay(attempt)
 		if deadline, ok := ctx.Deadline(); ok {
-			remaining := time.Until(deadline)
+			remaining := deadline.Sub(retryNow())
 			if remaining <= 0 {
 				return "", lastErr
 			}
@@ -203,17 +212,19 @@ func startClientWithRetry(ctx context.Context, client copilotClient) error {
 
 // recoverTransport restores the adapter's CLI child after a send failed on a
 // dead transport (CRI-272). The current client is probed and restarted only
-// when actually dead; every live, non-executing session is then reopened
-// against the new runtime, and the triggering session last (its own Execute
-// goroutine is waiting inside sendWithRetry). Errors are logged, not returned:
-// the retry loop continues and surfaces the last Send error if recovery fails.
+// when actually dead; every session still bound to a superseded runtime is
+// then re-opened — including sessions whose Execute is in flight: with the
+// guarded session accessor a swap is safe, and the in-flight retry loop picks
+// the re-opened session up on its next attempt. The triggering session is
+// handled last (its own goroutine is waiting inside sendWithRetry). A restart
+// already performed by a peer goroutine does not skip the sweep: the caller's
+// session may still be bound to the superseded runtime, and reopenSession's
+// staleness check keeps sessions a peer already re-opened from churning twice.
+// Errors are logged, not returned: the retry loop continues and surfaces the
+// last Send error if recovery fails.
 func (p *copilotAdapter) recoverTransport(ctx context.Context, trigger *sessionState) {
-	client, restarted, err := p.restartClient(ctx)
-	if err != nil {
+	if _, _, err := p.restartClient(ctx); err != nil {
 		slog.Warn("copilot: cli child restart failed", "err", err)
-		return
-	}
-	if !restarted {
 		return
 	}
 	p.mu.Lock()
@@ -226,18 +237,10 @@ func (p *copilotAdapter) recoverTransport(ctx context.Context, trigger *sessionS
 		if s == trigger {
 			continue
 		}
-		// An in-flight Execute owns its session; its own retry loop will
-		// recover it. Swapping it here would race with its goroutine.
-		s.mu.Lock()
-		active := s.active
-		s.mu.Unlock()
-		if active {
-			continue
-		}
-		p.reopenSession(ctx, client, s)
+		p.reopenSession(ctx, s)
 	}
 	if trigger != nil {
-		p.reopenSession(ctx, client, trigger)
+		p.reopenSession(ctx, trigger)
 	}
 }
 
@@ -261,13 +264,47 @@ func (p *copilotAdapter) restartClient(ctx context.Context) (copilotClient, bool
 	return client, true, nil
 }
 
-// reopenSessions re-opens the SDK session for an adapter session after a CLI
-// child restart: resume via the persisted SDK session ID when possible,
-// falling back to a fresh CreateSession; the persisted ID is updated when a
-// new session had to be created. Errors are logged — the subsequent retry will
-// surface the failure if the transport stayed broken.
-func (p *copilotAdapter) reopenSession(ctx context.Context, client copilotClient, s *sessionState) {
-	if client == nil || s == nil {
+// clientEpoch identifies the current CLI child runtime: it is bumped on every
+// successful (re)start, so sessions can tell whether they are still bound to
+// the runtime they were opened on or to one that has since been superseded by
+// a restart (possibly by a peer goroutine).
+func (p *copilotAdapter) currentClientAndEpoch() (copilotClient, int) {
+	p.clientMu.Lock()
+	defer p.clientMu.Unlock()
+	return p.client, p.clientEpoch
+}
+
+// currentClientEpoch reports the current CLI runtime epoch.
+func (p *copilotAdapter) currentClientEpoch() int {
+	p.clientMu.Lock()
+	defer p.clientMu.Unlock()
+	return p.clientEpoch
+}
+
+// reopenSession re-opens the SDK session for an adapter session that is still
+// bound to a superseded CLI runtime (CRI-272): resume via the persisted SDK
+// session ID when possible, falling back to a fresh CreateSession; the
+// persisted ID is updated when a new session had to be created. Sessions
+// already on the current runtime epoch — including ones a peer goroutine
+// re-opened first — are left untouched, so concurrent recovery sweeps churn a
+// session at most once, and sessions removed from the adapter (CloseSession)
+// are skipped. Serialized per session on reopenMu; errors are logged — the
+// subsequent retry will surface the failure if the transport stayed broken.
+func (p *copilotAdapter) reopenSession(ctx context.Context, s *sessionState) {
+	if s == nil {
+		return
+	}
+	s.reopenMu.Lock()
+	defer s.reopenMu.Unlock()
+
+	p.mu.Lock()
+	_, stillOpen := p.sessions[s.adapterSessionID]
+	p.mu.Unlock()
+	if !stillOpen {
+		return
+	}
+	client, epoch := p.currentClientAndEpoch()
+	if client == nil || s.boundClientEpoch == epoch {
 		return
 	}
 	sess, resumed, err := p.openSDKSession(ctx, client, s.adapterSessionID, s.sessionConfig, s.resumeConfig)
@@ -276,6 +313,7 @@ func (p *copilotAdapter) reopenSession(ctx context.Context, client copilotClient
 		return
 	}
 	s.swapSession(sess)
+	s.boundClientEpoch = epoch
 	slog.Info("copilot: reopened sdk session after cli restart",
 		"adapterSession", s.adapterSessionID, "sdkSession", sess.SessionID(), "resumed", resumed)
 }
@@ -337,5 +375,6 @@ func (p *copilotAdapter) startClientLocked(ctx context.Context, secrets *adapter
 		return nil, err
 	}
 	p.client = client
+	p.clientEpoch++
 	return p.client, nil
 }

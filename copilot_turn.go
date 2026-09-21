@@ -280,13 +280,17 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	unsubscribe := s.subscribeEvents(state.handleEvent(sink))
 	defer unsubscribe()
 
-	restoreEffort, err := applyRequestEffort(ctx, s, s.session, req.GetInput())
+	// Snapshot the SDK session via the guarded accessor for the model/effort
+	// apply calls below; a concurrent reopenSession may swap the session
+	// mid-setup, and the bare field read would be a data race (CRI-272).
+	sess := s.currentSession()
+	restoreEffort, err := applyRequestEffort(ctx, s, sess, req.GetInput())
 	if err != nil {
 		return err
 	}
 	defer restoreEffort()
 
-	if err := applyRequestModel(ctx, s.session, req.GetInput()); err != nil {
+	if err := applyRequestModel(ctx, sess, req.GetInput()); err != nil {
 		return err
 	}
 

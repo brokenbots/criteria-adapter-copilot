@@ -118,6 +118,11 @@ type copilotAdapter struct {
 	// first build so restarts need no fresh secrets.
 	client        copilotClient
 	clientOptions *copilot.ClientOptions
+	// clientEpoch counts successful CLI-child starts. Sessions record the
+	// epoch they were opened on; after a restart, reopenSession re-opens only
+	// the sessions still bound to a superseded epoch (no churn from peer
+	// sweeps, no stale bindings left behind).
+	clientEpoch int
 
 	// pendingPerms tracks in-flight permission requests from Copilot SDK
 	// callbacks that are waiting for a host decision over the Permissions

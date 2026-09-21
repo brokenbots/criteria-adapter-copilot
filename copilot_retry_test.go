@@ -256,29 +256,62 @@ func TestBackoffSequence(t *testing.T) {
 	}
 }
 
+// fakeDeadlineContext carries a deadline without ever expiring on its own:
+// Err() stays nil, so the retry loop's ctx check never fires and the deadline
+// path can only trigger through the clamp arithmetic — asserted against a
+// fake clock, not wall-clock scheduling margins.
+type fakeDeadlineContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c fakeDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+
 func TestSendWithRetryDeadlineCapsSleep(t *testing.T) {
 	origBase, origMax := retryBaseDelay, retryMaxDelay
 	retryBaseDelay = 40 * time.Millisecond
 	retryMaxDelay = time.Second
 	t.Cleanup(func() { retryBaseDelay, retryMaxDelay = origBase, origMax })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Millisecond)
-	defer cancel()
+	// Deterministic clock: the injected retrySleep records the requested
+	// sleep and advances the fake clock; retryNow reports it. No real timers
+	// are involved, so the assertions below cannot flake on scheduling.
+	base := time.Unix(1000, 0)
+	now := base
+	origNow := retryNow
+	retryNow = func() time.Time { return now }
+	t.Cleanup(func() { retryNow = origNow })
+	origSleep := retrySleep
+	sleeps := []time.Duration{}
+	retrySleep = func(_ context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		now = now.Add(d)
+		return nil
+	}
+	t.Cleanup(func() { retrySleep = origSleep })
 
-	fake := &fakeSession{sendErr: fmt.Errorf("failed to send message: JSON-RPC Error -32603: HTTP 502")}
+	lastErr := fmt.Errorf("failed to send message: JSON-RPC Error -32603: HTTP 502")
+	fake := &fakeSession{sendErr: lastErr}
 	s := &sessionState{session: fake}
+	ctx := fakeDeadlineContext{Context: context.Background(), deadline: base.Add(90 * time.Millisecond)}
+
 	_, err := s.sendWithRetry(ctx, &copilot.MessageOptions{Prompt: "hi"})
 	if err == nil {
-		t.Fatal("expected the last send error after the deadline expired")
+		t.Fatal("expected the last send error once the deadline is spent")
+	}
+	if !errors.Is(err, lastErr) {
+		t.Fatalf("err = %v, want the raw last provider error (no exhaustion wrap)", err)
 	}
 	if strings.Contains(err.Error(), "retries exhausted") {
-		t.Fatalf("deadline-capped send must surface the last error, not the exhaustion wrap: %v", err)
+		t.Fatalf("deadline-reached send must surface the last error, not the exhaustion wrap: %v", err)
 	}
-	if !strings.Contains(err.Error(), "HTTP 502") {
-		t.Fatalf("err = %v, want the provider 502 surfaced", err)
+	if fake.sendAttempts != 3 {
+		t.Fatalf("send attempts = %d, want 3 (attempt 2 sees remaining 0 and stops)", fake.sendAttempts)
 	}
-	if fake.sendAttempts < 3 || fake.sendAttempts > retryMaxAttempts {
-		t.Fatalf("send attempts = %d, want 3..%d (deadline must stop further attempts)", fake.sendAttempts, retryMaxAttempts)
+	// attempt 0 → 40ms; attempt 1 → 4s clamped to the 50ms remaining;
+	// attempt 2 → remaining 0 → return before sleeping.
+	if len(sleeps) != 2 || sleeps[0] != 40*time.Millisecond || sleeps[1] != 50*time.Millisecond {
+		t.Fatalf("recorded sleeps = %v, want [40ms 50ms]", sleeps)
 	}
 }
 
@@ -414,15 +447,19 @@ func TestSendWithRetryRestartsClientAndResumesSession(t *testing.T) {
 	}
 }
 
-// TestRecoverTransportSkipsActiveNonTriggerSessions: recovery reopens the
-// triggering session and idle ones, but must not swap a session whose Execute
-// is in flight (its own retry loop recovers it) — swapping would race.
-func TestRecoverTransportSkipsActiveNonTriggerSessions(t *testing.T) {
+// TestRecoverTransportReopensStaleSessionsIncludingActive: after a CLI-child
+// restart, recovery re-opens EVERY session still bound to the superseded
+// runtime — the triggering one last, in-flight ones included (their retry loop
+// re-reads the session each attempt). A session already re-opened on the new
+// runtime (simulated here by a fresh boundClientEpoch) must not churn, and a
+// second sweep over the same sessions must be a complete no-op.
+func TestRecoverTransportReopensStaleSessionsIncludingActive(t *testing.T) {
 	withFastBackoff(t)
 	dir := t.TempDir()
 	t.Setenv("CRITERIA_HOME", dir)
 	persistSDKSessionID("adapter-1", "sdk-1")
 	persistSDKSessionID("adapter-2", "sdk-2")
+	persistSDKSessionID("adapter-3", "sdk-3")
 
 	p := newCopilotAdapter()
 	fc := &fakeClient{pingErr: errors.New("client not connected")}
@@ -433,32 +470,299 @@ func TestRecoverTransportSkipsActiveNonTriggerSessions(t *testing.T) {
 	t.Cleanup(func() { newClientFn = origNew })
 
 	sc := &copilot.SessionConfig{Model: "m"}
+	secrets := adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil)
 	dead1 := &fakeSession{sessionID: "sdk-1"}
 	idle2 := &fakeSession{sessionID: "sdk-2"}
-	s1 := newSessionState("adapter-1", dead1, sc, buildResumeConfig(sc), adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil), p)
-	s2 := newSessionState("adapter-2", idle2, sc, buildResumeConfig(sc), adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil), p)
-	s2.mu.Lock()
-	s2.active = true
-	s2.mu.Unlock()
+	// s3 simulates a session a peer goroutine already re-opened on the new
+	// runtime epoch (1): its binding is current, so the sweep must skip it.
+	alive3 := &fakeSession{sessionID: "sdk-3"}
+	s1 := newSessionState("adapter-1", dead1, sc, buildResumeConfig(sc), secrets, p)
+	s2 := newSessionState("adapter-2", idle2, sc, buildResumeConfig(sc), secrets, p)
+	s3 := newSessionState("adapter-3", alive3, sc, buildResumeConfig(sc), secrets, p)
+	s3.reopenMu.Lock()
+	s3.boundClientEpoch = 1
+	s3.reopenMu.Unlock()
 	p.sessions["adapter-1"] = s1
 	p.sessions["adapter-2"] = s2
-
-	recovered := &fakeSession{sessionID: "sdk-1"}
-	fc.handOut = recovered
+	p.sessions["adapter-3"] = s3
 
 	p.recoverTransport(context.Background(), s1)
 
-	if s1.session != recovered {
-		t.Fatalf("triggering session was not reopened: got %T", s1.session)
+	// Non-trigger sessions first, triggering session last.
+	if len(fc.resumeIDs) != 2 || fc.resumeIDs[0] != "sdk-2" || fc.resumeIDs[1] != "sdk-1" {
+		t.Fatalf("resume calls = %v, want [sdk-2 sdk-1] (non-trigger first, trigger last)", fc.resumeIDs)
 	}
-	s2.mu.Lock()
-	stillIdle := s2.session == idle2
-	s2.mu.Unlock()
-	if !stillIdle {
-		t.Fatal("in-flight (active) non-trigger session must not be swapped concurrently")
+	if got := s1.currentSession(); got == dead1 {
+		t.Fatal("triggering session was not reopened")
 	}
-	if len(fc.resumeIDs) == 0 || fc.resumeIDs[0] != "sdk-1" {
-		t.Fatalf("resume order = %v, want the triggering session resumed", fc.resumeIDs)
+	if got := s2.currentSession(); got == idle2 {
+		t.Fatal("active non-trigger session was not reopened despite being stale")
+	}
+	if got := s3.currentSession(); got != alive3 {
+		t.Fatal("session already re-opened on the new runtime epoch must not churn")
+	}
+	if s1.boundClientEpoch != 1 || s2.boundClientEpoch != 1 || s3.boundClientEpoch != 1 {
+		t.Fatalf("bound epochs = %d/%d/%d, want 1/1/1", s1.boundClientEpoch, s2.boundClientEpoch, s3.boundClientEpoch)
+	}
+	if fc.createCount != 0 {
+		t.Fatalf("create calls = %d, want 0 (all resumes succeed)", fc.createCount)
+	}
+	if fc.stopCount != 1 || fc.startCount != 1 {
+		t.Fatalf("stop/start = %d/%d, want 1/1", fc.stopCount, fc.startCount)
+	}
+
+	// A second sweep over the same state must be a no-op: no restart (child
+	// is alive), no resumes, no swaps.
+	p.recoverTransport(context.Background(), nil)
+	if len(fc.resumeIDs) != 2 || fc.createCount != 0 || fc.stopCount != 1 || fc.startCount != 1 {
+		t.Fatalf("second sweep changed state: resumes=%v create=%d stop=%d start=%d, want unchanged",
+			fc.resumeIDs, fc.createCount, fc.stopCount, fc.startCount)
+	}
+	if got := s1.currentSession(); got == dead1 {
+		t.Fatal("second sweep swapped s1 back")
+	}
+}
+
+// gatedSendSession delays its first Send until the gate closes, then delegates
+// to the wrapped session. Used to script "session B's EOF failure happens only
+// after a peer already restarted the CLI child".
+type gatedSendSession struct {
+	copilotSession
+	gate chan struct{}
+}
+
+func (g *gatedSendSession) Send(ctx context.Context, opts *copilot.MessageOptions) (string, error) {
+	select {
+	case <-g.gate:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	return g.copilotSession.Send(ctx, opts)
+}
+
+// TestSendWithRetryPeerRestartHealsAllSessions covers the multi-session
+// recovery gap: session A fails EOF and restarts the CLI child; session B then
+// fails EOF only after that restart is complete. B must still land on the new
+// runtime — re-opened by A's sweep (exactly once each), not skipped — and
+// B's retry must succeed on the re-opened session. A live CLI (502 during a
+// healthy turn) causes no restart and no resume churn at all.
+func TestSendWithRetryPeerRestartHealsAllSessions(t *testing.T) {
+	withFastBackoff(t)
+	dir := t.TempDir()
+	t.Setenv("CRITERIA_HOME", dir)
+	persistSDKSessionID("adapter-a", "sdk-a")
+	persistSDKSessionID("adapter-b", "sdk-b")
+
+	p := newCopilotAdapter()
+	fc := &fakeClient{pingErr: errors.New("client not connected")}
+	p.client = fc
+	p.clientOptions = &copilot.ClientOptions{}
+	origNew := newClientFn
+	newClientFn = func(*copilot.ClientOptions) copilotClient { return fc }
+	t.Cleanup(func() { newClientFn = origNew })
+
+	sc := &copilot.SessionConfig{Model: "m"}
+	secrets := adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil)
+	eofErr := fmt.Errorf("failed to send message: CLI process exited: EOF")
+	deadA := &fakeSession{sessionID: "sdk-a", sendErrSequence: []error{eofErr}}
+	// B's first Send is gated: it fails with EOF only after A's retry loop has
+	// fully completed (restart + sweep), i.e. the restart is already done.
+	deadB := &fakeSession{sessionID: "sdk-b", sendErrSequence: []error{eofErr}}
+	gatedB := &gatedSendSession{copilotSession: deadB, gate: make(chan struct{})}
+	sA := newSessionState("adapter-a", deadA, sc, buildResumeConfig(sc), secrets, p)
+	sB := newSessionState("adapter-b", gatedB, sc, buildResumeConfig(sc), secrets, p)
+	p.sessions["adapter-a"] = sA
+	p.sessions["adapter-b"] = sB
+
+	doneA := make(chan error, 1)
+	go func() {
+		_, err := sA.sendWithRetry(context.Background(), &copilot.MessageOptions{Prompt: "a"})
+		doneA <- err
+	}()
+	doneB := make(chan error, 1)
+	go func() {
+		_, err := sB.sendWithRetry(context.Background(), &copilot.MessageOptions{Prompt: "b"})
+		doneB <- err
+	}()
+
+	// The gate opens once A's recovery is complete, so B's EOF failure lands
+	// exactly in the "restart already performed by a peer" window. The deferred
+	// open is a safety net so a failure path cannot hang the test.
+	openGate := sync.OnceFunc(func() { close(gatedB.gate) })
+	defer openGate()
+	if err := <-doneA; err != nil {
+		t.Fatalf("session A send = %v, want success after restart+resume", err)
+	}
+	openGate()
+	select {
+	case err := <-doneB:
+		if err != nil {
+			t.Fatalf("session B send = %v, want success (peer restart must heal B)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session B send did not complete")
+	}
+
+	// Both sessions ended on freshly re-opened SDK sessions; neither stale
+	// session ever completed a send.
+	for _, tc := range []struct {
+		name  string
+		dead  *fakeSession
+		s     *sessionState
+		sdkID string
+	}{
+		{"A", deadA, sA, "sdk-a"},
+		{"B", deadB, sB, "sdk-b"},
+	} {
+		resumed, ok := tc.s.currentSession().(*fakeSession)
+		if !ok {
+			t.Fatalf("session %s did not land on a fakeSession: %T", tc.name, tc.s.currentSession())
+		}
+		if resumed == tc.dead {
+			t.Fatalf("session %s is still bound to the dead session", tc.name)
+		}
+		if tc.dead.sendCount != 0 || resumed.sendCount < 1 {
+			t.Fatalf("session %s sends: dead=%d resumed=%d, want dead=0, resumed≥1", tc.name, tc.dead.sendCount, resumed.sendCount)
+		}
+	}
+	// Each session was re-opened exactly once, via resume (no create churn).
+	if len(fc.resumeIDs) != 2 {
+		t.Fatalf("resume calls = %v, want exactly one per session", fc.resumeIDs)
+	}
+	if fc.resumeIDs[0] != "sdk-b" || fc.resumeIDs[1] != "sdk-a" {
+		t.Fatalf("resume calls = %v, want [sdk-b sdk-a] (non-trigger first, trigger last)", fc.resumeIDs)
+	}
+	if fc.createCount != 0 {
+		t.Fatalf("create calls = %d, want 0", fc.createCount)
+	}
+	// Exactly one CLI restart despite two sessions driving recovery.
+	if fc.stopCount != 1 || fc.startCount != 1 {
+		t.Fatalf("stop/start = %d/%d, want 1/1", fc.stopCount, fc.startCount)
+	}
+	if p.clientEpoch != 1 {
+		t.Fatalf("client epoch = %d, want 1 (one restart)", p.clientEpoch)
+	}
+}
+
+// TestSendWithRetry502OnLiveCLIDoesNotRestartOrReopen: a provider 502 with a
+// healthy CLI child must not restart the child nor re-open/churn the session —
+// recovery sweeps over a live runtime are complete no-ops.
+func TestSendWithRetry502OnLiveCLIDoesNotRestartOrReopen(t *testing.T) {
+	withRetryRecorder(t)
+	dir := t.TempDir()
+	t.Setenv("CRITERIA_HOME", dir)
+	persistSDKSessionID("adapter-live", "sdk-live")
+
+	p := newCopilotAdapter()
+	fc := &fakeClient{} // ping succeeds: live CLI
+	p.client = fc
+	p.clientOptions = &copilot.ClientOptions{}
+	origNew := newClientFn
+	newClientFn = func(*copilot.ClientOptions) copilotClient { return fc }
+	t.Cleanup(func() { newClientFn = origNew })
+
+	sc := &copilot.SessionConfig{Model: "m"}
+	live := &fakeSession{sessionID: "sdk-live", sendErrSequence: []error{send502}}
+	s := newSessionState("adapter-live", live, sc, buildResumeConfig(sc), adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil), p)
+	p.sessions["adapter-live"] = s
+
+	if _, err := s.sendWithRetry(context.Background(), &copilot.MessageOptions{Prompt: "hi"}); err != nil {
+		t.Fatalf("sendWithRetry = %v, want success after the 502 retry", err)
+	}
+	if live.sendAttempts != 2 || live.sendCount != 1 {
+		t.Fatalf("live session attempts/sends = %d/%d, want 2/1 (502 then success)", live.sendAttempts, live.sendCount)
+	}
+	if got := s.currentSession(); got != live {
+		t.Fatal("a 502 on a live CLI must not swap the session")
+	}
+	if s.boundClientEpoch != 0 || p.clientEpoch != 0 {
+		t.Fatalf("epochs = session %d / adapter %d, want 0/0 (no restart)", s.boundClientEpoch, p.clientEpoch)
+	}
+	if fc.stopCount != 0 || fc.startCount != 0 || len(fc.resumeIDs) != 0 || fc.createCount != 0 {
+		t.Fatalf("502 on live CLI caused churn: stop=%d start=%d resumes=%v creates=%d, want all zero",
+			fc.stopCount, fc.startCount, fc.resumeIDs, fc.createCount)
+	}
+}
+
+// TestReopenSessionConcurrentWithReadersAndClose exercises the guarded session
+// accessor under concurrency: repeated reopenSession swaps against hammering
+// currentSession/subscribeEvents readers, then a CloseSession racing one more
+// reopen. Outcomes stay sane (no panic, no hang, closed session skipped by the
+// membership re-check); under -race this is the detector for unsynchronized
+// session field access.
+func TestReopenSessionConcurrentWithReadersAndClose(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CRITERIA_HOME", dir)
+	persistSDKSessionID("adapter-c", "sdk-c")
+
+	p := newCopilotAdapter()
+	fc := &fakeClient{}
+	p.client = fc
+	p.clientOptions = &copilot.ClientOptions{}
+
+	sc := &copilot.SessionConfig{Model: "m"}
+	live := &fakeSession{sessionID: "sdk-c"}
+	s := newSessionState("adapter-c", live, sc, buildResumeConfig(sc), adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil), p)
+	p.sessions["adapter-c"] = s
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { // reader: guarded accessor
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = s.currentSession()
+			}
+		}
+	}()
+	go func() { // reader: event subscription path
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				un := s.subscribeEvents(func(copilot.SessionEvent) {})
+				un()
+			}
+		}
+	}()
+	go func() { // writer: repeated reopens (forced staleness), then release the readers
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			p.reopenSession(context.Background(), s)
+			s.reopenMu.Lock()
+			s.boundClientEpoch = -1 // force the next reopen to swap again
+			s.reopenMu.Unlock()
+		}
+		close(stop)
+	}()
+	wg.Wait()
+
+	// CloseSession racing one more reopen: the loser must not panic or hang.
+	closeReq := &v2.CloseSessionRequest{SessionId: "adapter-c"}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.reopenMu.Lock()
+		s.boundClientEpoch = -1
+		s.reopenMu.Unlock()
+		p.reopenSession(context.Background(), s)
+	}()
+	if _, err := p.CloseSession(context.Background(), closeReq); err != nil {
+		t.Fatalf("CloseSession = %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reopenSession raced past CloseSession removal and hung")
+	}
+	if got := s.currentSession(); got == nil {
+		t.Fatal("session accessor returned nil after concurrent reopen/close")
 	}
 }
 

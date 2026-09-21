@@ -171,6 +171,17 @@ type sessionState struct {
 	fanout          *eventFanout
 	eventUnregister func()
 	eventMu         sync.Mutex
+
+	// CRI-272 recovery state. The SDK session field is guarded by eventMu and
+	// must only be read via currentSession (swapSession, the sole writer, and
+	// all readers share that lock — the pre-change write-once invariant ended
+	// with mid-run session swaps). boundClientEpoch records the CLI-child
+	// runtime epoch this session was opened on: reopenSession re-opens the
+	// session only when that epoch is superseded. reopenMu serializes
+	// reopenSession per session so concurrent recovery sweeps churn a session
+	// at most once.
+	boundClientEpoch int
+	reopenMu         sync.Mutex
 }
 
 // eventFanout fans SDK session events out to all subscribed handlers. It is
@@ -227,7 +238,7 @@ func (s *sessionState) subscribeEvents(h copilot.SessionEventHandler) func() {
 	fanout := s.fanout
 	s.eventMu.Unlock()
 	if fanout == nil {
-		return s.session.On(h)
+		return s.currentSession().On(h)
 	}
 	return fanout.subscribe(h)
 }
@@ -252,6 +263,16 @@ func (s *sessionState) swapSession(sess copilotSession) {
 	}
 }
 
+// currentSession returns the SDK session currently backing this adapter
+// session. It shares swapSession's eventMu so mid-run swaps (CLI-child
+// restart recovery) cannot race reads from the retry loop, Execute, or close
+// paths; all other readers must use this accessor instead of the bare field.
+func (s *sessionState) currentSession() copilotSession {
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	return s.session
+}
+
 // newSessionState builds the adapter's per-session state and attaches the
 // event fanout to the SDK session so a later CLI-child restart can re-register
 // it (CRI-272).
@@ -272,6 +293,11 @@ func newSessionState(
 		resumeConfig:     resumeConfig,
 		secrets:          secrets,
 		fanout:           fanout,
+	}
+	if owner != nil {
+		// Record the CLI-child runtime epoch at open so reopenSession can
+		// tell whether this session's binding is superseded after a restart.
+		s.boundClientEpoch = owner.currentClientEpoch()
 	}
 	s.eventUnregister = sess.On(fanout.handle)
 	return s
@@ -487,7 +513,7 @@ func (p *copilotAdapter) applyOpenSessionModel(ctx context.Context, s *sessionSt
 		if effort != "" {
 			opts = &copilot.SetModelOptions{ReasoningEffort: &effort}
 		}
-		if err := s.session.SetModel(ctx, model, opts); err != nil {
+		if err := s.currentSession().SetModel(ctx, model, opts); err != nil {
 			return fmt.Errorf("copilot: set model at open: %w", err)
 		}
 	}
@@ -508,20 +534,24 @@ func (p *copilotAdapter) CloseSession(_ context.Context, req *v2.CloseSessionReq
 	if !ok {
 		return &v2.CloseSessionResponse{}, nil
 	}
+	// Snapshot the SDK session once via the guarded accessor: a concurrent
+	// reopenSession may swap it mid-close, but the CloseSession contract
+	// closes the session as it was when the request arrived.
+	sess := s.currentSession()
 
 	disconnectDone := make(chan error, 1)
 	go func() {
-		disconnectDone <- s.session.Disconnect()
+		disconnectDone <- sess.Disconnect()
 	}()
 
 	select {
 	case err := <-disconnectDone:
 		if err != nil {
-			_ = s.session.Destroy()
+			_ = sess.Destroy()
 			return &v2.CloseSessionResponse{}, fmt.Errorf("copilot: disconnect session: %w", err)
 		}
 	case <-time.After(closeSessionGrace):
-		_ = s.session.Destroy()
+		_ = sess.Destroy()
 	}
 
 	return &v2.CloseSessionResponse{}, nil
