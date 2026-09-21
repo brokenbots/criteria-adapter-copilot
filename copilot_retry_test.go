@@ -54,6 +54,7 @@ type fakeClient struct {
 	startCount int
 	stopCount  int
 	pingErr    error
+	pingCount  int // total Ping probes observed (tests assert force skips the probe)
 
 	createCount   int
 	createErr     error
@@ -89,6 +90,7 @@ func (c *fakeClient) Stop() error {
 func (c *fakeClient) Ping(_ context.Context, _ string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.pingCount++
 	return c.pingErr
 }
 
