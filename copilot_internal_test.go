@@ -44,6 +44,18 @@ type fakeSession struct {
 	setModelErr error
 	sendErr     error
 
+	// sessionID backs the copilotSession.SessionID interface method.
+	sessionID string
+
+	// sendErrSequence makes the nth Send call (0-based) fail with the
+	// corresponding error; later calls succeed. Used by the CRI-272 retry
+	// tests to script transient failures.
+	sendErrSequence []error
+
+	// sendAttempts counts every Send call, including failed ones (sendErr /
+	// sendErrSequence do not bump sendCount, which only counts successes).
+	sendAttempts int
+
 	// setModelCalls records the (model, effort) pairs passed to SetModel in order.
 	setModelCalls []setModelCall
 
@@ -80,11 +92,17 @@ func (f *fakeSession) On(handler copilot.SessionEventHandler) func() {
 }
 
 func (f *fakeSession) Send(_ context.Context, opts *copilot.MessageOptions) (string, error) {
-	if f.sendErr != nil {
-		return "", f.sendErr
-	}
 	f.mu.Lock()
 	callIndex := f.sendCount
+	f.sendAttempts++
+	if f.sendErr != nil {
+		f.mu.Unlock()
+		return "", f.sendErr
+	}
+	if f.sendErrSequence != nil && f.sendAttempts-1 < len(f.sendErrSequence) {
+		f.mu.Unlock()
+		return "", f.sendErrSequence[f.sendAttempts-1]
+	}
 	f.sendCount++
 	f.sentOpts = append(f.sentOpts, *opts)
 	onSend := f.onSend
@@ -142,6 +160,12 @@ func (f *fakeSession) Disconnect() error {
 		return f.disconnect()
 	}
 	return nil
+}
+
+func (f *fakeSession) SessionID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionID
 }
 
 func (f *fakeSession) Destroy() error {

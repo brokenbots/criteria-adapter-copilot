@@ -28,7 +28,8 @@
 //
 // File layout:
 //   - copilot.go         — constants, types (copilotAdapter), Info/ensureClient/getSession
-//   - copilot_session.go — session lifecycle: copilotSession interface, sdkSession, sessionState, Open/CloseSession
+//   - copilot_session.go — session lifecycle: copilotSession/copilotClient interfaces, sdkSession/sdkClient, sessionState, Open/CloseSession
+//   - copilot_retry.go   — provider-5xx/transport retry, backoff classifier, CLI-child restart & session reopen (CRI-272)
 //   - copilot_turn.go    — Execute, turnState, event handlers
 //   - copilot_outcome.go — submit_outcome tool: SubmitOutcomeArgs, handleSubmitOutcome, helpers
 //   - copilot_toolcall.go — adapter_tool tool: AdapterToolArgs, handleAdapterToolCall, target parsing
@@ -111,7 +112,17 @@ type copilotAdapter struct {
 	toolBridge *adapterhost.ToolCallBridge
 
 	clientMu sync.Mutex
-	client   *copilot.Client
+	// client is the CLI-child handle for this adapter process lifetime. A dead
+	// child is detected (Ping probe) and restarted rather than treated as
+	// terminal (CRI-272). clientOptions holds the options captured from the
+	// first build so restarts need no fresh secrets.
+	client        copilotClient
+	clientOptions *copilot.ClientOptions
+	// clientEpoch counts successful CLI-child starts. Sessions record the
+	// epoch they were opened on; after a restart, reopenSession re-opens only
+	// the sessions still bound to a superseded epoch (no churn from peer
+	// sweeps, no stale bindings left behind).
+	clientEpoch int
 
 	// pendingPerms tracks in-flight permission requests from Copilot SDK
 	// callbacks that are waiting for a host decision over the Permissions
@@ -285,34 +296,6 @@ func (p *copilotAdapter) sendPermDecision(id, decision string) {
 		default:
 		}
 	}
-}
-
-func (p *copilotAdapter) ensureClient(ctx context.Context, secrets *adapterhost.Secrets) (*copilot.Client, error) {
-	p.clientMu.Lock()
-	defer p.clientMu.Unlock()
-	if p.client != nil {
-		return p.client, nil
-	}
-
-	cliPath := os.Getenv(defaultBinEnv)
-	if strings.TrimSpace(cliPath) == "" {
-		cliPath = defaultBin
-	}
-
-	options := &copilot.ClientOptions{
-		Connection: copilot.StdioConnection{Path: cliPath},
-		LogLevel:   "info",
-	}
-	if err := applyAuthOptions(options, secrets); err != nil {
-		return nil, fmt.Errorf("copilot: apply auth options: %w", err)
-	}
-
-	client := copilot.NewClient(options)
-	if err := client.Start(ctx); err != nil {
-		return nil, fmt.Errorf("copilot: start client: %w", err)
-	}
-	p.client = client
-	return p.client, nil
 }
 
 // githubTokenSecretNames are the accepted secret names for the Copilot GitHub
