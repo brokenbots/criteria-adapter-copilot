@@ -47,9 +47,13 @@ func (ts *turnState) sendErr(err error) {
 }
 
 // handleEvent returns a SessionEventHandler that dispatches SDK events to the
-// appropriate per-event-type methods on ts.
-func (ts *turnState) handleEvent(sink adapterhost.ExecuteEventSender) func(copilot.SessionEvent) {
+// appropriate per-event-type methods on ts. Every event is recorded as
+// provider-side activity first (CRI-274): a streaming response produces
+// events continuously, so event flow is what keeps the inter-event watchdog
+// disarmed.
+func (ts *turnState) handleEvent(s *sessionState, sink adapterhost.ExecuteEventSender) func(copilot.SessionEvent) {
 	return func(event copilot.SessionEvent) {
+		s.markActivity()
 		switch d := event.Data.(type) {
 		case *copilot.AssistantMessageDeltaData:
 			ts.handleAssistantDelta(sink, event.Type(), d)
@@ -68,6 +72,16 @@ func (ts *turnState) handleEvent(sink adapterhost.ExecuteEventSender) func(copil
 				"request_id": d.RequestID,
 				"event_type": string(event.Type()),
 			})))
+		case *copilot.ToolExecutionStartData:
+			// A native CLI tool execution (shell, read, ...) can run far
+			// longer than the silence window with only its start event
+			// emitted. Hold the watchdog gate for the run, keyed by tool call
+			// ID, so a long-but-healthy tool is not misread as a stall
+			// (CRI-274); the gate is bounded by watchdogGateWindow and closed
+			// on the matching completion event.
+			s.openToolGate(d.ToolCallID)
+		case *copilot.ToolExecutionCompleteData:
+			s.closeToolGate(d.ToolCallID)
 		case *copilot.SessionIdleData:
 			select {
 			case ts.turnDone <- struct{}{}:
@@ -118,22 +132,28 @@ func (ts *turnState) handleAssistantMessage(sink adapterhost.ExecuteEventSender,
 // awaitOutcome blocks until the session idles with a valid finalized outcome,
 // a reprompt-exhaustion failure, a context cancellation, or an error. It runs
 // up to maxFinalizeAttempts (1 initial + 2 reprompts) before returning failure.
+// The wait itself is watchdog-supervised (CRI-274): waitTurnSignal fails the
+// call with a stall error when the provider stream goes silent, which
+// executeTurn translates into a whole-call retry.
 func (ts *turnState) awaitOutcome(ctx context.Context, s *sessionState, sink adapterhost.ExecuteEventSender) error {
 	for attempt := 1; attempt <= maxFinalizeAttempts; attempt++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case err := <-ts.errCh:
+		signal, err := ts.waitTurnSignal(ctx, s)
+		switch signal {
+		case turnSignalCtx:
+			return err
+		case turnSignalErr:
 			if errors.Is(err, errMaxTurnsReached) {
 				return ts.handleMaxTurnsReached(s, sink)
 			}
 			return err
-		case <-ts.turnDone:
-			done, err := ts.handleIdleTurn(ctx, s, sink, attempt)
-			if done || err != nil {
-				return err
+		case turnSignalIdle:
+			done, idleErr := ts.handleIdleTurn(ctx, s, sink, attempt)
+			if done || idleErr != nil {
+				return idleErr
 			}
 			// Not done: reprompt was sent; loop and wait for the next SessionIdle.
+		case turnSignalStall:
+			return err
 		}
 	}
 	return ts.failExhausted(s, sink)
@@ -277,7 +297,9 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	// Route the handler through the session's event fanout (CRI-272): if the
 	// CLI child dies mid-turn and the session is re-opened, the swapped-in SDK
 	// session re-registers the same fanout and this turn keeps its events.
-	unsubscribe := s.subscribeEvents(state.handleEvent(sink))
+	// The handler also feeds the CRI-274 watchdog: every event marks activity,
+	// and native tool executions hold the watchdog gate.
+	unsubscribe := s.subscribeEvents(state.handleEvent(s, sink))
 	defer unsubscribe()
 
 	// Snapshot the SDK session via the guarded accessor for the model/effort
@@ -294,11 +316,11 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 		return err
 	}
 
-	if _, err := s.sendWithRetry(ctx, &copilot.MessageOptions{Prompt: prompt}); err != nil {
-		return fmt.Errorf("copilot: send prompt: %w", err)
-	}
-
-	return state.awaitOutcome(ctx, s, sink)
+	// The whole provider call (send + await outcome) is watchdog-supervised
+	// and retried by executeTurn: a hung send or a stream that opens and goes
+	// silent is failed and re-sent per the CRI-272 backoff path instead of
+	// wedging the turn (CRI-274).
+	return state.executeTurn(ctx, s, &copilot.MessageOptions{Prompt: prompt}, sink)
 }
 
 // prepareExecute validates the request and returns the session state, prompt,

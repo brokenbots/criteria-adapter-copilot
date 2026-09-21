@@ -56,6 +56,13 @@ func (p *copilotAdapter) handlePermissionRequest(sessionID string, request copil
 		return &rpc.PermissionDecisionUserNotAvailable{}, nil //nolint:nilerr // fail closed at the SDK boundary; the host-visible result carries the denial reason
 	}
 
+	// CRI-274: while the host deliberates, provider-side activity is not
+	// expected. Hold the watchdog gate so the inter-event watchdog does not
+	// misread the wait as a stall; the gate is bounded by watchdogGateWindow
+	// so a decision that never arrives cannot recreate an indefinite hang.
+	release := s.beginWatchdogGate()
+	defer release()
+
 	select {
 	case decision := <-decisionCh:
 		if decision == "allow" {

@@ -65,6 +65,14 @@ func (p *copilotAdapter) handleAdapterToolCall(adapterSessionID string, invocati
 	// end (ADR-0004 §8): the host gates it per call — capability, target
 	// shape, step-level tools grants, policy, graph — so no additional
 	// adapter-side gate is applied here.
+	//
+	// CRI-274: the bridge blocks until the host's decision and the callee
+	// adapter's result arrive — provider-side activity is not expected
+	// meanwhile. Hold the watchdog gate (bounded by watchdogGateWindow) so the
+	// inter-event watchdog does not misread the wait as a stall.
+	release := s.beginWatchdogGate()
+	defer release()
+
 	outcome, outputs, err := p.toolBridge.CallAdapterTool(ctx, sink, adapterhost.AdapterToolCall{
 		SessionID: adapterSessionID,
 		Target:    args.Target,

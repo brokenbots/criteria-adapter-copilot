@@ -492,7 +492,7 @@ func TestRecoverTransportReopensStaleSessionsIncludingActive(t *testing.T) {
 	p.sessions["adapter-2"] = s2
 	p.sessions["adapter-3"] = s3
 
-	p.recoverTransport(context.Background(), s1)
+	p.recoverTransport(context.Background(), s1, false)
 
 	// Non-trigger sessions first, triggering session last.
 	if len(fc.resumeIDs) != 2 || fc.resumeIDs[0] != "sdk-2" || fc.resumeIDs[1] != "sdk-1" {
@@ -519,7 +519,7 @@ func TestRecoverTransportReopensStaleSessionsIncludingActive(t *testing.T) {
 
 	// A second sweep over the same state must be a no-op: no restart (child
 	// is alive), no resumes, no swaps.
-	p.recoverTransport(context.Background(), nil)
+	p.recoverTransport(context.Background(), nil, false)
 	if len(fc.resumeIDs) != 2 || fc.createCount != 0 || fc.stopCount != 1 || fc.startCount != 1 {
 		t.Fatalf("second sweep changed state: resumes=%v create=%d stop=%d start=%d, want unchanged",
 			fc.resumeIDs, fc.createCount, fc.stopCount, fc.startCount)

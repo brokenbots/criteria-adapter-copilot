@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	copilot "github.com/github/copilot-sdk/go"
@@ -182,6 +183,23 @@ type sessionState struct {
 	// at most once.
 	boundClientEpoch int
 	reopenMu         sync.Mutex
+
+	// CRI-274 watchdog state. lastActivityNs records the unix-nano time of the
+	// last observed provider-side activity (any SDK session event, a send
+	// attempt, a gate transition) and is read by waitTurnSignal to compute the
+	// inter-event silence window. gatedWaits counts adapter-side waits that
+	// legitimately suspend provider activity (host permission decisions,
+	// adapter tool calls, native tool executions): while positive, the silence
+	// window is replaced by watchdogGateWindow. stallNotify (cap 1) wakes a
+	// parked waitTurnSignal so it re-reads fresh state; it is nil on bare
+	// unit-test states, where every access is nil-safe by construction.
+	// toolGates holds one gate release func per open native-tool gate, keyed by
+	// tool call ID, so an abandoned call's gates can be force-closed.
+	lastActivityNs atomic.Int64
+	gatedWaits     atomic.Int64
+	stallNotify    chan struct{}
+	toolGateMu     sync.Mutex
+	toolGates      map[string]func()
 }
 
 // eventFanout fans SDK session events out to all subscribed handlers. It is
@@ -293,6 +311,7 @@ func newSessionState(
 		resumeConfig:     resumeConfig,
 		secrets:          secrets,
 		fanout:           fanout,
+		stallNotify:      make(chan struct{}, 1),
 	}
 	if owner != nil {
 		// Record the CLI-child runtime epoch at open so reopenSession can
