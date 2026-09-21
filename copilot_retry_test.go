@@ -56,6 +56,13 @@ type fakeClient struct {
 	pingErr    error
 	pingCount  int // total Ping probes observed (tests assert force skips the probe)
 
+	// stopBlock, when non-nil, wedges Stop like a child that stays alive but
+	// no longer services the disconnect RPCs Stop issues (CRI-274); tests
+	// close it in cleanup so the abandoned goroutine exits.
+	stopBlock chan struct{}
+	// forceStopCount counts ForceStop kills (the bounded-stop fallback).
+	forceStopCount int
+
 	createCount   int
 	createErr     error
 	resumeIDs     []string
@@ -82,9 +89,22 @@ func (c *fakeClient) Start(_ context.Context) error {
 
 func (c *fakeClient) Stop() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.stopCount++
+	block := c.stopBlock
+	c.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	return nil
+}
+
+// ForceStop kills the CLI child. It does not unblock a wedged Stop: like the
+// real SDK, the kill is issued while the graceful stop is still in flight, and
+// the blocked Stop goroutine may keep failing on its dead pipes for a while.
+func (c *fakeClient) ForceStop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.forceStopCount++
 }
 
 func (c *fakeClient) Ping(_ context.Context, _ string) error {

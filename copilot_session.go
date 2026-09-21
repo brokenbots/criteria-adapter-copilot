@@ -40,6 +40,12 @@ type copilotSession interface {
 type copilotClient interface {
 	Start(ctx context.Context) error
 	Stop() error
+	// ForceStop kills the CLI child without waiting for graceful teardown.
+	// SDK Stop disconnects every session before killing the child, and those
+	// disconnect RPCs are unbounded — a child that stays alive but stops
+	// servicing RPCs wedges Stop forever (CRI-274), so bounded recovery kills
+	// the child past the grace to fail the pending RPCs.
+	ForceStop()
 	// Ping probes the runtime; a non-nil error means the CLI child or its
 	// stdio connection is gone.
 	Ping(ctx context.Context, message string) error
@@ -56,6 +62,8 @@ type sdkClient struct {
 func (c *sdkClient) Start(ctx context.Context) error { return c.inner.Start(ctx) }
 
 func (c *sdkClient) Stop() error { return c.inner.Stop() }
+
+func (c *sdkClient) ForceStop() { c.inner.ForceStop() }
 
 func (c *sdkClient) Ping(ctx context.Context, message string) error {
 	_, err := c.inner.Ping(ctx, message)

@@ -34,6 +34,15 @@ func withFastWatchdog(t *testing.T, window, gate time.Duration) {
 	t.Cleanup(func() { watchdogWindow, watchdogGateWindow = origWindow, origGate })
 }
 
+// withFastStop shrinks the forced-stop grace (stopGrace) for bounded-stop
+// tests; the real grace is 5s.
+func withFastStop(t *testing.T, grace time.Duration) {
+	t.Helper()
+	orig := stopGrace
+	stopGrace = grace
+	t.Cleanup(func() { stopGrace = orig })
+}
+
 // hungSendSession blocks its first hangFirst Send calls until release is
 // closed, then delegates to the wrapped fake session. Used to script a provider
 // request that never responds (CRI-274): the abandoned sendRPCTimeboxed
@@ -486,8 +495,87 @@ func TestRestartClientForceSemantics(t *testing.T) {
 	if err != nil || !restarted {
 		t.Fatalf("forced restart = (restarted=%v, err=%v), want a restart", restarted, err)
 	}
-	if fc.stopCount != 1 || fc.pingCount != 1 {
-		t.Fatalf("stop=%d ping=%d, want stop=1 ping=1 (force must skip the probe)", fc.stopCount, fc.pingCount)
+	if fc.stopCount != 1 || fc.pingCount != 1 || fc.forceStopCount != 0 {
+		t.Fatalf("stop=%d ping=%d forceStop=%d, want stop=1 ping=1 forceStop=0 (force must skip the probe; a prompt Stop needs no kill)",
+			fc.stopCount, fc.pingCount, fc.forceStopCount)
+	}
+}
+
+// TestRestartClientBoundsWedgedStopOnForce: SDK Stop disconnects every session
+// before killing the child, and those disconnect RPCs are unbounded — a child
+// that stays alive but stops servicing RPCs wedges Stop itself (observed
+// against copilot-sdk/go v1.0.0). Forced stall recovery must still return
+// within the stopGrace bound, kill the child via ForceStop, and replace the
+// client (CRI-274).
+func TestRestartClientBoundsWedgedStopOnForce(t *testing.T) {
+	withFastStop(t, 30*time.Millisecond)
+	fc := &fakeClient{stopBlock: make(chan struct{})}
+	t.Cleanup(func() { close(fc.stopBlock) }) // let the abandoned Stop goroutine exit
+	p := withRecoverableClient(t, fc)
+
+	bounded := time.After(2 * time.Second)
+	client, restarted, err := p.restartClient(context.Background(), true)
+	if err != nil || !restarted {
+		t.Fatalf("forced restart with wedged Stop = (restarted=%v, err=%v), want a restart", restarted, err)
+	}
+	select {
+	case <-bounded:
+		t.Fatalf("restartClient did not return within the bound")
+	default:
+	}
+	if fc.stopCount != 1 || fc.forceStopCount != 1 {
+		t.Fatalf("stop=%d forceStop=%d, want the wedged client stopped once and the child killed past the grace",
+			fc.stopCount, fc.forceStopCount)
+	}
+	if client == nil || fc.startCount == 0 {
+		t.Fatalf("startCount=%d, want the replacement client started", fc.startCount)
+	}
+}
+
+// TestRestartClientUnforcedStopStaysFast: the non-force path keeps its
+// original semantics — a child that fails Ping has a broken connection, so
+// Stop returns promptly and ForceStop is never reached.
+func TestRestartClientUnforcedStopStaysFast(t *testing.T) {
+	fc := &fakeClient{pingErr: errors.New("client not connected")}
+	p := withRecoverableClient(t, fc)
+
+	_, restarted, err := p.restartClient(context.Background(), false)
+	if err != nil || !restarted {
+		t.Fatalf("restart of dead child = (restarted=%v, err=%v), want a restart", restarted, err)
+	}
+	if fc.stopCount != 1 || fc.forceStopCount != 0 {
+		t.Fatalf("stop=%d forceStop=%d, want stop=1 forceStop=0 (non-force keeps the fast graceful stop)",
+			fc.stopCount, fc.forceStopCount)
+	}
+}
+
+// TestRecoverTransportBoundsWedgedStop: the full stall-recovery sweep —
+// restartClient(force) plus reopenSession for every live session — completes
+// within the stopGrace bound even when the previous client's Stop never
+// returns, so a stalled turn can proceed to its retry (CRI-274).
+func TestRecoverTransportBoundsWedgedStop(t *testing.T) {
+	withFastStop(t, 30*time.Millisecond)
+	fc := &fakeClient{stopBlock: make(chan struct{})}
+	t.Cleanup(func() { close(fc.stopBlock) })
+	p := withRecoverableClient(t, fc)
+	s := newWatchdogSession(t, p, "sess-wedge", &fakeSession{sessionID: "sdk-orig"})
+	before := s.currentSession().SessionID()
+
+	swept := make(chan struct{})
+	go func() {
+		defer close(swept)
+		p.recoverTransport(context.Background(), s, true)
+	}()
+	select {
+	case <-swept:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("recoverTransport did not complete within the bound")
+	}
+	if fc.forceStopCount != 1 {
+		t.Fatalf("forceStop=%d, want the wedged child killed past the grace", fc.forceStopCount)
+	}
+	if after := s.currentSession().SessionID(); after == before {
+		t.Fatalf("trigger session not re-opened after forced recovery")
 	}
 }
 

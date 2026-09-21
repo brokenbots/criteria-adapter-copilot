@@ -22,8 +22,11 @@
 // A watchdog stall is a retryable call failure: executeTurn and sendWithRetry
 // classify it via isProviderStallError and route it through the CRI-272
 // backoff path. Because an alive-but-wedged CLI child passes the Ping
-// liveness probe, stall recovery forces the restart (recoverTransport force)
-// — killing the wedged child also unblocks the abandoned in-flight Send
+// liveness probe, stall recovery forces the restart (recoverTransport force).
+// The forced teardown itself is bounded: SDK Stop can wedge on the per-session
+// disconnect RPCs it issues before killing the child, so past stopGrace the
+// child is killed via ForceStop (stopClientBounded) — failing the pending
+// RPCs, which unblocks both the wedged Stop and the abandoned in-flight Send
 // goroutine, whose result lands in a buffered channel (no leak beyond that).
 
 package main
@@ -52,6 +55,40 @@ var (
 	// watchdogNow is the clock used for watchdog deadlines (tests).
 	watchdogNow = time.Now
 )
+
+// stopGrace bounds the graceful Stop of the previous CLI child during forced
+// stall recovery (restartClient with force): SDK Stop disconnects every
+// session — an unbounded session.destroy RPC per session — before killing the
+// child, so a child that stays alive but no longer services RPCs wedges Stop
+// itself (observed against copilot-sdk/go v1.0.0). Past the grace,
+// stopClientBounded kills the child via ForceStop instead; the kill fails the
+// pending RPCs, which unblocks Stop and any Send parked on it.
+var stopGrace = 5 * time.Second
+
+// stopClientBounded stops c, killing the CLI child via ForceStop when the
+// graceful stop does not finish within stopGrace. The kill does not
+// deterministically unblock a wedged Stop (the goroutine is abandoned after a
+// second grace if it still has not returned), but the killed child can no
+// longer wedge the replacement client started afterwards.
+func stopClientBounded(c copilotClient) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.Stop()
+	}()
+	select {
+	case <-done:
+		return
+	case <-time.After(stopGrace):
+		c.ForceStop()
+		select {
+		case <-done:
+		case <-time.After(stopGrace):
+			// Stop is still wedged past the kill; abandon its goroutine.
+			// It exits once the killed child's pipes error out.
+		}
+	}
+}
 
 // watchdogMaxCallAttempts bounds how many whole provider calls (send + await
 // outcome) one Execute makes after watchdog stalls: 1 initial + 2 retries.

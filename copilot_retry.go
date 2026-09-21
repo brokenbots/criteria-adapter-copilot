@@ -264,7 +264,12 @@ func (p *copilotAdapter) recoverTransport(ctx context.Context, trigger *sessionS
 // restartClient probes the CLI child and restarts it when dead. With force
 // set, the Ping probe is skipped and a live child is stopped unconditionally —
 // watchdog stall recovery must not be fooled by a child that answers liveness
-// probes while its provider stream is wedged (CRI-274). Returns the
+// probes while its provider stream is wedged (CRI-274). The forced stop is
+// bounded (stopClientBounded): SDK Stop can itself wedge on the child it is
+// stopping, since its per-session disconnect RPCs go unanswered, so the child
+// is killed via ForceStop past stopGrace and clientMu is never held past that
+// bound. The non-force path keeps its original semantics: a child that fails
+// Ping has a broken connection, so Stop returns promptly. Returns the
 // (possibly unchanged) client and whether a restart happened. Serialized with
 // ensureClient on clientMu.
 func (p *copilotAdapter) restartClient(ctx context.Context, force bool) (copilotClient, bool, error) {
@@ -275,8 +280,10 @@ func (p *copilotAdapter) restartClient(ctx context.Context, force bool) (copilot
 			if err := p.client.Ping(ctx, "liveness"); err == nil {
 				return p.client, false, nil
 			}
+			_ = p.client.Stop()
+		} else {
+			stopClientBounded(p.client)
 		}
-		_ = p.client.Stop()
 		p.client = nil
 	}
 	client, err := p.startClientLocked(ctx, nil)
