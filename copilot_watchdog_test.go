@@ -108,7 +108,7 @@ func TestSendRPCTimeboxedFailsHungSend(t *testing.T) {
 	hung := &hungSendSession{fakeSession: &fakeSession{sessionID: "sdk-hung"}, release: release, hangFirst: 1 << 30}
 	t.Cleanup(func() { close(release) })
 
-	_, err := sendRPCTimeboxed(context.Background(), hung, &copilot.MessageOptions{Prompt: "hi"})
+	_, err := sendRPCTimeboxed(context.Background(), hung, &copilot.MessageOptions{Prompt: "hi"}, watchdogWindow)
 	if !isProviderStallError(err) {
 		t.Fatalf("sendRPCTimeboxed err = %v, want a provider stall", err)
 	}
@@ -124,7 +124,7 @@ func TestSendRPCTimeboxedPassesThroughSuccessfulSend(t *testing.T) {
 	withFastWatchdog(t, 30*time.Millisecond, time.Minute)
 	fake := &fakeSession{sessionID: "sdk-ok"}
 
-	msgID, err := sendRPCTimeboxed(context.Background(), fake, &copilot.MessageOptions{Prompt: "hi"})
+	msgID, err := sendRPCTimeboxed(context.Background(), fake, &copilot.MessageOptions{Prompt: "hi"}, watchdogWindow)
 	if err != nil || msgID != "msg-1" {
 		t.Fatalf("sendRPCTimeboxed = (%q, %v), want (msg-1, nil)", msgID, err)
 	}
@@ -139,7 +139,7 @@ func TestSendRPCTimeboxedHonorsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := sendRPCTimeboxed(ctx, hung, &copilot.MessageOptions{Prompt: "hi"})
+		_, err := sendRPCTimeboxed(ctx, hung, &copilot.MessageOptions{Prompt: "hi"}, watchdogWindow)
 		done <- err
 	}()
 	cancel()

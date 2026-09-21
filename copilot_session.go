@@ -208,6 +208,14 @@ type sessionState struct {
 	stallNotify    chan struct{}
 	toolGateMu     sync.Mutex
 	toolGates      map[string]func()
+
+	// CRI-277 per-session watchdog windows parsed from the agent-level config
+	// (watchdog_window / watchdog_gate_window). Written once at OpenSession
+	// and read-only afterwards; zero fields fall back to the package defaults
+	// via the watchdogWindow / watchdogGateWindow accessors, so sessions
+	// opened without the keys — and bare unit-test states — keep the shipped
+	// windows.
+	watchdog watchdogSettings
 }
 
 // eventFanout fans SDK session events out to all subscribed handlers. It is
@@ -393,6 +401,15 @@ func persistSDKSessionID(adapterSessionID, sdkSessionID string) {
 }
 
 func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionRequest) (*v2.OpenSessionResponse, error) {
+	// Parse and validate the CRI-277 watchdog config first: a misconfigured
+	// window must fail the open before any side effect (no CLI child start,
+	// no SDK session) so the error reads as session misconfiguration.
+	cfg := req.GetConfig()
+	watchdogCfg, err := parseWatchdogSettings(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	// Resolved secrets for this session, constrained to the names the adapter
 	// declared in Info().Secrets. The GitHub token is sourced from here, never
 	// from the process environment (D69).
@@ -402,7 +419,6 @@ func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionReq
 		return nil, err
 	}
 
-	cfg := req.GetConfig()
 	adapterSessionID := req.GetSessionId()
 	sessionConfig := p.buildSessionConfig(cfg, adapterSessionID)
 	resumeConfig := buildResumeConfig(sessionConfig)
@@ -412,7 +428,15 @@ func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionReq
 	}
 
 	s := newSessionState(adapterSessionID, session, sessionConfig, resumeConfig, secrets, p)
+	s.watchdog = watchdogCfg
 	s.heldSecrets = heldGitHubTokenSecrets(secrets)
+
+	if strings.TrimSpace(cfg[watchdogWindowCfgKey]) != "" || strings.TrimSpace(cfg[watchdogGateWindowCfgKey]) != "" {
+		slog.Info("copilot: watchdog windows configured",
+			"adapterSession", adapterSessionID,
+			"window", watchdogCfg.window.String(),
+			"gateWindow", watchdogCfg.gateWindow.String())
+	}
 
 	p.mu.Lock()
 	p.sessions[adapterSessionID] = s
