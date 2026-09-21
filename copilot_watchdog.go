@@ -29,12 +29,19 @@
 // RPCs, which unblocks both the wedged Stop and the abandoned in-flight Send
 // goroutine, whose result lands in a buffered channel (no leak beyond that).
 
+//
+// CRI-277: both windows are configurable per session through the agent-level
+// `watchdog_window` / `watchdog_gate_window` config keys (see
+// parseWatchdogSettings); the package vars remain the shipped defaults, the
+// test overrides, and the fallback for sessions opened without the keys.
+
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	copilot "github.com/github/copilot-sdk/go"
@@ -48,13 +55,123 @@ import (
 // watchdogGateWindow. An Execute re-sends the prompt at most
 // watchdogMaxCallAttempts times after stalls, so the worst-case wall time per
 // call is bounded (~3 × 90s of silence plus backoff and recovery time) instead
-// of the unbounded wedge this replaces. Vars are overridable in tests.
+// of the unbounded wedge this replaces. The vars are the shipped defaults,
+// overridable in tests, and the fallback for sessions opened without the
+// CRI-277 config keys (see parseWatchdogSettings).
 var (
 	watchdogWindow     = 90 * time.Second
 	watchdogGateWindow = 10 * time.Minute
 	// watchdogNow is the clock used for watchdog deadlines (tests).
 	watchdogNow = time.Now
 )
+
+// CRI-277 agent-level config keys for the watchdog windows. Values are Go
+// duration strings (time.ParseDuration; e.g. "90s", "10m").
+const (
+	watchdogWindowCfgKey     = "watchdog_window"
+	watchdogGateWindowCfgKey = "watchdog_gate_window"
+)
+
+// Config guardrails, derived from the CRI-277 healthy-gap data (15 runs,
+// ~15K events: 12 healthy turns, 3 death turns): the worst inter-event gap on
+// a healthy turn was 217s (a gate-held build/test phase), the worst gate-held
+// wait reached ~10m, and the smallest silent gap on a death run was 994s.
+const (
+	// maxWatchdogWindow is the ceiling for the configured base window: a base
+	// window at or above the smallest observed death-run silence would catch
+	// every documented death mode only slower than the runs that died.
+	maxWatchdogWindow = 994 * time.Second
+	// minWatchdogGateWindow is the floor for the configured gate ceiling:
+	// gate-held waits legitimately reach ~10m on healthy build/test-heavy
+	// turns, so a tighter ceiling false-stalls healthy turns.
+	minWatchdogGateWindow = 10 * time.Minute
+)
+
+// watchdogSettings is the per-session watchdog window configuration parsed
+// from the agent-level config (CRI-277). OpenSession stores the windows
+// already resolved (parseWatchdogSettings fills unset keys with the package
+// defaults); zero fields are the bare unit-test state and fall back to the
+// package defaults via the watchdogWindow / watchdogGateWindow accessors.
+// Written once at OpenSession and read-only afterwards.
+type watchdogSettings struct {
+	window     time.Duration
+	gateWindow time.Duration
+}
+
+// resolved fills unset (non-positive) fields with the current package
+// defaults.
+func (w watchdogSettings) resolved() watchdogSettings {
+	if w.window <= 0 {
+		w.window = watchdogWindow
+	}
+	if w.gateWindow <= 0 {
+		w.gateWindow = watchdogGateWindow
+	}
+	return w
+}
+
+// parseWatchdogSettings parses and validates the CRI-277 watchdog config keys
+// (agent-level, the OpenSession config map). Unset keys yield zero fields.
+// Validation against the healthy-gap data: both windows must be positive Go
+// durations, the base window must stay below the smallest death-run silence
+// gap (maxWatchdogWindow) so the watchdog keeps catching the documented death
+// modes, and the gate ceiling must stay at or above the worst observed
+// healthy gate-held wait (minWatchdogGateWindow) and never below the base
+// window — a gate ceiling tighter than the base window would protect nothing.
+func parseWatchdogSettings(cfg map[string]string) (watchdogSettings, error) {
+	var w watchdogSettings
+	for _, spec := range []struct {
+		key string
+		dst *time.Duration
+	}{
+		{watchdogWindowCfgKey, &w.window},
+		{watchdogGateWindowCfgKey, &w.gateWindow},
+	} {
+		raw := strings.TrimSpace(cfg[spec.key])
+		if raw == "" {
+			continue
+		}
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return watchdogSettings{}, fmt.Errorf("copilot: config %s: %q is not a valid duration (e.g. 90s, 10m): %w", spec.key, raw, err)
+		}
+		if d <= 0 {
+			return watchdogSettings{}, fmt.Errorf("copilot: config %s: %q must be positive", spec.key, raw)
+		}
+		*spec.dst = d
+	}
+
+	w = w.resolved()
+	if w.window >= maxWatchdogWindow {
+		return watchdogSettings{}, fmt.Errorf("copilot: config %s: %s must stay below %s — the smallest silent gap observed on a death run (CRI-277 healthy-gap data); a window that large would catch the documented death modes later than every run that actually died", watchdogWindowCfgKey, w.window, maxWatchdogWindow)
+	}
+	if w.gateWindow < minWatchdogGateWindow {
+		return watchdogSettings{}, fmt.Errorf("copilot: config %s: %s must stay at or above %s — the worst gate-held wait observed on a healthy turn (CRI-277 healthy-gap data); a tighter ceiling false-stalls healthy build/test-heavy turns", watchdogGateWindowCfgKey, w.gateWindow, minWatchdogGateWindow)
+	}
+	if w.gateWindow < w.window {
+		return watchdogSettings{}, fmt.Errorf("copilot: config %s: %s must not be below %s (%s)", watchdogGateWindowCfgKey, w.gateWindow, watchdogWindowCfgKey, w.window)
+	}
+	return w, nil
+}
+
+// watchdogWindow returns the session's send/stream silence window: the
+// session-configured value (CRI-277) or the package default when unset. Safe
+// on bare unit-test states (zero settings fall back to the default).
+func (s *sessionState) watchdogWindow() time.Duration {
+	if w := s.watchdog.window; w > 0 {
+		return w
+	}
+	return watchdogWindow
+}
+
+// watchdogGateWindow returns the session's gate ceiling, falling back to the
+// package default when unset.
+func (s *sessionState) watchdogGateWindow() time.Duration {
+	if w := s.watchdog.gateWindow; w > 0 {
+		return w
+	}
+	return watchdogGateWindow
+}
 
 // stopGrace bounds the graceful Stop of the previous CLI child during forced
 // stall recovery (restartClient with force): SDK Stop disconnects every
@@ -124,11 +241,12 @@ func isProviderStallError(err error) bool {
 }
 
 // sendRPCTimeboxed runs sess.Send under the send-RPC watchdog: a Send that
-// produces no JSON-RPC response within watchdogWindow is failed as a stall.
+// produces no JSON-RPC response within window (the session's watchdog window,
+// CRI-277) is failed as a stall.
 // The abandoned goroutine parks until the response arrives or the transport is
 // torn down (a forced recovery stops the CLI child, which unblocks pending
 // jsonrpc2 requests); its result lands in the buffered channel and is dropped.
-func sendRPCTimeboxed(ctx context.Context, sess copilotSession, opts *copilot.MessageOptions) (string, error) {
+func sendRPCTimeboxed(ctx context.Context, sess copilotSession, opts *copilot.MessageOptions, window time.Duration) (string, error) {
 	type sendResult struct {
 		msgID string
 		err   error
@@ -139,7 +257,7 @@ func sendRPCTimeboxed(ctx context.Context, sess copilotSession, opts *copilot.Me
 		msgID, err := sess.Send(ctx, opts)
 		ch <- sendResult{msgID, err}
 	}()
-	timer := time.NewTimer(watchdogWindow)
+	timer := time.NewTimer(window)
 	defer timer.Stop()
 	select {
 	case res := <-ch:
@@ -258,7 +376,10 @@ func (ts *turnState) waitTurnSignal(ctx context.Context, s *sessionState) (turnS
 			// Gate held: provider silence is expected. Bound the total wait
 			// with the gate ceiling so a stuck gate (e.g. the CLI died mid
 			// native-tool without emitting completion) still fails the call.
-			timer := time.NewTimer(watchdogGateWindow)
+			// The ceiling is the session-configured watchdogGateWindow
+			// (CRI-277).
+			gate := s.watchdogGateWindow()
+			timer := time.NewTimer(gate)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -273,11 +394,12 @@ func (ts *turnState) waitTurnSignal(ctx context.Context, s *sessionState) (turnS
 				timer.Stop()
 				continue
 			case <-timer.C:
-				return turnSignalStall, stallError(stallGateCeiling, time.Unix(0, s.lastActivityNs.Load()), watchdogGateWindow)
+				return turnSignalStall, stallError(stallGateCeiling, time.Unix(0, s.lastActivityNs.Load()), gate)
 			}
 		}
 		last := time.Unix(0, s.lastActivityNs.Load())
-		delay := last.Add(watchdogWindow).Sub(watchdogNow())
+		window := s.watchdogWindow()
+		delay := last.Add(window).Sub(watchdogNow())
 		if delay <= 0 {
 			return turnSignalStall, stallError(stallStream, last, watchdogNow().Sub(last))
 		}

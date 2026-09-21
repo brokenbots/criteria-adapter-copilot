@@ -161,6 +161,10 @@ func (p *copilotAdapter) Info(_ context.Context, _ *v2.InfoRequest) (*v2.InfoRes
 			"provider_bearer_token":      {Type: "string", Description: "Custom provider bearer token. Sets Authorization header directly; takes precedence over provider_api_key."},
 			"provider_wire_api":          {Type: "string", Description: "Custom provider wire format (openai/azure only): completions or responses. Default: completions."},
 			"provider_azure_api_version": {Type: "string", Description: "Azure API version, used when provider_type=azure. Default: 2024-10-21."},
+			// CRI-277: provider-call watchdog windows (parseWatchdogSettings
+			// validates configured values against the CRI-277 healthy-gap data).
+			"watchdog_window":      {Type: "string", Description: "Provider-call watchdog silence window (Go duration, e.g. 90s, 2m): a send/stream with no response or session events for this long is failed as a stall and retried. Default: 90s. Must stay below watchdog_gate_window and under 16m34s (smallest death-run silence in the CRI-277 data)."},
+			"watchdog_gate_window": {Type: "string", Description: "Watchdog ceiling for gate-held waits — host permission decisions, adapter/native tool runs (Go duration, e.g. 10m). Default and floor: 10m (worst healthy tool wait in the CRI-277 data); values below it are rejected."},
 		}},
 		InputSchema: &v2.AdapterSchemaProto{Fields: map[string]*v2.ConfigFieldProto{
 			"prompt":           {Required: true, Type: "string", Description: "User prompt to send to the assistant."},

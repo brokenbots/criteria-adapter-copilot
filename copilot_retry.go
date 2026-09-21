@@ -157,7 +157,7 @@ func (s *sessionState) sendWithRetry(ctx context.Context, opts *copilot.MessageO
 		// send itself is timeboxed: the SDK's jsonrpc2 Request has no timeout
 		// of its own, so a CLI that never answers would park Send forever.
 		s.markActivity()
-		msgID, err := sendRPCTimeboxed(ctx, s.currentSession(), opts)
+		msgID, err := sendRPCTimeboxed(ctx, s.currentSession(), opts, s.watchdogWindow())
 		if err == nil {
 			return msgID, nil
 		}
