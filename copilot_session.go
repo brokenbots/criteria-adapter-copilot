@@ -209,6 +209,14 @@ type sessionState struct {
 	toolGateMu     sync.Mutex
 	toolGates      map[string]func()
 
+	// CRI-288 liveness clock: unix-nano time of the last event the adapter
+	// actually forwarded to the host through the Execute sink (see
+	// forwardTrackingSink), stamped at beginExecution and re-baselined after
+	// each successful liveness tick. The liveness ticker measures host-visible
+	// silence from it; unlike lastActivityNs it is NOT provider-side activity
+	// and never feeds the watchdog.
+	lastForwardNs atomic.Int64
+
 	// CRI-277 per-session watchdog windows parsed from the agent-level config
 	// (watchdog_window / watchdog_gate_window). Written once at OpenSession
 	// — already resolved, unset keys holding the shipped defaults — and
