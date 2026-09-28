@@ -14,9 +14,9 @@ import (
 	"strings"
 	"testing"
 
-	copilot "github.com/github/copilot-sdk/go"
 	v2 "github.com/brokenbots/criteria-adapter-proto/criteria/v2"
 	adapterhost "github.com/brokenbots/criteria-go-adapter-sdk/adapterhost"
+	copilot "github.com/github/copilot-sdk/go"
 )
 
 // TestScrubTrackerCredentialsRemovesTrackerCreds verifies the scrubber drops
