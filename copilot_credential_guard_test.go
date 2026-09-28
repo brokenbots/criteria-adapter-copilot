@@ -20,9 +20,11 @@ import (
 )
 
 // TestScrubTrackerCredentialsRemovesTrackerCreds verifies the scrubber drops
-// every tracker credential entry by name — exact-list names and the LINEAR_
-// prefix rule — regardless of value (including empty values), while keeping
-// the documented Copilot auth variables and ordinary environment intact.
+// every tracker credential entry by name — exact-list names, the LINEAR_ and
+// KANBOARD_ prefix rules, and the Kanboard handles this deployment actually
+// injects (KANBOARD_APP_TOKEN, KANBOARD_URL) — regardless of value (including
+// empty values), while keeping the documented Copilot auth variables, the
+// workflow's GitHub credential handles, and ordinary environment intact.
 func TestScrubTrackerCredentialsRemovesTrackerCreds(t *testing.T) {
 	env := []string{
 		"PATH=/usr/bin",
@@ -31,11 +33,19 @@ func TestScrubTrackerCredentialsRemovesTrackerCreds(t *testing.T) {
 		"GITHUB_TOKEN=github-token",
 		"COPILOT_GITHUB_TOKEN=copilot-token",
 		"COPILOT_SDK_AUTH_TOKEN=sdk-token",
+		// The workflow's GitHub credential handles: the git credential helper
+		// reads these, so the scrub must NOT blanket-drop credential-shaped vars.
+		"WORKFLOW_GITHUB_TOKEN=wf-token",
+		"REVIEWER_GITHUB_TOKEN=reviewer-token",
 		"LINEAR_API_KEY=lin_key",
 		"LINEAR_API_KEY=",
 		"LINEAR_ACCESS_TOKEN=lin_oauth",
 		"LINEAR_WEBHOOK_SECRET=whsec",
+		// The Kanboard handles this deployment injects into adapter pods.
+		"KANBOARD_APP_TOKEN=kb_app_token",
+		"KANBOARD_URL=file:/home/agent/kanboard-secrets/kanboard_url",
 		"KANBOARD_API_TOKEN=kb_token",
+		"KANBOARD_WEBHOOK_SECRET=kb_whsec",
 		"JIRA_API_TOKEN=jira_token",
 		"ASANA_ACCESS_TOKEN=asana_token",
 		"AGENT_WORKSPACE=/work", // a non-credential name that merely shares a prefix must survive
@@ -43,12 +53,12 @@ func TestScrubTrackerCredentialsRemovesTrackerCreds(t *testing.T) {
 
 	got := scrubTrackerCredentials(env)
 
-	for _, denied := range []string{"LINEAR_API_KEY", "LINEAR_ACCESS_TOKEN", "LINEAR_WEBHOOK_SECRET", "KANBOARD_API_TOKEN", "JIRA_API_TOKEN", "ASANA_ACCESS_TOKEN"} {
+	for _, denied := range []string{"LINEAR_API_KEY", "LINEAR_ACCESS_TOKEN", "LINEAR_WEBHOOK_SECRET", "KANBOARD_APP_TOKEN", "KANBOARD_URL", "KANBOARD_API_TOKEN", "KANBOARD_WEBHOOK_SECRET", "JIRA_API_TOKEN", "ASANA_ACCESS_TOKEN"} {
 		if slices.ContainsFunc(got, func(s string) bool { return strings.HasPrefix(s, denied+"=") }) {
 			t.Fatalf("scrubbed env must not contain %s; got %v", denied, got)
 		}
 	}
-	for _, want := range env[:6] {
+	for _, want := range env[:8] {
 		if !slices.Contains(got, want) {
 			t.Fatalf("scrubbed env must keep %q; got %v", want, got)
 		}
@@ -69,7 +79,11 @@ func TestIsTrackerCredentialEnvName(t *testing.T) {
 		{"LINEAR_API_KEY", true},
 		{"LINEAR_OAUTH_REFRESH_TOKEN", true},
 		{"LINEAR_ANYTHING_AT_ALL", true},
+		// The names this deployment actually injects for the Kanboard family.
+		{"KANBOARD_APP_TOKEN", true},
+		{"KANBOARD_URL", true},
 		{"KANBOARD_API_TOKEN", true},
+		{"KANBOARD_ANYTHING_AT_ALL", true},
 		{"JIRA_API_TOKEN", true},
 		{"JIRA_PERSONAL_ACCESS_TOKEN", true},
 		{"ASANA_ACCESS_TOKEN", true},
@@ -79,8 +93,12 @@ func TestIsTrackerCredentialEnvName(t *testing.T) {
 		{"GITHUB_TOKEN", false},
 		{"COPILOT_GITHUB_TOKEN", false},
 		{"COPILOT_SDK_AUTH_TOKEN", false},
+		{"WORKFLOW_GITHUB_TOKEN", false},
+		{"REVIEWER_GITHUB_TOKEN", false},
 		{"linear_api_key", false}, // env names are case-sensitive; the child never sees lowercase variants
+		{"kanboard_app_token", false},
 		{"SUPERLINEAR_API_KEY", false},
+		{"SUBKANBOARD_APP_TOKEN", false},
 	}
 	for _, tc := range cases {
 		if got := isTrackerCredentialEnvName(tc.name); got != tc.want {
@@ -90,19 +108,22 @@ func TestIsTrackerCredentialEnvName(t *testing.T) {
 }
 
 // TestApplyAuthOptionsChildEnvExcludesTrackerCredentials is the KB-43
-// regression test for the credential channel: with Linear and Kanboard
-// credentials in the adapter's process environment, the CLI child environment
-// built by applyAuthOptions must carry none of them — in BOTH auth modes —
-// while the Copilot auth surface (channel token, GH_TOKEN/GITHUB_TOKEN, PATH)
-// keeps working.
+// regression test for the credential channel: with the tracker credentials the
+// deployment actually injects (LINEAR_API_KEY, KANBOARD_APP_TOKEN,
+// KANBOARD_URL) in the adapter's process environment, the CLI child
+// environment built by applyAuthOptions must carry none of them — in BOTH auth
+// modes — while the Copilot auth surface (channel token,
+// GH_TOKEN/GITHUB_TOKEN, PATH) and the workflow's GitHub credential handles
+// keep working.
 func TestApplyAuthOptionsChildEnvExcludesTrackerCredentials(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "lin_key_inherited")
-	t.Setenv("KANBOARD_API_TOKEN", "kb_token_inherited")
+	t.Setenv("KANBOARD_APP_TOKEN", "kb_app_token_inherited")
+	t.Setenv("KANBOARD_URL", "file:/home/agent/kanboard-secrets/kanboard_url")
 	t.Setenv("PATH", "/usr/bin")
 
 	assertNoTrackerCreds := func(t *testing.T, env []string) {
 		t.Helper()
-		for _, denied := range []string{"LINEAR_API_KEY=", "KANBOARD_API_TOKEN="} {
+		for _, denied := range []string{"LINEAR_API_KEY=", "KANBOARD_APP_TOKEN=", "KANBOARD_URL="} {
 			if slices.ContainsFunc(env, func(s string) bool { return strings.HasPrefix(s, denied) }) {
 				t.Fatalf("CLI child env must not contain %q; got %v", denied, env)
 			}
@@ -212,13 +233,16 @@ func TestInfoDeclaresExcludeTrackerScopes(t *testing.T) {
 }
 
 // TestOpenSessionChildEnvAndConfigAreTrackerFree is the end-to-end regression
-// test at the OpenSession boundary: with tracker credentials present in the
-// adapter's process environment AND delivered over the secret channel under an
-// undeclared name, the spawned CLI child environment carries no tracker
-// credentials and the session config keeps discovery disabled.
+// test at the OpenSession boundary: with the tracker credentials the
+// deployment actually injects present in the adapter's process environment
+// (LINEAR_API_KEY, KANBOARD_APP_TOKEN, KANBOARD_URL) AND a tracker credential
+// delivered over the secret channel under an undeclared name, the spawned CLI
+// child environment carries no tracker credentials and the session config
+// keeps discovery disabled.
 func TestOpenSessionChildEnvAndConfigAreTrackerFree(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "lin_key_inherited")
-	t.Setenv("KANBOARD_API_TOKEN", "kb_token_inherited")
+	t.Setenv("KANBOARD_APP_TOKEN", "kb_app_token_inherited")
+	t.Setenv("KANBOARD_URL", "file:/home/agent/kanboard-secrets/kanboard_url")
 
 	var capturedOptions *copilot.ClientOptions
 	origNew := newClientFn
@@ -247,7 +271,7 @@ func TestOpenSessionChildEnvAndConfigAreTrackerFree(t *testing.T) {
 	if capturedOptions == nil {
 		t.Fatal("newClientFn was not called; the CLI child options were not built")
 	}
-	for _, denied := range []string{"LINEAR_API_KEY=", "KANBOARD_API_TOKEN="} {
+	for _, denied := range []string{"LINEAR_API_KEY=", "KANBOARD_APP_TOKEN=", "KANBOARD_URL="} {
 		if slices.ContainsFunc(capturedOptions.Env, func(s string) bool { return strings.HasPrefix(s, denied) }) {
 			t.Fatalf("CLI child env must not contain %q; got %v", denied, capturedOptions.Env)
 		}
