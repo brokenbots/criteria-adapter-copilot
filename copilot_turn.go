@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	copilot "github.com/github/copilot-sdk/go"
 
@@ -16,6 +17,51 @@ import (
 )
 
 const maxFinalizeAttempts = 3
+
+// errSessionLoss is the sentinel for a developer turn that died without a
+// chance to submit an outcome: the CLI reported a turn-terminal session event
+// (session.error, session.shutdown) that ends the agentic loop, so no
+// session.idle — and therefore no outcome — will ever arrive for it (KB-42).
+// Waiting it out previously fell through to the CRI-274 silence watchdog and
+// burned three whole-call stall attempts (forced child restarts included)
+// before surfacing anything. The sentinel is deliberately NOT
+// provider-stall-typed: a reported session error means the CLI is alive and
+// its session object exists, so executeTurn must return the error without a
+// forced transport restart or a re-send into the dead turn (CRI-272 policy).
+// Recovery belongs to the engine's bounded step retry: the Execute error is
+// what the engine records, and the last agent message rides along as
+// evidence.
+var errSessionLoss = errors.New("copilot developer turn lost before submitting an outcome")
+
+// isSessionLossError reports whether err is a turn-terminal session loss
+// (KB-42).
+func isSessionLossError(err error) bool {
+	return errors.Is(err, errSessionLoss)
+}
+
+// maxEvidenceLen bounds the last-agent-message evidence attached to turn
+// failures and the errors they surface. Long enough for an operator to
+// recognize the workstream message that ended the run, short enough to keep
+// error payloads reviewable.
+const maxEvidenceLen = 2000
+
+// evidenceSnippet truncates model-produced text for failure evidence (KB-42).
+// A rune-boundary cut keeps multi-byte content from splitting mid-character.
+// Empty input yields an empty snippet, so callers can decide to omit the
+// evidence entirely.
+func evidenceSnippet(content string) string {
+	if content == "" {
+		return ""
+	}
+	if len(content) <= maxEvidenceLen {
+		return content
+	}
+	cut := maxEvidenceLen
+	for cut > 0 && !utf8.RuneStart(content[cut]) {
+		cut--
+	}
+	return content[:cut] + "…[truncated]"
+}
 
 // turnState tracks per-Execute state: final content, turn count, and channels
 // for coordinating the event handler goroutine with the wait loop.
@@ -87,8 +133,94 @@ func (ts *turnState) handleEvent(s *sessionState, sink adapterhost.ExecuteEventS
 			case ts.turnDone <- struct{}{}:
 			default:
 			}
+		case *copilot.SessionErrorData:
+			// KB-42: a reported session error ends the agentic turn (SDK
+			// SendAndWait treats it the same way). Forward the diagnostic as
+			// evidence, then end the wait instead of letting it ride the
+			// silence watchdog through three forced stall-recovery cycles.
+			ts.handleSessionError(s, sink, event.Type(), d)
+		case *copilot.SessionShutdownData:
+			// KB-42: the CLI session is being torn down — an idle for the
+			// in-flight turn will never arrive. Same treatment: evidence +
+			// immediate turn-terminal error.
+			ts.handleSessionShutdown(s, sink, event.Type(), d)
+		case *copilot.AbortData:
+			// Evidence only, not turn-terminal: the SDK follows an abort
+			// with session.idle (Aborted=true), which the finalize loop
+			// already handles via the reprompt path. Making the abort itself
+			// terminal would break that recovery. If the idle never comes,
+			// the silence watchdog bounds the wait (CRI-274).
+			ts.sendErr(sink.Send(adapterEvent("turn.aborted", map[string]any{
+				"reason":             string(d.Reason),
+				"last_agent_message": evidenceSnippet(ts.finalContent),
+				"event_type":         string(event.Type()),
+			})))
 		}
 	}
+}
+
+// handleSessionError processes a session.error event (KB-42). The error is
+// forwarded as a diagnostic event carrying the last agent message as
+// evidence; when the turn cannot continue (every errorType except an
+// auto-switch-eligible rate limit) the wait is ended immediately with a
+// session-loss error so the Execute fails loudly instead of stalling.
+func (ts *turnState) handleSessionError(s *sessionState, sink adapterhost.ExecuteEventSender, eventType copilot.SessionEventType, d *copilot.SessionErrorData) {
+	payload := map[string]any{
+		"error_type":         d.ErrorType,
+		"message":            redactSecrets(d.Message, s.heldSecrets),
+		"last_agent_message": evidenceSnippet(ts.finalContent),
+		"event_type":         string(eventType),
+	}
+	if d.ErrorCode != nil && *d.ErrorCode != "" {
+		payload["error_code"] = *d.ErrorCode
+	}
+	if d.StatusCode != nil {
+		payload["status_code"] = *d.StatusCode
+	}
+	autoSwitch := d.EligibleForAutoSwitch != nil && *d.EligibleForAutoSwitch
+	if autoSwitch {
+		payload["eligible_for_auto_switch"] = true
+	}
+	ts.sendErr(sink.Send(adapterEvent("session.error", payload)))
+	if autoSwitch {
+		// SDK contract: the runtime follows this error with an
+		// auto_mode_switch.requested event and continues the agentic loop,
+		// so an idle for this turn still arrives. Not turn-terminal.
+		return
+	}
+	ts.sendErr(sessionLossError(s, fmt.Sprintf("session error (%s): %s", d.ErrorType, d.Message), ts.finalContent))
+}
+
+// handleSessionShutdown processes a session.shutdown event (KB-42): the CLI
+// session is gone (ShutdownType "routine" or "error"), so the in-flight turn
+// can never idle. Forward the diagnostic and end the wait immediately.
+func (ts *turnState) handleSessionShutdown(s *sessionState, sink adapterhost.ExecuteEventSender, eventType copilot.SessionEventType, d *copilot.SessionShutdownData) {
+	detail := ""
+	if d.ErrorReason != nil {
+		detail = *d.ErrorReason
+	}
+	ts.sendErr(sink.Send(adapterEvent("session.shutdown", map[string]any{
+		"shutdown_type":      string(d.ShutdownType),
+		"error_reason":       redactSecrets(detail, s.heldSecrets),
+		"last_agent_message": evidenceSnippet(ts.finalContent),
+		"event_type":         string(eventType),
+	})))
+	label := fmt.Sprintf("session shutdown (%s)", d.ShutdownType)
+	if detail != "" {
+		label += ": " + detail
+	}
+	ts.sendErr(sessionLossError(s, label, ts.finalContent))
+}
+
+// sessionLossError builds the turn-terminal session-loss error: the reason
+// text, the truncated last agent message as evidence, and the sentinel the
+// classification checks.
+func sessionLossError(s *sessionState, cause string, finalContent string) error {
+	msg := "copilot: developer turn ended without submitting the outcome: " + redactSecrets(cause, s.heldSecrets)
+	if ev := evidenceSnippet(finalContent); ev != "" {
+		msg += "; last agent message: " + ev
+	}
+	return fmt.Errorf("%s: %w", msg, errSessionLoss)
 }
 
 // handleAssistantDelta forwards a streaming delta event.
@@ -130,11 +262,12 @@ func (ts *turnState) handleAssistantMessage(sink adapterhost.ExecuteEventSender,
 }
 
 // awaitOutcome blocks until the session idles with a valid finalized outcome,
-// a reprompt-exhaustion failure, a context cancellation, or an error. It runs
-// up to maxFinalizeAttempts (1 initial + 2 reprompts) before returning failure.
-// The wait itself is watchdog-supervised (CRI-274): waitTurnSignal fails the
-// call with a stall error when the provider stream goes silent, which
-// executeTurn translates into a whole-call retry.
+// a reprompt-exhaustion failure, a context cancellation, an error, or a
+// turn-terminal session loss (KB-42). It runs up to maxFinalizeAttempts
+// (1 initial + 2 reprompts) before returning failure. The wait itself is
+// watchdog-supervised (CRI-274): waitTurnSignal fails the call with a stall
+// error when the provider stream goes silent, which executeTurn translates
+// into a whole-call retry.
 func (ts *turnState) awaitOutcome(ctx context.Context, s *sessionState, sink adapterhost.ExecuteEventSender) error {
 	for attempt := 1; attempt <= maxFinalizeAttempts; attempt++ {
 		signal, err := ts.waitTurnSignal(ctx, s)
@@ -145,13 +278,46 @@ func (ts *turnState) awaitOutcome(ctx context.Context, s *sessionState, sink ada
 			if errors.Is(err, errMaxTurnsReached) {
 				return ts.handleMaxTurnsReached(s, sink)
 			}
-			return err
+			// A session loss can race a completed turn: the CLI may report
+			// the error event and only then deliver the idle that closes the
+			// turn. If the idle is already buffered, the turn survived the
+			// error — prefer it and let the finalize loop decide (KB-42).
+			select {
+			case <-ts.turnDone:
+				ts.drainStaleSignals(s)
+				done, idleErr := ts.handleIdleTurn(ctx, s, sink, attempt)
+				if done || idleErr != nil {
+					return idleErr
+				}
+			default:
+				// A session loss that trails a submitted outcome must not
+				// fail the step: the deliverable was already produced, the
+				// same way the stall path returns a finalized outcome
+				// directly instead of retrying (CRI-274, KB-42).
+				if errors.Is(err, errSessionLoss) {
+					s.mu.Lock()
+					outcome := s.finalizedOutcome
+					reason := s.finalizedReason
+					s.mu.Unlock()
+					if outcome != "" {
+						return sink.Send(resultEvent(outcome, reason, s.heldSecrets...))
+					}
+				}
+				return err
+			}
 		case turnSignalIdle:
+			// The completed turn may leave a late turn-terminal signal
+			// buffered behind its idle (e.g. a session error that trailed
+			// it). Drop everything buffered BEFORE the reprompt send: at
+			// this point it all belongs to the turn that just ended, and a
+			// stale session error must not kill the next reprompt wait
+			// (KB-42). Signals the reprompt itself produces are buffered
+			// after this drain and stay intact.
+			ts.drainStaleSignals(s)
 			done, idleErr := ts.handleIdleTurn(ctx, s, sink, attempt)
 			if done || idleErr != nil {
 				return idleErr
 			}
-			// Not done: reprompt was sent; loop and wait for the next SessionIdle.
 		case turnSignalStall:
 			return err
 		}
@@ -216,11 +382,17 @@ func (ts *turnState) reprompt(ctx context.Context, s *sessionState) error {
 //   - kind:   machine-readable category ("missing", "invalid_outcome", "duplicate", "no_outcomes")
 //   - allowed_outcomes: sorted list of the step's declared outcomes (for operator alerting)
 //   - attempts: how many tool-call attempts were made
+//   - last_agent_message: truncated final model output as evidence (KB-42)
+//
+// The failure result reason carries the same evidence: the engine records it
+// as the step failure reason, which is how a run that failed on a
+// missing-outcome turn keeps its last agent message visible (KB-42).
 func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEventSender) error {
 	s.mu.Lock()
 	attempts := s.finalizeAttempts
 	kind := s.finalizeFailureKind
 	allowedList := sortedAllowedOutcomes(s.activeAllowedOutcomes)
+	secrets := s.heldSecrets
 	s.mu.Unlock()
 
 	if kind == "" {
@@ -241,13 +413,23 @@ func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEven
 	for i, v := range allowedList {
 		allowedAny[i] = v
 	}
+	// ts.finalContent is written by the event-handler goroutine; every path
+	// into failExhausted has received turnDone from that goroutine (the
+	// channel send happens after the last assistant message was recorded),
+	// so the read is synchronized (KB-42).
+	evidence := evidenceSnippet(ts.finalContent)
 	_ = sink.Send(adapterEvent("outcome.failure", map[string]any{
-		"reason":           reason,
-		"kind":             kind,
-		"allowed_outcomes": allowedAny,
-		"attempts":         attempts,
+		"reason":             reason,
+		"kind":               kind,
+		"allowed_outcomes":   allowedAny,
+		"attempts":           attempts,
+		"last_agent_message": evidence,
 	}))
-	return sink.Send(resultEvent("failure", ""))
+	resultReason := "step failed: no outcome submitted (" + reason + ")"
+	if evidence != "" {
+		resultReason += "; last agent message: " + evidence
+	}
+	return sink.Send(resultEvent("failure", resultReason, secrets...))
 }
 
 // handleMaxTurnsReached returns failure unless "needs_review" is in the
