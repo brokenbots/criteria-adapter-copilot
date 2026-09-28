@@ -529,9 +529,9 @@ func TestAwaitOutcome_OutcomeAndReasonInOutputs(t *testing.T) {
 	}
 }
 
-// Failure paths must still emit outputs with the outcome key populated and
-// reason empty, so downstream expressions have a consistent shape regardless
-// of how the step ended.
+// Failure paths must still emit outputs with the outcome key populated. The
+// reason carries the KB-42 failure evidence: why no outcome was submitted,
+// plus the last agent message when one exists (KB-42).
 func TestAwaitOutcome_FailurePathPopulatesOutcomeOutput(t *testing.T) {
 	s := stateWithOutcomes("success", "failure")
 	fake := s.session.(*fakeSession)
@@ -555,8 +555,8 @@ func TestAwaitOutcome_FailurePathPopulatesOutcomeOutput(t *testing.T) {
 	if got := outputs["outcome"]; got != "failure" {
 		t.Errorf("outputs[outcome] = %q, want %q", got, "failure")
 	}
-	if got, ok := outputs["reason"]; !ok || got != "" {
-		t.Errorf("outputs[reason] = (%q, present=%v), want (\"\", true)", got, ok)
+	if got, ok := outputs["reason"]; !ok || got == "" {
+		t.Errorf("outputs[reason] = (%q, present=%v), want the KB-42 failure evidence", got, ok)
 	}
 }
 
