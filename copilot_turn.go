@@ -271,8 +271,19 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	s.execMu.Lock()
 	defer s.execMu.Unlock()
 
+	// CRI-288: wrap the sink so every host-visible forward (handler forwards,
+	// permission bridge, finalize/reprompt diagnostics, result events) stamps
+	// the liveness clock, then run the liveness ticker for the turn. The
+	// wrapper must be in place before beginExecution stores s.sink so the
+	// permission bridge tracks forwards too. LIFO defers stop the ticker
+	// before cleanup closes the active-execution channel.
+	sink = forwardTrackingSink{inner: sink, s: s}
+
 	cleanup := s.beginExecution(sink)
 	defer cleanup()
+
+	stopLiveness := s.startLivenessTicker(ctx, sink)
+	defer stopLiveness()
 
 	// Populate allowed set before the prompt is sent so the tool handler can
 	// validate on the very first turn.
@@ -355,6 +366,10 @@ func (s *sessionState) beginExecution(sink adapterhost.ExecuteEventSender) func(
 	s.active = true
 	s.activeCh = execDone
 	s.sink = sink
+
+	// CRI-288: turn time starts here — the liveness ticker measures
+	// host-visible silence from this stamp until the first forwarded event.
+	s.lastForwardNs.Store(watchdogNow().UnixNano())
 
 	// W15: reset per-execute finalize state. activeAllowedOutcomes is set by
 	// Execute *after* this returns; do not reset it here.
