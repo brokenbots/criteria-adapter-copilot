@@ -347,21 +347,23 @@ func newSessionState(
 
 // buildResumeConfig derives a ResumeSessionConfig from the session config so a
 // resumed SDK session keeps the same provider (BYOK), model, tools,
-// permission-gating callback, streaming and system-message setup as the
-// original session. Returns nil when there is no session config to derive from.
+// permission-gating callback, streaming, config-discovery posture (KB-43) and
+// system-message setup as the original session. Returns nil when there is no
+// session config to derive from.
 func buildResumeConfig(sc *copilot.SessionConfig) *copilot.ResumeSessionConfig {
 	if sc == nil {
 		return nil
 	}
 	return &copilot.ResumeSessionConfig{
-		ClientName:          sc.ClientName,
-		Model:               sc.Model,
-		Tools:               sc.Tools,
-		SystemMessage:       sc.SystemMessage,
-		Provider:            sc.Provider,
-		Streaming:           sc.Streaming,
-		OnPermissionRequest: sc.OnPermissionRequest,
-		WorkingDirectory:    sc.WorkingDirectory,
+		ClientName:            sc.ClientName,
+		Model:                 sc.Model,
+		Tools:                 sc.Tools,
+		SystemMessage:         sc.SystemMessage,
+		Provider:              sc.Provider,
+		Streaming:             sc.Streaming,
+		OnPermissionRequest:   sc.OnPermissionRequest,
+		WorkingDirectory:      sc.WorkingDirectory,
+		EnableConfigDiscovery: sc.EnableConfigDiscovery,
 	}
 }
 
@@ -518,6 +520,17 @@ func (p *copilotAdapter) buildSessionConfig(cfg map[string]string, adapterSessio
 		},
 		Tools: []copilot.Tool{submitTool, adapterTool},
 	}
+	// KB-43: the CLI child must not inherit tool side-channels the adapter
+	// never declared. Config discovery would load MCP servers (and skills)
+	// from the working directory (e.g. .mcp.json, .vscode/mcp.json) and merge
+	// them into the session — an undeclared side-channel that can carry
+	// tracker-mutation tools together with their credentials. The adapter's
+	// tool surface is exactly the two registered tools plus the CLI's built-in
+	// tools; cross-adapter capabilities are reachable only through host-gated
+	// adapter_tool calls. Custom instruction files (AGENTS.md,
+	// .github/copilot-instructions.md) are always loaded regardless, so the
+	// developer agent keeps its instructions.
+	sc.EnableConfigDiscovery = copilot.Bool(false)
 	if wd := strings.TrimSpace(cfg["working_directory"]); wd != "" {
 		sc.WorkingDirectory = wd
 	}

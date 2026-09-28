@@ -335,6 +335,10 @@ func declaredGitHubTokenSecrets() map[string]string {
 //     via the logged-in user). The process environment is passed through so the
 //     runtime can read those vars; in a sandboxed adapter the env is scrubbed
 //     (D29/D32), so nothing leaks and auto-login simply finds no credentials.
+//
+// In both modes the runtime environment is scrubbed of tracker credentials
+// (KB-43): the CLI child must have no tracker mutation scope — ticket state
+// transitions belong to the workflow, not to the developer LLM.
 func applyAuthOptions(opts *copilot.ClientOptions, secrets *adapterhost.Secrets) error {
 	if token := resolveGitHubToken(secrets); token != "" {
 		opts.GitHubToken = token
@@ -345,11 +349,14 @@ func applyAuthOptions(opts *copilot.ClientOptions, secrets *adapterhost.Secrets)
 		if err != nil {
 			return fmt.Errorf("copilot: spawn github token env: %w", err)
 		}
-		opts.Env = append(os.Environ(), cleanSpawnedEnv(spawned)...)
+		// Scrub the base environment first; the spawned channel values are
+		// appended last so a same-named process-env entry cannot shadow the
+		// authoritative channel value (the runtime uses the last value per key).
+		opts.Env = append(scrubTrackerCredentials(os.Environ()), cleanSpawnedEnv(spawned)...)
 		return nil
 	}
 	opts.UseLoggedInUser = copilot.Bool(true)
-	opts.Env = os.Environ()
+	opts.Env = scrubTrackerCredentials(os.Environ())
 	return nil
 }
 
