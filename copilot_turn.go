@@ -174,6 +174,9 @@ func (ts *turnState) handleSessionError(s *sessionState, sink adapterhost.Execut
 	if d.ErrorCode != nil && *d.ErrorCode != "" {
 		payload["error_code"] = *d.ErrorCode
 	}
+	if d.StatusCode != nil {
+		payload["status_code"] = *d.StatusCode
+	}
 	autoSwitch := d.EligibleForAutoSwitch != nil && *d.EligibleForAutoSwitch
 	if autoSwitch {
 		payload["eligible_for_auto_switch"] = true
