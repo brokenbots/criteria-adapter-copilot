@@ -119,8 +119,8 @@ func (s *sessionState) sendLivenessTick(ctx context.Context, sink adapterhost.Ex
 
 // startLivenessTicker runs the CRI-288 liveness tick for one Execute call and
 // returns its idempotent stop func. Ticks are host-visible liveness only:
-// they never call markActivity, so a tick (nor its cadence) can re-arm the
-// CRI-274 provider watchdog.
+// they never call markActivity, so neither a tick nor its cadence can re-arm
+// the CRI-274 provider watchdog.
 func (s *sessionState) startLivenessTicker(ctx context.Context, sink adapterhost.ExecuteEventSender) func() {
 	stop := make(chan struct{})
 	var once sync.Once

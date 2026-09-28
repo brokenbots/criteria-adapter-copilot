@@ -57,6 +57,8 @@ type errSinkSender struct{ err error }
 
 func (e errSinkSender) Send(event *v2.ExecuteEvent) error { return e.err }
 
+var errTestSink = errors.New("liveness tick send rejected")
+
 // TestNativeToolEventsNotForwarded pins the CRI-288 forwarding gap at the
 // adapter seam: native CLI tool executions are consumed as CRI-274 watchdog
 // bookkeeping (gates + activity marks) and produce ZERO host-visible events —
@@ -163,8 +165,6 @@ func TestSendLivenessTickSilenceWindows(t *testing.T) {
 		t.Fatal("ticker must stop after a send error")
 	}
 }
-
-var errTestSink = errors.New("liveness tick send rejected")
 
 // TestLivenessTickDoesNotTouchWatchdog: a tick is host-visible liveness, not
 // provider activity — it must never advance the CRI-274 activity clock.
