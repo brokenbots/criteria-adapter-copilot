@@ -126,8 +126,16 @@ func (ts *turnState) handleEvent(s *sessionState, sink adapterhost.ExecuteEventS
 			// (CRI-274); the gate is bounded by watchdogGateWindow and closed
 			// on the matching completion event.
 			s.openToolGate(d.ToolCallID)
+			// KB-57: record the raw command for native tool calls so the
+			// permission request the CLI sends for this call can carry a
+			// full-text fingerprint (the SDK request itself carries only
+			// parsed identifiers). Only shell-ish calls carry a command.
+			if cmd := toolCommandFromStartArgs(d); cmd != "" {
+				s.recordToolCommand(d.ToolCallID, cmd)
+			}
 		case *copilot.ToolExecutionCompleteData:
 			s.closeToolGate(d.ToolCallID)
+			s.forgetToolCommand(d.ToolCallID)
 		case *copilot.SessionIdleData:
 			select {
 			case ts.turnDone <- struct{}{}:
@@ -572,3 +580,31 @@ func (s *sessionState) beginExecution(sink adapterhost.ExecuteEventSender) func(
 		s.mu.Unlock()
 	}
 }
+
+
+// toolCommandFromStartArgs extracts the raw shell command from a native
+// ToolExecutionStart event's arguments (KB-57). The CLI delivers arguments as
+// a decoded JSON object; the shell tool carries its command under the
+// "command" key. Returns "" for every other tool or a command-less call so
+// non-shell tools never pollute the fingerprint map.
+func toolCommandFromStartArgs(d *copilot.ToolExecutionStartData) string {
+	if d == nil || d.ToolName != "shell" || d.Arguments == nil {
+		return ""
+	}
+	m, ok := d.Arguments.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if raw, ok := m["command"].(string); ok {
+		return raw
+	}
+	// Some CLI versions nest the payload under "args" or "input"; unwrap one
+	// level so the fingerprint survives those shapes too.
+	if inner, ok := m["args"].(map[string]any); ok {
+		if raw, ok := inner["command"].(string); ok {
+			return raw
+		}
+	}
+	return ""
+}
+

@@ -47,6 +47,22 @@ func (p *copilotAdapter) handlePermissionRequest(sessionID string, request copil
 	}
 
 	payload, requestID := buildPermEventPayload(request)
+	// KB-57: the CLI's shell permission request carries only parsed command
+	// identifiers ("git", not "git status ..."), which no subcommand-pattern
+	// allow_tools entry can ever match, and its FullCommandText field is empty
+	// in current CLI builds. The adapter records the raw command from the
+	// matching ToolExecutionStart event; attach it as the details["command"]
+	// fingerprint the engine's requestFingerprints matcher consumes
+	// (internal/adapterhost/policy.go). Forwarded unconditionally: the same
+	// text is already visible on the wire in the adapter's own
+	// tool.invocation events, so this introduces no new stream exposure, and
+	// gating the policy fingerprint behind an opt-in left the CRI-260
+	// reviewer policy unable to match anything in live runs.
+	if toolCallID := permissionToolCallID(request); toolCallID != "" {
+		if cmd := s.toolCommandFor(toolCallID); cmd != "" {
+			payload["command"] = cmd
+		}
+	}
 
 	decisionCh := make(chan string, 1)
 	p.registerPendingPerm(requestID, decisionCh)
@@ -247,6 +263,39 @@ func setString(details map[string]string, key string, value *string) {
 // permissionTool returns the host policy tool name for a permission request.
 // Tool-specific names win when the SDK exposes them; otherwise we fall back to
 // the canonical permission kind such as "read", "write", or "shell".
+// permissionToolCallID extracts the SDK tool call ID from any permission
+// request variant that carries one (KB-57). Used to bridge the permission
+// request to the recorded raw command from the matching ToolExecutionStart.
+func permissionToolCallID(request copilot.PermissionRequest) string {
+	switch req := request.(type) {
+	case copilot.PermissionRequestShell:
+		if req.ToolCallID != nil {
+			return *req.ToolCallID
+		}
+	case *copilot.PermissionRequestShell:
+		if req.ToolCallID != nil {
+			return *req.ToolCallID
+		}
+	case copilot.PermissionRequestCustomTool:
+		if req.ToolCallID != nil {
+			return *req.ToolCallID
+		}
+	case *copilot.PermissionRequestCustomTool:
+		if req.ToolCallID != nil {
+			return *req.ToolCallID
+		}
+	case copilot.PermissionRequestHook:
+		if req.ToolCallID != nil {
+			return *req.ToolCallID
+		}
+	case *copilot.PermissionRequestHook:
+		if req.ToolCallID != nil {
+			return *req.ToolCallID
+		}
+	}
+	return ""
+}
+
 func permissionTool(request copilot.PermissionRequest) string {
 	switch req := request.(type) {
 	case copilot.PermissionRequestCustomTool:

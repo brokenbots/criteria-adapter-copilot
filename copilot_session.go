@@ -154,6 +154,17 @@ type sessionState struct {
 	// redacts from `reason` before emitting step outputs.
 	heldSecrets []string
 
+	// toolCommands maps a native CLI tool call's ID to its raw command argument
+	// ( KB-57/CRI-260 follow-up). The Copilot CLI's shell permission requests
+	// carry only parsed command identifiers ("git', not "git status ..."),
+	// so the host's allow_tools policy could never match subcommand patterns.
+	// ToolExecutionStart events carry the full arguments; the adapter records
+	// the command per call ID and permissionDetails attaches it as the
+	// details["command"] fingerprint the engine's requestFingerprints matchers
+	// consume. Guarded by mu; entries are removed on ToolExecutionComplete and
+	// the map is capped to avoid unbounded growth on pathological turns.
+	toolCommands map[string]string
+
 	// CRI-272 recovery state. owner is the adapter that opened this session
 	// (nil for bare unit-test states): sendWithRetry consults it to restart a
 	// dead CLI child, and it is the only path back to the adapter's mutexes.
@@ -317,6 +328,56 @@ func (s *sessionState) currentSession() copilotSession {
 // newSessionState builds the adapter's per-session state and attaches the
 // event fanout to the SDK session so a later CLI-child restart can re-register
 // it (CRI-272).
+// toolCommandsMax bounds the per-session command fingerprint map (KB-57). A
+// turn normally holds a handful of native tool calls; the cap keeps a
+// pathological model turn from growing the map without bound. When full, the
+// oldest entry is evicted (map order is random in Go, so use insertion-order
+// tracking via a slice queue).
+const toolCommandsMax = 128
+
+// recordToolCommand stores the raw command argument the CLI passed to a
+// native tool (KB-57). The Copilot CLI's shell permission requests carry only
+// parsed command identifiers, so the host policy could never match
+// subcommand patterns; permissionDetails attaches this recorded command as
+// the details["command"] fingerprint the engine consumes.
+func (s *sessionState) recordToolCommand(toolCallID string, command string) {
+	if toolCallID == "" || command == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.toolCommands == nil {
+		s.toolCommands = make(map[string]string)
+	}
+	if len(s.toolCommands) >= toolCommandsMax {
+		for k := range s.toolCommands {
+			delete(s.toolCommands, k)
+			break // single eviction is enough; bounded amortized
+		}
+	}
+	s.toolCommands[toolCallID] = command
+}
+
+// toolCommandFor returns the recorded raw command for a tool call ID, or "".
+func (s *sessionState) toolCommandFor(toolCallID string) string {
+	if toolCallID == "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.toolCommands[toolCallID]
+}
+
+// forgetToolCommand drops the recording for a completed tool call.
+func (s *sessionState) forgetToolCommand(toolCallID string) {
+	if toolCallID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.toolCommands, toolCallID)
+}
+
 func newSessionState(
 	adapterSessionID string,
 	sess copilotSession,
@@ -335,6 +396,7 @@ func newSessionState(
 		secrets:          secrets,
 		fanout:           fanout,
 		stallNotify:      make(chan struct{}, 1),
+		toolCommands:     make(map[string]string),
 	}
 	if owner != nil {
 		// Record the CLI-child runtime epoch at open so reopenSession can
