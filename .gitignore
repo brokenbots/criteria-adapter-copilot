@@ -4,3 +4,7 @@ coverage.out
 
 # Built adapter binary (publish via CI; never commit)
 /criteria-adapter-copilot
+scripts/kb57_fastfail/adapters/
+scripts/kb57_fastfail/last_run.ndjson
+scripts/kb57_fastfail/last_stdout.json
+scripts/kb57_fastfail/.gh_token
