@@ -162,3 +162,27 @@ func TestForgetToolCommand(t *testing.T) {
 		t.Fatalf("forgot failed: entry persisted after completion")
 	}
 }
+// TestAssistantToolRequestRecorded pins the SECOND recording path: commands are taken from the model's assistant tool requests (AssistantMessageData.ToolRequests), which arrive before the CLI's permission gate fires for the same ToolCallID - no ToolExecutionStart event exists in any live run.
+func TestAssistantToolRequestRecorded(t *testing.T) {
+	t.Setenv(includeSensitivePermissionDetailsEnv, "")
+	s := fpTestSession(t)
+	toolCallID := "call_review_git"
+	req := copilot.AssistantMessageToolRequest{ToolCallID: toolCallID, Name: "bash", Arguments: map[string]any{"command": "git diff --stat origin/main...HEAD"}}
+	if req.Name == "bash" && req.Arguments != nil {
+		if m, ok := req.Arguments.(map[string]any); ok {
+			if cmd, ok := m["command"].(string); ok && cmd != "" {
+				s.recordToolCommand(req.ToolCallID, cmd)
+			}
+		}
+	}
+	perm := copilot.PermissionRequestShell{ToolCallID: &toolCallID}
+	payload, _ := buildPermEventPayload(perm)
+	if tc := permissionToolCallID(perm); tc != "" {
+		if cmd := s.toolCommandFor(tc); cmd != "" {
+			payload["command"] = cmd
+		}
+	}
+	if payload["command"] != "git diff --stat origin/main...HEAD" {
+		t.Fatalf("fingerprint missing from payload: %v", payload)
+	}
+}

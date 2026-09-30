@@ -104,6 +104,18 @@ func (ts *turnState) handleEvent(s *sessionState, sink adapterhost.ExecuteEventS
 		case *copilot.AssistantMessageDeltaData:
 			ts.handleAssistantDelta(sink, event.Type(), d)
 		case *copilot.AssistantMessageData:
+			// KB-57: record raw commands for bash tool requests BEFORE the
+			// CLI's permission gate fires for these ToolCallIDs - the
+			// permission request payload itself only carries identifiers.
+			for _, tr := range d.ToolRequests {
+				if tr.Name == "bash" && tr.Arguments != nil {
+					if m, ok := tr.Arguments.(map[string]any); ok {
+						if cmd, ok := m["command"].(string); ok && cmd != "" {
+							s.recordToolCommand(tr.ToolCallID, cmd)
+						}
+					}
+				}
+			}
 			ts.handleAssistantMessage(sink, event.Type(), d)
 		case *copilot.ExternalToolRequestedData:
 			ts.sendErr(sink.Send(adapterEvent("tool.invocation", map[string]any{
