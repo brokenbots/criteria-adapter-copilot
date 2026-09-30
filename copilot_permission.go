@@ -51,18 +51,14 @@ func (p *copilotAdapter) handlePermissionRequest(sessionID string, request copil
 	// identifiers ("git", not "git status ..."), which no subcommand-pattern
 	// allow_tools entry can ever match, and its FullCommandText field is empty
 	// in current CLI builds. The adapter records the raw command from the
-	// matching ToolExecutionStart event; attach it as the details["command"]
-	// fingerprint the engine's requestFingerprints matcher consumes
-	// (internal/adapterhost/policy.go). Forwarded unconditionally: the same
-	// text is already visible on the wire in the adapter's own
-	// tool.invocation events, so this introduces no new stream exposure, and
-	// gating the policy fingerprint behind an opt-in left the CRI-260
-	// reviewer policy unable to match anything in live runs.
-	if toolCallID := permissionToolCallID(request); toolCallID != "" {
-		if cmd := s.toolCommandFor(toolCallID); cmd != "" {
-			payload["command"] = cmd
-		}
-	}
+	// assistant tool-request stream; attach it as the full_command_text
+	// fingerprint the engine's requestFingerprints matcher consumes via BOTH
+	// permission sinks (internal/adapterhost/permission_state.go and
+	// loader.go rebuild the request Details with full_command_text ONLY — a
+	// fingerprint under any other key, such as details["command"], is dropped
+	// before requestFingerprints ever runs, which is why the wave-2 fix was
+	// test-green but matchless in every live run).
+	attachCommandFingerprint(payload, request, s)
 
 	decisionCh := make(chan string, 1)
 	p.registerPendingPerm(requestID, decisionCh)
@@ -258,6 +254,34 @@ func setString(details map[string]string, key string, value *string) {
 	if value != nil && *value != "" {
 		details[key] = *value
 	}
+}
+
+// attachCommandFingerprint bridges a CLI shell permission request to the raw
+// command text recorded earlier in the turn (the assistant tool-request
+// stream; the CLI's own permission payload carries only parsed identifiers
+// and an empty FullCommandText). The fingerprint goes out under BOTH keys:
+//
+//   - "full_command_text": the ONLY detail key the engine's permission sinks
+//     rebuild into the evaluated request (permission_state.go and loader.go
+//     construct Details with full_command_text alone), so this is what
+//     requestFingerprints actually consumes on every supported engine.
+//   - "command": forward-compat for hosts that read the raw key directly.
+//
+// Attachment is unconditional: the same text is already on the wire in the
+// adapter's tool.invocation events, so this adds no new stream exposure —
+// and gating it behind the sensitive-details opt-in left the scoped reviewer
+// policy matchless in every live run (CRI-260/KB-57).
+func attachCommandFingerprint(payload map[string]any, request copilot.PermissionRequest, s *sessionState) {
+	toolCallID := permissionToolCallID(request)
+	if toolCallID == "" {
+		return
+	}
+	cmd := s.toolCommandFor(toolCallID)
+	if cmd == "" {
+		return
+	}
+	payload["full_command_text"] = cmd
+	payload["command"] = cmd
 }
 
 // permissionTool returns the host policy tool name for a permission request.

@@ -177,12 +177,11 @@ func TestAssistantToolRequestRecorded(t *testing.T) {
 	}
 	perm := copilot.PermissionRequestShell{ToolCallID: &toolCallID}
 	payload, _ := buildPermEventPayload(perm)
-	if tc := permissionToolCallID(perm); tc != "" {
-		if cmd := s.toolCommandFor(tc); cmd != "" {
-			payload["command"] = cmd
-		}
+	attachCommandFingerprint(payload, perm, s)
+	if payload["full_command_text"] != "git diff --stat origin/main...HEAD" {
+		t.Fatalf("full_command_text fingerprint missing (the key the engine sinks rebuild): %v", payload)
 	}
 	if payload["command"] != "git diff --stat origin/main...HEAD" {
-		t.Fatalf("fingerprint missing from payload: %v", payload)
+		t.Fatalf("command fingerprint missing: %v", payload)
 	}
 }
