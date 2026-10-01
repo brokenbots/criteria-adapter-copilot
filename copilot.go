@@ -189,6 +189,14 @@ func (p *copilotAdapter) Info(_ context.Context, _ *v2.InfoRequest) (*v2.InfoRes
 		// adapter secret is authoritative; when none is delivered, ensureClient
 		// falls back to Copilot's standard auth (env vars / credential caches).
 		Secrets: declaredGitHubTokenSecrets(),
+		// CRI-206: declared checkpoint state contract. Mode ref — the
+		// checkpointable state is an opaque token to adapter-owned state (the
+		// Copilot SDK session id): the host persists the token, never the
+		// payload (StateDescriptor mode "ref", criteria-adapter-proto).
+		// Per-turn granularity: develop turns run tens of minutes, so
+		// turn-boundary checkpoints are what make resume meaningful
+		// (CRI-202 ships per-turn in v1). See copilot_state.go.
+		State: stateDeclaration(),
 	}, nil
 }
 
