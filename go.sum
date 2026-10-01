@@ -1,5 +1,5 @@
-github.com/brokenbots/criteria-adapter-proto v0.5.3 h1:8BvGS960xalT5MB0DrWaRlAdvF1IHUrjW/go+8gNDGA=
-github.com/brokenbots/criteria-adapter-proto v0.5.3/go.mod h1:JeoJ2SvxmswXrsd3N2ohhhG8XuNDKL63yxRnJWT6PnU=
+github.com/brokenbots/criteria-adapter-proto v0.6.0 h1:GDyMPYcl/2OhINXZJZ96b3F0D/h+hM3remM7fYIo82M=
+github.com/brokenbots/criteria-adapter-proto v0.6.0/go.mod h1:JeoJ2SvxmswXrsd3N2ohhhG8XuNDKL63yxRnJWT6PnU=
 github.com/brokenbots/criteria-go-adapter-sdk v0.5.4 h1:0kZipKw4a9OA7uuYPao/H/5EqxOAoibV0cG+zWmFxUo=
 github.com/brokenbots/criteria-go-adapter-sdk v0.5.4/go.mod h1:NpK73UD4ypr3wsyt17n0aK8HQyZfZdOkccdamgP1/M0=
 github.com/bufbuild/protocompile v0.14.1 h1:iA73zAf/fyljNjQKwYzUHD6AD4R8KMasmwa/FBatYVw=
