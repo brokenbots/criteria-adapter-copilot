@@ -33,6 +33,10 @@ func TestPermissionDetailsOptionalFields(t *testing.T) {
 }
 
 func TestPermissionDetailsSensitiveFieldsRedactedByDefault(t *testing.T) {
+	// Force the redacted default explicitly: the ambient environment (e.g. a
+	// pod with CRITERIA_COPILOT_INCLUDE_SENSITIVE_PERMISSION_DETAILS=1) must
+	// not flip the behavior under test.
+	t.Setenv(includeSensitivePermissionDetailsEnv, "")
 	path := "/etc/passwd"
 	cmd := "cat /etc/passwd"
 	req := copilot.PermissionRequestShell{
