@@ -7,6 +7,7 @@ require (
 	github.com/brokenbots/criteria-go-adapter-sdk v0.5.4
 	github.com/github/copilot-sdk/go v1.0.0
 	github.com/google/uuid v1.6.0
+	github.com/hashicorp/go-plugin v1.8.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
 )
@@ -19,7 +20,6 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/hashicorp/go-hclog v1.6.3 // indirect
-	github.com/hashicorp/go-plugin v1.8.0 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.17 // indirect

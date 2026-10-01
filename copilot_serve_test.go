@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -164,7 +165,7 @@ func TestServeRemoteFull_HandshakeAndFullContractRegistration(t *testing.T) {
 			return
 		}
 		if hs.Name != adapterName || hs.SDKProtocolVersion != 2 {
-			errCh <- errUnexpectedHandshake{hs.Name, hs.SDKProtocolVersion}
+			errCh <- fmt.Errorf("unexpected handshake: name=%q sdk_protocol_version=%d", hs.Name, hs.SDKProtocolVersion)
 			return
 		}
 		// Handshake accepted: drop the connection; the server must unblock.
@@ -192,22 +193,6 @@ func TestServeRemoteFull_HandshakeAndFullContractRegistration(t *testing.T) {
 		t.Fatalf("host shim: %v", err)
 	default:
 	}
-}
-
-type errUnexpectedHandshake struct {
-	name    string
-	protoV2 int
-}
-
-func (e errUnexpectedHandshake) Error() string {
-	return "unexpected handshake: name=" + e.name + " sdk_protocol_version=" + itoa(e.protoV2)
-}
-
-func itoa(n int) string {
-	if n == 2 {
-		return "2"
-	}
-	return "not-2"
 }
 
 func remoteTestOptions(addr string) *adapterhost.ServeRemoteOptions {

@@ -48,9 +48,8 @@ func TestInfo_StateDeclaration(t *testing.T) {
 func newSnapshotTestSession(t *testing.T, id, sdkSessionID string, fc *fakeClient) *copilotAdapter {
 	t.Helper()
 	p := withRecoverableClient(t, fc)
-	sess := &fakeSession{sessionID: sdkSessionID}
-	s := newWatchdogSession(t, p, id, sess)
-	_ = s
+	// newWatchdogSession registers the session on p.
+	newWatchdogSession(t, p, id, &fakeSession{sessionID: sdkSessionID})
 	return p
 }
 
