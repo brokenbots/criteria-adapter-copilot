@@ -76,8 +76,10 @@ const (
 
 	// submitOutcomeToolDescription is the description surfaced to the model for
 	// the submit_outcome tool. It conveys the contract: call exactly once with
-	// a valid outcome before ending the turn, or the step fails.
-	submitOutcomeToolDescription = "Finalize the outcome for the current step. Call this exactly once with one of the allowed outcomes for the step. The list of allowed outcomes is provided in the user prompt. Failure to call this tool with a valid outcome will fail the step."
+	// a valid outcome (an optional finalize comment and, under contract mode,
+	// a JSON object payload matching the step contract) before ending the
+	// turn, or the step fails.
+	submitOutcomeToolDescription = "Finalize the outcome for the current step. Call this exactly once with one of the allowed outcomes for the step. The list of allowed outcomes is provided in the user prompt; when the step carries finalization contracts, the prompt also conveys the required `payload` JSON object schema and whether a `comment` is mandatory for a given outcome. Failure to call this tool with a valid outcome will fail the step."
 
 	// adapterToolToolDescription is the description surfaced to the model for
 	// the adapter_tool tool. It conveys when to call it, which targets are

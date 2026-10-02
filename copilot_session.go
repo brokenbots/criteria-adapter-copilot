@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -161,13 +162,56 @@ type sessionState struct {
 	// captures a successful tool call; finalizeAttempts counts invocations
 	// (valid + invalid) for the 3-attempt cap; finalizeFailureKind records the
 	// reason category for the most-recent failed invocation ("missing",
-	// "invalid_outcome", "duplicate", or "no_outcomes") and is used by
-	// failExhausted to emit a structured diagnostic event.
+	// "invalid_outcome", "duplicate", "no_outcomes", "invalid_payload", or
+	// "comment_missing") and is used by failExhausted to emit a structured
+	// diagnostic event.
 	activeAllowedOutcomes map[string]struct{}
 	finalizedOutcome      string
 	finalizedReason       string
 	finalizeAttempts      int
 	finalizeFailureKind   string
+
+	// KB-47 contract mode. contractMode is true for a step whose
+	// ExecuteRequest carried outcome contracts; activeContracts maps outcome
+	// name to its contract (nil entry possible via map check), and
+	// fallbackContractName holds the single fallback contract's outcome name
+	// ("" when none). On finalize, checkContractFinalize validates the
+	// submission against the contract in-turn; accepted submissions are
+	// validated: finalizedPayload keeps the model-submitted payload verbatim
+	// (proto's absent/empty/null = empty-object normalization applied) and
+	// finalizedComment the trimmed comment; the turn loop forwards both (with
+	// secret redaction) instead of the legacy session-state assembly.
+	contractMode         bool
+	activeContracts      map[string]*v2.OutcomeContract
+	fallbackContractName string
+
+	// finalizeFailureIssues carries the structured validator issue list for the
+	// most recent contract rejection (invalid_payload / comment_missing). The
+	// in-turn ToolResult surfaces it; handleIdleTurn appends it to the
+	// corrective reprompt. Reset at beginExecution.
+	finalizeFailureIssues []string
+
+	// finalizedPayload/finalizedComment record the accepted finalize's payload
+	// (verbatim, proto normalization applied) and trimmed comment in contract
+	// mode; the turn loop forwards them via contractResultEvent.
+	finalizedPayload json.RawMessage
+	finalizedComment string
+
+	// KB-47 repair state. inRepairMode marks a step being re-finalized after a
+	// host ExecutionRejection; inRepairAttempt is the host-provided attempt
+	// number echoed in repair events. createdEpoch counts adapter-side SDK
+	// session creations (1 on fresh create, bumped by reopenSession when the
+	// session could only be created fresh); finalizeSessionEpoch records
+	// createdEpoch at the last accepted finalize. In-session repair (minimal
+	// repair prompt into the live session) is used when the last finalize is
+	// known to still be in the current conversation
+	// (finalizeSessionEpoch >= createdEpoch); both zero — bare unit-test
+	// states or a Restore reattach, which restores the exact conversation —
+	// also count as in-session.
+	inRepairMode         bool
+	inRepairAttempt      uint32
+	createdEpoch         uint32
+	finalizeSessionEpoch uint32
 
 	// heldSecrets caches non-empty values the adapter received over the secret
 	// channel during OpenSession. These are the only secrets the adapter
@@ -521,6 +565,10 @@ func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionReq
 	s := newSessionState(adapterSessionID, session, sessionConfig, resumeConfig, secrets, p)
 	s.watchdog = watchdogCfg
 	s.heldSecrets = heldGitHubTokenSecrets(secrets)
+	// First SDK session for this adapter session (KB-47): epoch 1 whether the
+	// open created it fresh or resumed a persisted one — both restore/continue
+	// a conversation a later repair can address in-session.
+	s.createdEpoch = 1
 
 	if strings.TrimSpace(cfg[watchdogWindowCfgKey]) != "" || strings.TrimSpace(cfg[watchdogGateWindowCfgKey]) != "" {
 		slog.Info("copilot: watchdog windows configured",
@@ -640,17 +688,25 @@ func (p *copilotAdapter) openSDKSession(ctx context.Context, client copilotClien
 
 // buildSessionConfig constructs the SDK SessionConfig from agent-level config fields.
 func (p *copilotAdapter) buildSessionConfig(cfg map[string]string, adapterSessionID string) *copilot.SessionConfig {
-	// Register submit_outcome once per session. Validation against the active
-	// step's allowed set happens in handleSubmitOutcome at call time so that
-	// per-step scoping works without recreating the session.
-	submitTool := copilot.DefineTool(
-		submitOutcomeToolName,
-		submitOutcomeToolDescription,
-		func(args SubmitOutcomeArgs, _ copilot.ToolInvocation) (copilot.ToolResult, error) {
-			return p.handleSubmitOutcome(adapterSessionID, args)
+	// Register submit_outcome once per session as a hand-built Tool (KB-47):
+	// a static structural parameter schema — outcome: string, comment: string,
+	// payload: {type: object} — with no per-step enum. Tools bind only at
+	// session create/resume (the SDK has no Session-level tool mutation), so
+	// the enforceable per-step specifics (allowed outcome set, payload schema,
+	// require_comment) stay prompt-conveyed and handler-validated. Validation
+	// against the active step's allowed set and contracts happens in
+	// handleSubmitOutcome at call time so per-step scoping works without
+	// recreating the session. The handler decodes the already-decoded `any`
+	// arguments envelope itself (decodeSubmitOutcomeArgs).
+	submitTool := copilot.Tool{
+		Name:           submitOutcomeToolName,
+		Description:    submitOutcomeToolDescription,
+		Parameters:     submitOutcomeToolParameters(),
+		SkipPermission: true,
+		Handler: func(invocation copilot.ToolInvocation) (copilot.ToolResult, error) {
+			return p.handleSubmitOutcomeRaw(adapterSessionID, invocation)
 		},
-	)
-	submitTool.SkipPermission = true
+	}
 
 	// Register adapter_tool (CRI-178): the agent-invocable channel for calls
 	// to other adapters' tools. SkipPermission stays false — the call the

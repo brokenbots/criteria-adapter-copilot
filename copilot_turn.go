@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -37,6 +38,67 @@ var errSessionLoss = errors.New("copilot developer turn lost before submitting a
 // (KB-42).
 func isSessionLossError(err error) bool {
 	return errors.Is(err, errSessionLoss)
+}
+
+// recordedFinalize captures an accepted submit_outcome whose terminal
+// ExecuteEvent must be emitted outside the turn's idle path: a provider stall
+// that struck after the finalize (CRI-274) or a session loss that trailed the
+// submit (KB-42). Emission mirrors handleIdleTurn exactly — an
+// outcome.recovered event precedes the terminal result for a repair finalize,
+// and contract mode forwards the schema-validated payload and comment
+// verbatim (through the secret-hygiene path) instead of the legacy
+// session-state outputs assembly.
+type recordedFinalize struct {
+	outcome       string
+	reason        string
+	contractMode  bool
+	inRepair      bool
+	repairAttempt uint32
+	payload       json.RawMessage
+	comment       string
+	secrets       []string
+}
+
+// snapshotRecordedFinalize captures the recorded finalize state under s.mu.
+// ok is false when no finalize was accepted, so the caller falls back to its
+// own error handling.
+func (s *sessionState) snapshotRecordedFinalize() (recordedFinalize, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome == "" {
+		return recordedFinalize{}, false
+	}
+	return recordedFinalize{
+		outcome:       s.finalizedOutcome,
+		reason:        s.finalizedReason,
+		contractMode:  s.contractMode,
+		inRepair:      s.inRepairMode,
+		repairAttempt: s.inRepairAttempt,
+		payload:       append(json.RawMessage(nil), s.finalizedPayload...),
+		comment:       s.finalizedComment,
+		secrets:       s.heldSecrets,
+	}, true
+}
+
+// send emits the captured terminal result (and the outcome.recovered event
+// ahead of it for a repair finalize).
+func (f recordedFinalize) send(sink adapterhost.ExecuteEventSender) error {
+	if f.inRepair {
+		// KB-47: a rejected finalize that the model repaired and resubmitted
+		// successfully — surface the recovery once, before the terminal result.
+		_ = sink.Send(adapterEvent("outcome.recovered", map[string]any{
+			"outcome":        f.outcome,
+			"repair_attempt": f.repairAttempt,
+		}))
+	}
+	if f.contractMode {
+		// Contract mode: outputs_json is exactly the model-submitted,
+		// schema-validated payload — never a session-state assembly — and the
+		// finalize comment rides ExecuteResult.comment. Both pass through the
+		// secret-hygiene path.
+		return sink.Send(contractResultEvent(f.outcome, f.payload, f.comment, f.secrets...))
+	}
+	return sink.Send(resultEvent(f.outcome, f.reason, f.secrets...))
 }
 
 // maxEvidenceLen bounds the last-agent-message evidence attached to turn
@@ -101,6 +163,15 @@ type turnState struct {
 	// awaitOutcome goroutine, read by failExhausted on that same goroutine.
 	repromptReplies     []string
 	lastCapturedReplyID string
+
+	// execPrompt holds the composition inputs for this Execute's prompt: the
+	// step prompt, allowed outcomes, contracts, and an optional rejection.
+	// The prompt is composed at send time — not when Execute populates
+	// session state — because a repair Execute must observe the session
+	// generation AFTER sendWithRetry's lazy reopen has had its chance to
+	// re-create the SDK session (KB-47): a fresh create bumps createdEpoch
+	// and degrades the repair to the full re-execute prompt.
+	execPrompt executePrompt
 }
 
 func newTurnState(maxTurns int) *turnState {
@@ -108,6 +179,25 @@ func newTurnState(maxTurns int) *turnState {
 		turnDone: make(chan struct{}, 1),
 		errCh:    make(chan error, 1),
 		maxTurns: maxTurns,
+	}
+}
+
+// executePrompt carries the composition inputs for an Execute's prompt. The
+// prompt is composed lazily — at each send attempt — so a repair Execute can
+// observe the session generation after any lazy reopen (KB-47).
+type executePrompt struct {
+	stepPrompt string
+	allowed    []string
+	contracts  []*v2.OutcomeContract
+	rejection  *v2.ExecutionRejection
+}
+
+// messageOptions composes the prompt for the current session state. Called
+// outside s.mu: composeExecutePrompt reads session state (repair eligibility)
+// under s.mu itself.
+func (ep executePrompt) messageOptions(s *sessionState) *copilot.MessageOptions {
+	return &copilot.MessageOptions{
+		Prompt: composeExecutePrompt(ep.stepPrompt, ep.allowed, ep.contracts, ep.rejection, s, s.heldSecrets),
 	}
 }
 
@@ -366,14 +456,12 @@ func (ts *turnState) awaitOutcome(ctx context.Context, s *sessionState, sink ada
 				// A session loss that trails a submitted outcome must not
 				// fail the step: the deliverable was already produced, the
 				// same way the stall path returns a finalized outcome
-				// directly instead of retrying (CRI-274, KB-42).
+				// directly instead of retrying (CRI-274, KB-42). In contract
+				// mode the recorded payload/comment ride the dedicated
+				// result fields, not the legacy outputs assembly (KB-47).
 				if errors.Is(err, errSessionLoss) {
-					s.mu.Lock()
-					outcome := s.finalizedOutcome
-					reason := s.finalizedReason
-					s.mu.Unlock()
-					if outcome != "" {
-						return sink.Send(resultEvent(outcome, reason, s.heldSecrets...))
+					if snap, ok := s.snapshotRecordedFinalize(); ok {
+						return snap.send(sink)
 					}
 				}
 				return err
@@ -428,6 +516,29 @@ func (ts *turnState) handleIdleTurn(ctx context.Context, s *sessionState, sink a
 	}
 
 	if outcome != "" {
+		s.mu.Lock()
+		contractMode := s.contractMode
+		inRepair := s.inRepairMode
+		repairAttempt := s.inRepairAttempt
+		payload := append([]byte(nil), s.finalizedPayload...)
+		comment := s.finalizedComment
+		s.mu.Unlock()
+		if inRepair {
+			// KB-47: a rejected finalize that the model repaired and
+			// resubmitted successfully — surface the recovery once, before the
+			// terminal result.
+			_ = sink.Send(adapterEvent("outcome.recovered", map[string]any{
+				"outcome":        outcome,
+				"repair_attempt": repairAttempt,
+			}))
+		}
+		if contractMode {
+			// Contract mode: outputs_json is exactly the model-submitted,
+			// schema-validated payload — never a session-state assembly — and
+			// the finalize comment rides ExecuteResult.comment. Both pass
+			// through the secret-hygiene path.
+			return true, sink.Send(contractResultEvent(outcome, payload, comment, s.heldSecrets...))
+		}
 		return true, sink.Send(resultEvent(outcome, reason, s.heldSecrets...))
 	}
 
@@ -456,6 +567,8 @@ func (ts *turnState) handleIdleTurn(ctx context.Context, s *sessionState, sink a
 func (ts *turnState) reprompt(ctx context.Context, s *sessionState) error {
 	s.mu.Lock()
 	allowedList := sortedAllowedOutcomes(s.activeAllowedOutcomes)
+	issues := append([]string(nil), s.finalizeFailureIssues...)
+	secrets := s.heldSecrets
 	s.mu.Unlock()
 
 	list := strings.Join(allowedList, ", ")
@@ -463,6 +576,19 @@ func (ts *turnState) reprompt(ctx context.Context, s *sessionState) error {
 		"You must call the `submit_outcome` tool with one of the allowed outcomes: %s. Do not return a final answer without calling the tool. Allowed outcomes: %s. Failure to call the tool will fail the step.",
 		list, list,
 	)
+	if len(issues) > 0 {
+		// KB-47: the prior finalize was rejected by the step's outcome
+		// contract; surface the structured issue list so the model repairs
+		// in-turn. Issue text is truncated and secret-redacted before echoing
+		// (it can quote model-generated content).
+		var b strings.Builder
+		b.WriteString(msg)
+		b.WriteString("\n\nYour last submission was rejected; fix the issues below and resubmit:")
+		for _, issue := range issues {
+			fmt.Fprintf(&b, "\n- %s", truncateText(redactSecrets(issue, secrets), maxContractIssueLen))
+		}
+		msg = b.String()
+	}
 	if _, err := s.sendWithRetry(ctx, &copilot.MessageOptions{Prompt: msg}); err != nil {
 		return fmt.Errorf("copilot: reprompt: %w", err)
 	}
@@ -504,6 +630,8 @@ func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEven
 		"invalid_outcome": "invalid outcome",
 		"duplicate":       "duplicate finalize",
 		"no_outcomes":     "step has no declared outcomes",
+		"invalid_payload": "invalid payload",
+		"comment_missing": "missing comment",
 	}
 	reason, ok := reasonLabels[kind]
 	if !ok {
@@ -542,6 +670,20 @@ func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEven
 		"last_agent_message":   evidence,
 		"reprompt_replies":     repromptAny,
 	}))
+	// KB-47: under outcome contracts a fallback contract is the step's
+	// guaranteed-finalize exit — a finalize loop that ran out of budget is
+	// exactly the condition the fallback declares, so the loop's loss
+	// finalizes with the fallback outcome (no payload, no comment; proto
+	// v0.7.0) instead of the legacy failure. turn.finalize_exhausted above is
+	// kept (it is the operator evidence); only the legacy outcome.failure +
+	// failure result are skipped. Without a fallback contract — or with no
+	// contracts at all — today's legacy path is byte-for-byte unchanged.
+	s.mu.Lock()
+	fallbackName := s.fallbackContractName
+	s.mu.Unlock()
+	if fallbackName != "" {
+		return sink.Send(fallbackResultEvent(fallbackName))
+	}
 	_ = sink.Send(adapterEvent("outcome.failure", map[string]any{
 		"reason":             reason,
 		"kind":               kind,
@@ -579,12 +721,18 @@ func (ts *turnState) probeErrSignal() bool {
 	}
 }
 
-// handleMaxTurnsReached returns failure unless "needs_review" is in the
-// allowed set, in which case it preserves the historical max-turns behavior.
+// handleMaxTurnsReached returns the fallback-contract outcome when the step
+// carries outcome contracts with a fallback (KB-47); otherwise it returns
+// failure unless "needs_review" is in the allowed set, preserving the
+// historical max-turns behavior (the no-contract legacy path).
 func (ts *turnState) handleMaxTurnsReached(s *sessionState, sink adapterhost.ExecuteEventSender) error {
 	s.mu.Lock()
 	_, needsReviewAllowed := s.activeAllowedOutcomes["needs_review"]
+	fallbackName := s.fallbackContractName
 	s.mu.Unlock()
+	if fallbackName != "" {
+		return sink.Send(fallbackResultEvent(fallbackName))
+	}
 	if needsReviewAllowed {
 		return sink.Send(resultEvent("needs_review", ""))
 	}
@@ -615,25 +763,43 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	defer stopLiveness()
 
 	// Populate allowed set before the prompt is sent so the tool handler can
-	// validate on the very first turn.
+	// validate on the very first turn. Contract mode (v0.7.0 OutcomeContracts)
+	// and repair-mode state ride the same lock.
 	allowed := req.GetAllowedOutcomes()
+	contracts := req.GetOutcomeContracts()
+	rejection := req.GetRejection()
 	s.mu.Lock()
 	s.activeAllowedOutcomes = make(map[string]struct{}, len(allowed))
 	for _, name := range allowed {
 		s.activeAllowedOutcomes[name] = struct{}{}
 	}
+	s.contractMode = len(contracts) > 0
+	if s.contractMode {
+		s.activeContracts = make(map[string]*v2.OutcomeContract, len(contracts))
+		for _, contract := range contracts {
+			s.activeContracts[contract.GetName()] = contract
+			if contract.GetFallback() {
+				s.fallbackContractName = contract.GetName()
+			}
+		}
+	} else {
+		s.activeContracts = nil
+		s.fallbackContractName = ""
+	}
+	s.inRepairMode = rejection != nil && rejection.GetOutcome() != ""
+	s.inRepairAttempt = 0
+	if s.inRepairMode {
+		s.inRepairAttempt = rejection.GetAttempt()
+	}
 	s.mu.Unlock()
 
-	// Prepend the allowed-outcomes preamble so the model knows what to call.
-	if len(allowed) > 0 {
-		outcomeList := strings.Join(allowed, ", ") // already sorted ascending by W14 loader
-		prompt = fmt.Sprintf(
-			"You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are: %s. If you do not call the tool with a valid outcome, the step will fail.\n\n%s",
-			outcomeList, prompt,
-		)
-	}
-
 	state := newTurnState(maxTurns)
+	state.execPrompt = executePrompt{
+		stepPrompt: prompt,
+		allowed:    allowed,
+		contracts:  contracts,
+		rejection:  rejection,
+	}
 	// Route the handler through the session's event fanout (CRI-272): if the
 	// CLI child dies mid-turn and the session is re-opened, the swapped-in SDK
 	// session re-registers the same fanout and this turn keeps its events.
@@ -659,8 +825,128 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	// The whole provider call (send + await outcome) is watchdog-supervised
 	// and retried by executeTurn: a hung send or a stream that opens and goes
 	// silent is failed and re-sent per the CRI-272 backoff path instead of
-	// wedging the turn (CRI-274).
-	return state.executeTurn(ctx, s, &copilot.MessageOptions{Prompt: prompt}, sink)
+	// wedging the turn (CRI-274). The prompt is composed at send time —
+	// inside executeTurn, per attempt (KB-47) — so a repair Execute observes
+	// the session generation after sendWithRetry's lazy reopen: a fresh SDK
+	// create bumps createdEpoch and degrades the repair to the full
+	// re-execute prompt instead of a minimal prompt into an empty
+	// conversation.
+	return state.executeTurn(ctx, s, sink)
+}
+
+// repairInSession reports whether a rejected finalize can be repaired with a
+// minimal prompt into the live SDK session (KB-47): the rejected finalize must
+// still be in the model's conversation. That holds when the finalize landed in
+// the current SDK session generation (finalizeSessionEpoch >= createdEpoch).
+// Both epochs zero — bare unit-test states, and process restarts whose in-memory
+// bookkeeping was lost while the host reattached the checkpointed conversation
+// (Restore resumes the exact conversation) — also count as in-session. A fresh
+// SDK session create after a CLI-child death (createdEpoch bumped by
+// reopenSession) starts an empty conversation and degrades the repair to a
+// full re-execute.
+//
+// Takes s.mu. Call it OUTSIDE s.mu — from prompt composition, which runs at
+// send time, never from code already holding the lock (KB-47).
+func (s *sessionState) repairInSession() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizeSessionEpoch >= s.createdEpoch && s.finalizeSessionEpoch > 0 {
+		return true
+	}
+	return s.finalizeSessionEpoch == 0 && s.createdEpoch <= 1
+}
+
+// composeExecutePrompt assembles the model prompt for an Execute: the
+// allowed-outcomes preamble, the contract-conveyance block (contract mode),
+// and — for a host-rejected repair — either the minimal repair prompt
+// (in-session) or the full step prompt with the rejection note appended
+// (degraded re-execute). The no-contract, no-rejection result is byte-for-byte
+// today's preamble-wrapped step prompt.
+//
+// Takes s *sessionState instead of a pre-decided inSession flag (KB-47): the
+// in-session decision is made HERE, at composition time (under s.mu), so a
+// lazy reopen that re-created the SDK session before the send is reflected.
+// s must not be nil; bare (&sessionState{}) works for stateless tests.
+func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.OutcomeContract, rejection *v2.ExecutionRejection, s *sessionState, secrets []string) string {
+	// Prepend the allowed-outcomes preamble so the model knows what to call.
+	if len(allowed) > 0 {
+		outcomeList := strings.Join(allowed, ", ") // already sorted ascending by W14 loader
+		stepPrompt = fmt.Sprintf(
+			"You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are: %s. If you do not call the tool with a valid outcome, the step will fail.\n\n%s",
+			outcomeList, stepPrompt,
+		)
+	}
+
+	if contracts := contractConveyance(contracts); contracts != "" {
+		stepPrompt = stepPrompt + "\n\n" + contracts
+	}
+
+	if rejection != nil && rejection.GetOutcome() != "" {
+		// The model must repair its rejected finalize. Issue text is
+		// host-provided diagnostic quoting model-generated content: truncate
+		// and secret-redact before echoing it back.
+		issues := truncateText(redactSecrets(rejection.GetIssues(), secrets), maxContractIssueLen)
+		// In-session decision at composition time (KB-47): a reopen that
+		// created a fresh SDK session before this send bumped createdEpoch,
+		// degrading the repair to the full re-execute.
+		inSession := s.repairInSession()
+		if inSession {
+			// Minimal repair prompt (KB-47): the live conversation already
+			// holds the full step context and the rejected finalize; resending
+			// the full step prompt would re-run the discovery work.
+			var b strings.Builder
+			fmt.Fprintf(&b, "Your previous finalize submission was rejected by the workflow and must be repaired in this session with the `submit_outcome` tool. Rejected outcome: %q.", rejection.GetOutcome())
+			if issues != "" {
+				fmt.Fprintf(&b, "\nIssues reported by the workflow:\n%s", issues)
+			}
+			fmt.Fprintf(&b, "\nResubmit the finalize now: call `submit_outcome` with a corrected submission for this outcome before ending the turn.")
+			return b.String()
+		}
+		// Degraded re-execute: the conversation was recreated (CRI-272 fresh
+		// create), so the full step prompt runs again — with the rejection
+		// note attached so the resubmission addresses the reported issues.
+		var b strings.Builder
+		b.WriteString(stepPrompt)
+		fmt.Fprintf(&b, "\n\nNote: a previous finalize submission for this step was rejected by the workflow (outcome %q, attempt %d).", rejection.GetOutcome(), rejection.GetAttempt())
+		if issues != "" {
+			fmt.Fprintf(&b, " Its reported issues were:\n%s", issues)
+		}
+		b.WriteString("\nAddress these issues in your finalization.")
+		return b.String()
+	}
+
+	return stepPrompt
+}
+
+// contractConveyance renders the per-step contract block the model sees: what
+// each contracted outcome requires of the payload and comment, and which
+// outcome is the fallback. Empty when there are no contracts.
+func contractConveyance(contracts []*v2.OutcomeContract) string {
+	if len(contracts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Finalization contracts for this step.")
+	for _, contract := range contracts {
+		name := contract.GetName()
+		var reqs []string
+		if schema := string(contract.GetSchemaJson()); strings.TrimSpace(schema) != "" {
+			reqs = append(reqs, fmt.Sprintf(
+				"when finalizing with this outcome, the submit_outcome call must include a `payload` argument — a JSON object matching this JSON Schema: %s", schema))
+		}
+		if contract.GetRequireComment() {
+			reqs = append(reqs, "when finalizing with this outcome, the submit_outcome call must include a non-empty `comment` argument (require_comment)")
+		}
+		if contract.GetFallback() {
+			reqs = append(reqs, "fallback contract: if no other outcome can be finalized, finalize with this outcome (no payload or comment required)")
+		}
+		if len(reqs) == 0 {
+			fmt.Fprintf(&b, "\n- Outcome %q: no additional requirements.", name)
+			continue
+		}
+		fmt.Fprintf(&b, "\n- Outcome %q: %s.", name, strings.Join(reqs, "; and "))
+	}
+	return b.String()
 }
 
 // prepareExecute validates the request and returns the session state, prompt,
@@ -700,12 +986,19 @@ func (s *sessionState) beginExecution(sink adapterhost.ExecuteEventSender) func(
 	// host-visible silence from this stamp until the first forwarded event.
 	s.lastForwardNs.Store(watchdogNow().UnixNano())
 
-	// W15: reset per-execute finalize state. activeAllowedOutcomes is set by
-	// Execute *after* this returns; do not reset it here.
+	// W15: reset per-execute finalize state. activeAllowedOutcomes and the
+	// KB-47 contract-mode fields (contractMode, activeContracts,
+	// fallbackContractName) are set by Execute *after* this returns; do not
+	// reset them here.
 	s.finalizedOutcome = ""
 	s.finalizedReason = ""
 	s.finalizeAttempts = 0
 	s.finalizeFailureKind = ""
+	s.finalizeFailureIssues = nil
+	s.finalizedPayload = nil
+	s.finalizedComment = ""
+	s.inRepairMode = false
+	s.inRepairAttempt = 0
 	s.mu.Unlock()
 
 	return func() {

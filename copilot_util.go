@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -71,6 +72,28 @@ func redactSecrets(reason string, secrets []string) string {
 	return out
 }
 
+// truncateText cuts s to at most limit runes, never splitting a multi-byte
+// character. The final rune boundary cut keeps multi-byte content from
+// splitting mid-character. Empty input yields an empty string, so callers can
+// decide to omit the text entirely.
+func truncateText(s string, limit int) string {
+	if s == "" {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// adapterEvent wraps a semantic AdapterEvent in an ExecuteEvent, encoding the
+// payload map as a structpb Struct. Encoding failures degrade to a minimal
+// struct so the event kind is preserved and diagnosable rather than
+// silently dropped.
 func adapterEvent(kind string, data map[string]any) *v2.ExecuteEvent {
 	s, err := structpb.NewStruct(data)
 	if err != nil {
@@ -85,6 +108,32 @@ func adapterEvent(kind string, data map[string]any) *v2.ExecuteEvent {
 				Payload:   s,
 			},
 		},
+	}
+}
+
+// contractResultEvent builds the terminal ExecuteEvent for a contract-mode
+// finalize: outputs_json is exactly the model-submitted, schema-validated
+// payload (never a session-state assembly — proto v0.7.0 contract-mode rule)
+// and the finalize comment rides the dedicated ExecuteResult.comment field.
+// Both the payload and the comment pass through the secret-hygiene path;
+// like resultEvent this is best-effort hygiene, not a safety guarantee.
+func contractResultEvent(outcome string, payload json.RawMessage, comment string, secrets ...string) *v2.ExecuteEvent {
+	return &v2.ExecuteEvent{
+		Event: &v2.ExecuteEvent_Result{Result: &v2.ExecuteResult{
+			Outcome:     outcome,
+			OutputsJson: []byte(redactSecrets(string(payload), secrets)),
+			Comment:     redactSecrets(comment, secrets),
+		}},
+	}
+}
+
+// fallbackResultEvent builds the terminal ExecuteEvent for a fallback-contract
+// finalize: outcome only. A fallback finalize carries no payload and no
+// comment regardless of the contract's other settings (proto
+// OutcomeContract.Fallback v0.7.0).
+func fallbackResultEvent(outcome string) *v2.ExecuteEvent {
+	return &v2.ExecuteEvent{
+		Event: &v2.ExecuteEvent_Result{Result: &v2.ExecuteResult{Outcome: outcome}},
 	}
 }
 

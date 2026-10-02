@@ -59,9 +59,34 @@
 //
 //	All turns: session.idle with no tool call (exhausts 3 attempts => failure)
 //
+// "contract-payload-ok" (KB-47):
+//
+//	Emits submit_outcome(outcome, payload, comment) + session.idle — the
+//	payload and comment come from FAKE_COPILOT_PAYLOAD / FAKE_COPILOT_COMMENT.
+//
+// "contract-payload-repair" (KB-47):
+//
+//	Turn 1: submit_outcome with the FAKE_COPILOT_PAYLOAD payload (invalid
+//	per the step contract) + session.idle. Repair turns — prompts that
+//	mention the rejection — resubmit with FAKE_COPILOT_PAYLOAD2
+//	(/ FAKE_COPILOT_COMMENT2), exercising the in-turn invalid_payload
+//	classification and the issue-carrying reprompt.
+//
+// "contract-repair" (KB-47):
+//
+//	Turn 1: submit_outcome with the FAKE_COPILOT_PAYLOAD payload + session.idle
+//	(the finalize the host later rejects). Repair-execute turns — prompts that
+//	say the finalize was "rejected by the workflow" — resubmit with
+//	FAKE_COPILOT_PAYLOAD2 (/ FAKE_COPILOT_COMMENT2).
+//
 // FAKE_COPILOT_OUTCOME overrides the outcome value submitted on success
 // paths (default "success") — used by review-step conformance tests, whose
 // steps declare outcomes like "approved".
+//
+// FAKE_COPILOT_PAYLOAD / FAKE_COPILOT_COMMENT (and the *2 repair-stage
+// variants) are JSON-object strings decoded into the submit_outcome tool-call
+// arguments as the "payload" / "comment" fields; an empty or undecodable
+// value contributes no field.
 //
 // Permission prompt (contains "fetch"): emits permission.requested (auto-approved),
 // waits for handlePendingPermissionRequest, then emits session.idle with no tool call.
@@ -364,6 +389,33 @@ func handleSessionSend(msg *rpcMsg) {
 		case "", "success":
 			sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "step completed")
 
+		case "contract-payload-ok":
+			// KB-47: submit the env-provided payload and comment so the
+			// adapter's contract validation and verbatim forwarding can be
+			// observed end to end.
+			sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "step completed", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+
+		case "contract-payload-repair":
+			// KB-47: turn 1 submits the (contract-invalid) first-stage
+			// payload; any repair prompt — the in-turn rejection reprompt or
+			// the host-rejection repair prompt — resubmits with the
+			// second-stage payload.
+			if isRepairPrompt(p.Prompt) {
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "repaired submission", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
+			} else {
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "step completed", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+			}
+
+		case "contract-repair":
+			// KB-47: turn 1 submits the first-stage payload (the finalize the
+			// host later rejects); the host-rejection repair execute resubmits
+			// with the second-stage payload.
+			if strings.Contains(p.Prompt, repairPromptMarker) {
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "repaired submission", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
+			} else {
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "step completed", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+			}
+
 		case "success-after-reprompt-1":
 			if turn == 1 {
 				sendEvent(p.SessionID, "session.idle", map[string]any{})
@@ -401,9 +453,9 @@ func handleSessionSend(msg *rpcMsg) {
 			// second call. This ensures finalizedOutcome is set to "success"
 			// deterministically before the second handler runs, making the
 			// first-call-wins semantics observable at the boundary.
-			reqID1 := sendToolCall(p.SessionID, "success", "first call")
+			reqID1 := sendToolCall(p.SessionID, submitArgs("success", "first call", nil))
 			waitForToolCall(reqID1)
-			reqID2 := sendToolCall(p.SessionID, "failure", "second call")
+			reqID2 := sendToolCall(p.SessionID, submitArgs("failure", "second call", nil))
 			waitForToolCall(reqID2)
 			sendEvent(p.SessionID, "session.idle", map[string]any{})
 
@@ -421,9 +473,78 @@ func handleSessionSend(msg *rpcMsg) {
 // SDK to confirm the handler ran (via handlePendingToolCall), then emits
 // session.idle to end the turn.
 func sendToolCallAndIdle(sessionID, outcome, reason string) {
-	reqID := sendToolCall(sessionID, outcome, reason)
+	sendArgsAndIdle(sessionID, submitArgs(outcome, reason, nil))
+}
+
+// sendArgsAndIdle emits a submit_outcome tool call with the given arguments,
+// waits for the handler to run, then ends the turn with session.idle.
+func sendArgsAndIdle(sessionID string, args map[string]any) {
+	reqID := sendToolCall(sessionID, args)
 	waitForToolCall(reqID)
 	sendEvent(sessionID, "session.idle", map[string]any{})
+}
+
+// submitArgs builds a submit_outcome tool-call argument object: the outcome,
+// an optional reason, and the optional contract fields (payload/comment).
+func submitArgs(outcome, reason string, fields map[string]any) map[string]any {
+	args := map[string]any{"outcome": outcome}
+	if reason != "" {
+		args["reason"] = reason
+	}
+	for k, v := range fields {
+		args[k] = v
+	}
+	return args
+}
+
+// repairPromptMarker names the host-rejection repair prompt (KB-47): repair
+// executes that degrade to full re-execute append it, and the minimal in-session
+// repair prompt opens with it.
+const repairPromptMarker = "rejected by the workflow"
+
+// repromptRejectMarker names the corrective reprompt for an in-turn contract
+// rejection (KB-47).
+const repromptRejectMarker = "Your last submission was rejected"
+
+// isRepairPrompt reports whether a session.send prompt is a repair prompt —
+// either the host-rejection repair (degraded re-execute note or minimal
+// in-session prompt) or the in-turn rejection reprompt.
+func isRepairPrompt(prompt string) bool {
+	return strings.Contains(prompt, repairPromptMarker) || strings.Contains(prompt, repromptRejectMarker)
+}
+
+// Scenario payload/comment stages: first-stage submissions and the second-stage
+// values used on repair turns. Each value is a JSON object string (or plain
+// text for the comment); empty contributes nothing.
+const (
+	scenarioPayload1Env = "FAKE_COPILOT_PAYLOAD"
+	scenarioPayload2Env = "FAKE_COPILOT_PAYLOAD2"
+	scenarioComment1Env = "FAKE_COPILOT_COMMENT"
+	scenarioComment2Env = "FAKE_COPILOT_COMMENT2"
+)
+
+// scenarioContractFields returns the "payload" / "comment" argument fields for
+// the given repair stage ("FAKE_COPILOT_PAYLOAD"/"...2" and
+// "FAKE_COPILOT_COMMENT"/"...2"). An undecodable payload value contributes
+// nothing (a warn goes to stderr — the fixture must not crash mid-scenario).
+func scenarioContractFields(prompt string, payloadEnv string) map[string]any {
+	fields := map[string]any{}
+	if raw := strings.TrimSpace(os.Getenv(payloadEnv)); raw != "" {
+		var payload any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			fmt.Fprintf(os.Stderr, "fake-copilot: %s is not valid JSON: %v\n", payloadEnv, err)
+		} else {
+			fields["payload"] = payload
+		}
+	}
+	commentEnv := scenarioComment1Env
+	if payloadEnv == scenarioPayload2Env {
+		commentEnv = scenarioComment2Env
+	}
+	if c := strings.TrimSpace(os.Getenv(commentEnv)); c != "" {
+		fields["comment"] = c
+	}
+	return fields
 }
 
 // waitForToolCall blocks until handlePendingToolCall has been received for
@@ -440,7 +561,7 @@ func waitForToolCall(reqID string) {
 
 // sendToolCall emits a single external_tool.requested event for submit_outcome
 // and registers a pending channel for handlePendingToolCall. Returns the requestId.
-func sendToolCall(sessionID, outcome, reason string) string {
+func sendToolCall(sessionID string, args map[string]any) string {
 	seq := atomic.AddInt64(&toolSeq, 1)
 	reqID := fmt.Sprintf("fake-tool-req-%d", seq)
 	toolCallID := fmt.Sprintf("fake-tc-%d", seq)
@@ -450,11 +571,6 @@ func sendToolCall(sessionID, outcome, reason string) string {
 	pendingToolCalls[reqID] = ch
 	toolCallSessions[reqID] = sessionID
 	toolsMu.Unlock()
-
-	args := map[string]any{"outcome": outcome}
-	if reason != "" {
-		args["reason"] = reason
-	}
 
 	sendEvent(sessionID, "external_tool.requested", map[string]any{
 		"requestId":  reqID,

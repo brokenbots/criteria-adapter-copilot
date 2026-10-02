@@ -864,3 +864,332 @@ func TestSubmitOutcome_PreamblePresentInPrompt(t *testing.T) {
 		t.Errorf("first prompt should include the step prompt, got: %q", firstPrompt)
 	}
 }
+
+// ── contract-mode submit_outcome tests (KB-47) ───────────────────────────────
+
+// contractTestContract builds an OutcomeContract for handler tests.
+func contractTestContract(t *testing.T, name string, schema string, requireComment, fallback bool) *v2.OutcomeContract {
+	t.Helper()
+	c := &v2.OutcomeContract{Name: name, RequireComment: requireComment, Fallback: fallback}
+	if schema != "" {
+		c.SchemaJson = []byte(schema)
+	}
+	return c
+}
+
+// contractTestState returns a sessionState in contract mode with the given
+// allowed outcomes and contracts; a fallback-marked contract also becomes
+// fallbackContractName.
+func contractTestState(allowed []string, contracts ...*v2.OutcomeContract) *sessionState {
+	s := stateWithOutcomes(allowed...)
+	s.contractMode = true
+	// OpenSession sets createdEpoch = 1; every accepted contract finalize
+	// stamps finalizeSessionEpoch with it (repair eligibility).
+	s.createdEpoch = 1
+	s.activeContracts = make(map[string]*v2.OutcomeContract, len(contracts))
+	for _, c := range contracts {
+		s.activeContracts[c.GetName()] = c
+		if c.GetFallback() {
+			s.fallbackContractName = c.GetName()
+		}
+	}
+	return s
+}
+
+// verbatimSchema: object with a required string verdict property.
+const verbatimSchema = `{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string"}}}`
+
+// Contract-mode finalize accepted: outcome, verbatim payload, and trimmed
+// comment all land on sessionState, and the finalize session epoch is set.
+func TestContractSubmitAcceptedStoresPayloadAndComment(t *testing.T) {
+	s := contractTestState([]string{"approved", "failure"},
+		contractTestContract(t, "approved", `{"type":"object"}`, false, false))
+	p := outcomeAdapter(s)
+
+	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  " ship it ",
+		Comment: " LGTM ",
+		Payload: json.RawMessage(`{"b":1,"a":2}`),
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q, want success (%s)", res.ResultType, res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "approved" || s.finalizedReason != "ship it" || s.finalizedComment != "LGTM" {
+		t.Errorf("finalized = %q/%q/%q, want approved/ship it/LGTM", s.finalizedOutcome, s.finalizedReason, s.finalizedComment)
+	}
+	if string(s.finalizedPayload) != `{"b":1,"a":2}` {
+		t.Errorf("payload stored as %s, want the submitted bytes verbatim", s.finalizedPayload)
+	}
+	if s.finalizeSessionEpoch == 0 {
+		t.Error("finalizeSessionEpoch not set on accepted contract finalize")
+	}
+}
+
+// Contract-mode accepted finalize with no schema and no payload forwards an
+// empty-object payload (proto: absent/empty/null payload = empty object).
+func TestContractSubmitNoSchemaNoPayloadYieldsEmptyObject(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", "", false, false))
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "approved"})
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q, want success (%s)", res.ResultType, res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if string(s.finalizedPayload) != "{}" {
+		t.Errorf("finalizedPayload = %s, want {}", s.finalizedPayload)
+	}
+}
+
+// Uncontracted allowed outcome in contract mode: the adapter does not reject
+// it (host owns outcome_uncontracted post-finalize); the submission finalizes.
+func TestContractSubmitUncontractedOutcomeIsForwarded(t *testing.T) {
+	s := contractTestState([]string{"approved", "failure"},
+		contractTestContract(t, "approved", verbatimSchema, false, false))
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "failure"})
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q, want success (adapter must not reject uncontracted outcomes): %s", res.ResultType, res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "failure" {
+		t.Errorf("finalizedOutcome = %q, want failure", s.finalizedOutcome)
+	}
+	if s.finalizeFailureIssues != nil {
+		t.Errorf("finalizeFailureIssues = %v, want none", s.finalizeFailureIssues)
+	}
+}
+
+// require_comment without a comment → comment_missing rejection that does not
+// finalize, and reports the requirement in the ToolResult text.
+func TestContractSubmitCommentMissing(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimSchema, true, false))
+	p := outcomeAdapter(s)
+
+	s.mu.Lock()
+	s.finalizeAttempts = 0
+	s.mu.Unlock()
+	for _, comment := range []string{"", "   "} {
+		res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "approved", Comment: comment, Payload: json.RawMessage(`{"verdict":"ok"}`)})
+		if res.ResultType != "failure" {
+			t.Fatalf("comment %q: ResultType = %q, want failure", comment, res.ResultType)
+		}
+		if !strings.Contains(res.TextResultForLLM, "requires a finalize comment") || !strings.Contains(res.TextResultForLLM, "Fix the listed issues") {
+			t.Errorf("comment %q: message %q should state the requirement and invite repair", comment, res.TextResultForLLM)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "" || s.finalizeFailureKind != "comment_missing" {
+		t.Errorf("state = outcome %q kind %q, want unfinalized comment_missing", s.finalizedOutcome, s.finalizeFailureKind)
+	}
+	if s.finalizeAttempts != 2 {
+		t.Errorf("finalizeAttempts = %d, want 2 (one per rejected call)", s.finalizeAttempts)
+	}
+}
+
+// Schema violation → invalid_payload rejection with the validator's structured
+// issue text so the model can repair in-turn.
+func TestContractSubmitInvalidPayloadStructuredIssues(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimSchema, false, false))
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "approved", Payload: json.RawMessage(`{"verdict": 9}`)})
+	if res.ResultType != "failure" {
+		t.Fatalf("ResultType = %q, want failure", res.ResultType)
+	}
+	s.mu.Lock()
+	kind, issues := s.finalizeFailureKind, s.finalizeFailureIssues
+	s.mu.Unlock()
+	if kind != "invalid_payload" {
+		t.Errorf("finalizeFailureKind = %q, want invalid_payload", kind)
+	}
+	if len(issues) == 0 || !strings.Contains(strings.Join(issues, "; "), "properties/verdict") {
+		t.Errorf("issues = %v, want a structured validator issue naming the failing path", issues)
+	}
+}
+
+// A payload that breaks a schema whose messages quote the submitted value: the
+// ToolResult keeps the raw issue (same session, model repairs from it) while
+// the emitted outcome.payload_invalid event is secret-redacted.
+func TestContractSubmitInvalidPayloadRedactsEventIssuesButKeepsToolResultRaw(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", `{"type":"object","required":["note"],"properties":{"note":{"type":"array"}}}`, false, false))
+	s.heldSecrets = []string{"swordfish"}
+	sink := &recordingSender{}
+	s.mu.Lock()
+	s.active, s.sink = true, sink
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Payload: json.RawMessage(`{"note": "swordfish"}`),
+	})
+	if res.ResultType != "failure" {
+		t.Fatalf("ResultType = %q, want failure", res.ResultType)
+	}
+
+	s.mu.Lock()
+	kind := s.finalizeFailureKind
+	s.mu.Unlock()
+	if kind != "invalid_payload" {
+		t.Fatalf("finalizeFailureKind = %q, want invalid_payload", kind)
+	}
+
+	// The ToolResult goes only to the model in the live session.
+	if !strings.Contains(res.TextResultForLLM, "swordfish") {
+		t.Errorf("ToolResult should carry the validator issue verbatim for in-session repair, got %q", res.TextResultForLLM)
+	}
+
+	found := false
+	for _, ev := range sink.snapshot() {
+		a := ev.GetAdapter()
+		if a == nil || a.GetEventKind() != "outcome.payload_invalid" {
+			continue
+		}
+		found = true
+		d := a.GetPayload().AsMap()
+		if d["outcome"] != "approved" || d["kind"] != "invalid_payload" {
+			t.Errorf("event = %v, want outcome approved kind invalid_payload", d)
+		}
+		issues, ok := d["issues"].([]any)
+		if !ok || len(issues) == 0 {
+			t.Fatalf("event issues = %#v, want a non-empty list", d["issues"])
+		}
+		for _, i := range issues {
+			if txt, ok := i.(string); ok && strings.Contains(txt, "swordfish") {
+				t.Errorf("event issue %q leaks the held secret", txt)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected an outcome.payload_invalid adapter event")
+	}
+}
+
+// Undecodable invocation envelopes (hand-built tools bypass reflection
+// decoding) are classified invalid_outcome and consume the finalize budget.
+func TestSubmitOutcomeRawDecodeEnvelopeFailures(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimSchema, false, false))
+	p := outcomeAdapter(s)
+
+	res, err := p.handleSubmitOutcomeRaw("s1", copilot.ToolInvocation{ToolName: "submit_outcome", Arguments: "not-an-object"})
+	if err != nil {
+		t.Fatalf("raw handler must return ToolResult, not Go error: %v", err)
+	}
+	if res.ResultType != "failure" || !strings.Contains(res.TextResultForLLM, "JSON object") {
+		t.Errorf("string envelope: %q / %q, want failure with decode guidance", res.ResultType, res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	kind, attempts := s.finalizeFailureKind, s.finalizeAttempts
+	s.mu.Unlock()
+	if kind != "invalid_outcome" || attempts != 1 {
+		t.Errorf("kind/attempts = %q/%d, want invalid_outcome/1", kind, attempts)
+	}
+
+	res, err = p.handleSubmitOutcomeRaw("s1", copilot.ToolInvocation{ToolName: "submit_outcome", Arguments: "{nope"})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.ResultType != "failure" {
+		t.Errorf("malformed envelope: ResultType = %q, want failure", res.ResultType)
+	}
+
+	// A good round-trip still succeeds through the raw handler.
+	res, err = p.handleSubmitOutcomeRaw("s1", copilot.ToolInvocation{
+		ToolName:  "submit_outcome",
+		Arguments: map[string]any{"outcome": "approved", "payload": map[string]any{"verdict": "ok"}},
+	})
+	if err != nil || res.ResultType != "success" {
+		t.Fatalf("map envelope: err=%v result=%q, want success", err, res.ResultType)
+	}
+}
+
+// validateContractPayload table: proto absent/empty/null = empty-object
+// semantics, structured issue text, and invalid-instance classification.
+func TestValidateContractPayload(t *testing.T) {
+	schema := []byte(verbatimSchema)
+	cases := []struct {
+		name    string
+		payload string
+		want    []string // nil = valid; substrings expected in issues otherwise
+	}{
+		{"valid object", `{"verdict":"approved"}`, nil},
+		{"null payload is empty object", "null", []string{"required"}},
+		{"missing required", `{}`, []string{"required"}},
+		{"wrong type", `{"verdict": 5}`, []string{"verdict"}},
+		{"instance not object", `[1,2]`, []string{"type"}},
+		{"undecodable bytes", `{"a":`, []string{"payload does not decode to a JSON object"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			issues := validateContractPayload(json.RawMessage(tc.payload), schema)
+			if tc.want == nil {
+				if len(issues) != 0 {
+					t.Fatalf("issues = %v, want none", issues)
+				}
+				return
+			}
+			joined := strings.Join(issues, "; ")
+			for _, fragment := range tc.want {
+				if !strings.Contains(joined, fragment) {
+					t.Errorf("issues %q missing fragment %q", joined, fragment)
+				}
+			}
+		})
+	}
+	if issues := validateContractPayload(json.RawMessage(`{"x":1}`), nil); len(issues) != 0 {
+		t.Errorf("nil schema should validate anything, got %v", issues)
+	}
+}
+
+// normalizedFinalizePayload: only the degenerate shapes rewrite to {}; the
+// whitespace-trimmed original bytes are otherwise preserved.
+func TestNormalizedFinalizePayload(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"", "{}"},
+		{"   ", "{}"},
+		{"null", "{}"},
+		{"  null  ", "{}"},
+		{`{}`, `{}`},
+		{`  {"b":1,"a":2}  `, `{"b":1,"a":2}`},
+		{`{"a":1}`, `{"a":1}`},
+	}
+	for _, tc := range cases {
+		if got := string(normalizedFinalizePayload(json.RawMessage(tc.in))); got != tc.want {
+			t.Errorf("normalizedFinalizePayload(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// checkContractFinalize: comment-missing class only when the payload is
+// otherwise clean; combined violations classify invalid_payload.
+func TestCheckContractFinalizeClassification(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimSchema, true, false))
+	if r := s.checkContractFinalize("approved", json.RawMessage(`{"verdict":"ok"}`), ""); r == nil || r.kind != "comment_missing" {
+		t.Errorf("clean payload + no comment: %+v, want comment_missing", r)
+	}
+	if r := s.checkContractFinalize("approved", json.RawMessage(`{"verdict":9}`), ""); r == nil || r.kind != "invalid_payload" {
+		t.Errorf("bad payload + no comment: %+v, want invalid_payload", r)
+	}
+	if r := s.checkContractFinalize("approved", json.RawMessage(`{"verdict":"ok"}`), "note"); r != nil {
+		t.Errorf("clean payload + comment: %+v, want nil", r)
+	}
+}
