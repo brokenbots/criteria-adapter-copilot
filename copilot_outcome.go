@@ -142,10 +142,11 @@ func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMes
 	if contract == nil {
 		return nil
 	}
-	var issues []string
 	schema := contract.GetSchemaJson()
 	requireComment := contract.GetRequireComment()
-	if requireComment && strings.TrimSpace(comment) == "" {
+	commentMissing := requireComment && strings.TrimSpace(comment) == ""
+	var issues []string
+	if commentMissing {
 		issues = append(issues, fmt.Sprintf(
 			"the outcome %q requires a finalize comment (require_comment); none was supplied", outcome))
 	}
@@ -155,11 +156,11 @@ func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMes
 	if len(issues) == 0 {
 		return nil
 	}
+	// Comment-missing is its own in-turn class, but only when the payload is
+	// otherwise clean; when both are wrong the payload issues dominate the
+	// rejection message and the classification.
 	kind := "invalid_payload"
-	if requireComment && strings.TrimSpace(comment) == "" && len(validateContractPayload(payload, schema)) == 0 {
-		// Comment-missing is its own in-turn class; when both are wrong the
-		// payload issues win the classification since they dominate the
-		// rejection message.
+	if commentMissing && len(issues) == 1 {
 		kind = "comment_missing"
 	}
 	return &contractRejection{kind: kind, issues: issues}
@@ -174,6 +175,11 @@ func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMes
 // valid); issue text is the validator's structured messages, truncated and
 // never nil-safe-guessed.
 func validateContractPayload(payload json.RawMessage, schemaJSON []byte) []string {
+	if len(schemaJSON) == 0 {
+		// No payload contract: everything valid (proto: empty schema_json =
+		// outputs_json forwarded verbatim).
+		return nil
+	}
 	instance, instanceIssue := payloadInstance(payload)
 	if instanceIssue != "" {
 		return []string{instanceIssue}
@@ -357,10 +363,16 @@ func (p *copilotAdapter) emitContractRejectionEvent(s *sessionState, adapterSess
 	if err != nil {
 		issueJSON = []byte("[]")
 	}
+	// proto Struct encoding cannot carry json.RawMessage: decode the redacted
+	// JSON array into concrete values before building the event payload.
+	var redactedIssues []any
+	if err := json.Unmarshal([]byte(redactSecrets(string(issueJSON), heldSecrets)), &redactedIssues); err != nil {
+		redactedIssues = []any{}
+	}
 	_ = sink.Send(adapterEvent("outcome.payload_invalid", map[string]any{
 		"outcome": outcome,
 		"kind":    rejection.kind,
-		"issues":  json.RawMessage(redactSecrets(string(issueJSON), heldSecrets)),
+		"issues":  redactedIssues,
 	}))
 }
 
