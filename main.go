@@ -25,7 +25,7 @@ func newCopilotAdapter() *copilotAdapter {
 func runAdapter(impl *copilotAdapter) error {
 	host := os.Getenv("CRITERIA_REMOTE_HOST")
 	if host == "" {
-		adapterhost.Serve(impl)
+		servePlugin(impl)
 		return nil
 	}
 	return serveRemote(impl)
@@ -36,7 +36,9 @@ func serveRemote(impl *copilotAdapter) error {
 	if err != nil {
 		return err
 	}
-	return adapterhost.ServeRemote(impl, opts)
+	// CRI-206: serve the full contract (including Snapshot/Restore) so the
+	// engine's declared-state handshake can reattach restored sessions.
+	return serveRemoteFull(impl, opts)
 }
 
 func buildRemoteOptions() (*adapterhost.ServeRemoteOptions, error) {

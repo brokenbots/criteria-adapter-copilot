@@ -71,6 +71,12 @@ type fakeClient struct {
 
 	// handOut is the session the next Create/Resume hands back.
 	handOut copilotSession
+
+	// holdResume, when non-nil, parks the ResumeSessionWithOptions call for
+	// the matching session id until the gate channel is closed. The resume
+	// entry is recorded BEFORE the park, so tests can deterministically stage
+	// interleavings between concurrent resumers (KB-65 restore/sweep race).
+	holdResume map[string]chan struct{}
 }
 
 func (c *fakeClient) Start(_ context.Context) error {
@@ -129,13 +135,19 @@ func (c *fakeClient) CreateSession(_ context.Context, config *copilot.SessionCon
 
 func (c *fakeClient) ResumeSessionWithOptions(_ context.Context, sessionID string, config *copilot.ResumeSessionConfig) (copilotSession, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.resumeIDs = append(c.resumeIDs, sessionID)
 	c.resumeConfigs = append(c.resumeConfigs, config)
-	if c.resumeErr != nil {
-		return nil, c.resumeErr
+	resumeErr, handOut, hold := c.resumeErr, c.handOut, c.holdResume[sessionID]
+	c.mu.Unlock()
+	if hold != nil {
+		<-hold
 	}
-	if c.handOut == nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if resumeErr != nil {
+		return nil, resumeErr
+	}
+	if handOut == nil {
 		return &fakeSession{sessionID: sessionID}, nil
 	}
 	return c.handOut, nil
