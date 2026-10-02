@@ -751,7 +751,7 @@ func TestContractConveyanceRendering(t *testing.T) {
 	out := contractConveyance(contracts)
 	for _, want := range []string{
 		"Finalization contracts for this step.",
-		`Outcome "approved": when finalizing with this outcome, the submit_outcome call must include a `+"`payload`",
+		`Outcome "approved": when finalizing with this outcome, the submit_outcome call must include a ` + "`payload`",
 		"JSON Schema: {\"type\":\"object\"}",
 		`Outcome "unspecified": no additional requirements.`,
 		"fallback contract: if no other outcome can be finalized",
@@ -767,13 +767,13 @@ func TestRepairInSessionEpochMatrix(t *testing.T) {
 		finalizeEpoch, createdEpoch uint32
 		want                        bool
 	}{
-		{3, 3, true},   // finalize landed in the current session generation
-		{4, 3, true},   // newer-than-current: still the live conversation
-		{2, 3, false},  // finalize predates a fresh SDK create (CRI-272)
-		{1, 1, true},   // first-generation finalize
-		{0, 1, true},   // no finalize epoch yet; process attached the checkpointed conversation
-		{0, 0, true},   // bare unit-test state
-		{0, 2, false},  // bookkeeping lost + fresh create: degrade to re-execute
+		{3, 3, true},  // finalize landed in the current session generation
+		{4, 3, true},  // newer-than-current: still the live conversation
+		{2, 3, false}, // finalize predates a fresh SDK create (CRI-272)
+		{1, 1, true},  // first-generation finalize
+		{0, 1, true},  // no finalize epoch yet; process attached the checkpointed conversation
+		{0, 0, true},  // bare unit-test state
+		{0, 2, false}, // bookkeeping lost + fresh create: degrade to re-execute
 		{1, 2, false},
 	}
 	for _, tc := range cases {

@@ -33,10 +33,10 @@ const maxContractIssueLen = 2000
 // outcome contracts (v0.7.0 contract mode), the matched contract's schema —
 // both carried on sessionState.
 type SubmitOutcomeArgs struct {
-	Outcome string          `json:"outcome"`                   // required; must be a member of the active allowed set
-	Reason  string          `json:"reason,omitempty"`          // optional prose; surfaced in events for operator visibility
-	Comment string          `json:"comment,omitempty"`         // optional finalize comment; mandatory when the matched contract sets require_comment
-	Payload json.RawMessage `json:"payload,omitempty"`         // optional JSON object payload, kept verbatim; validated against the matched contract's schema_json when contract mode is active
+	Outcome string          `json:"outcome"`           // required; must be a member of the active allowed set
+	Reason  string          `json:"reason,omitempty"`  // optional prose; surfaced in events for operator visibility
+	Comment string          `json:"comment,omitempty"` // optional finalize comment; mandatory when the matched contract sets require_comment
+	Payload json.RawMessage `json:"payload,omitempty"` // optional JSON object payload, kept verbatim; validated against the matched contract's schema_json when contract mode is active
 }
 
 // submitOutcomeToolParameters is the static structural JSON Schema the
