@@ -7,7 +7,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -679,5 +681,392 @@ func TestEvidenceSnippet(t *testing.T) {
 	}
 	if maxEvidenceLen <= len(marker) {
 		t.Fatalf("maxEvidenceLen = %d, want > %d so long inputs are marked", maxEvidenceLen, len(marker))
+	}
+}
+
+// ── KB-47 contract-mode turn-loop tests ──────────────────────────────────────
+
+// composeExecutePrompt: four shapes — legacy (no contracts, no rejection),
+// contract conveyance appended, minimal in-session repair, degraded
+// re-execute with the rejection note.
+func TestComposeExecutePromptShapes(t *testing.T) {
+	const stepPrompt = "review the worktree diff"
+	legacy := composeExecutePrompt(stepPrompt, []string{"approved", "failure"}, nil, nil, false, nil)
+	wantLegacy := "You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are: approved, failure. If you do not call the tool with a valid outcome, the step will fail.\n\nreview the worktree diff"
+	if legacy != wantLegacy {
+		t.Errorf("legacy shape drift:\n got %q\nwant %q", legacy, wantLegacy)
+	}
+	if strings.Contains(legacy, "Finalization contracts") || strings.Contains(legacy, "rejected by the workflow") {
+		t.Errorf("legacy shape must not carry contract/repair content: %q", legacy)
+	}
+
+	contracts := []*v2.OutcomeContract{
+		{Name: "approved", SchemaJson: []byte(`{"type":"object"}`), RequireComment: true},
+		{Name: "stalled", Fallback: true},
+	}
+	withContract := composeExecutePrompt(stepPrompt, []string{"approved", "stalled"}, contracts, nil, false, nil)
+	for _, want := range []string{"Finalization contracts", `"approved"`, `"stalled"`, "require_comment", "fallback contract"} {
+		if !strings.Contains(withContract, want) {
+			t.Errorf("contract shape missing %q:\n%s", want, withContract)
+		}
+	}
+
+	rejection := &v2.ExecutionRejection{Outcome: "approved", Issues: "the payload misses the verdict", Attempt: 2}
+	repair := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, true, nil)
+	for _, want := range []string{`Rejected outcome: "approved"`, "Issues reported by the workflow", "Resubmit the finalize now"} {
+		if !strings.Contains(repair, want) {
+			t.Errorf("in-session repair shape missing %q:\n%s", want, repair)
+		}
+	}
+	if strings.Contains(repair, stepPrompt) {
+		t.Errorf("in-session repair shape must stay minimal, got the full step prompt:\n%s", repair)
+	}
+
+	degraded := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, false, nil)
+	for _, want := range []string{stepPrompt, `(outcome "approved", attempt 2)`, "Its reported issues were", "Address these issues"} {
+		if !strings.Contains(degraded, want) {
+			t.Errorf("degraded shape missing %q:\n%s", want, degraded)
+		}
+	}
+
+	// Issue text quotes model-generated content: it must not leak a held
+	// secret through either repair shape.
+	leaky := &v2.ExecutionRejection{Outcome: "approved", Issues: "verdict swordfish was not in the enum", Attempt: 1}
+	leakyRepair := composeExecutePrompt("step", []string{"approved"}, nil, leaky, true, []string{"swordfish"})
+	leakyDegraded := composeExecutePrompt("step", []string{"approved"}, nil, leaky, false, []string{"swordfish"})
+	if strings.Contains(leakyRepair, "swordfish") || strings.Contains(leakyDegraded, "swordfish") {
+		t.Errorf("repair prompts leak held secrets:\n%s\n%s", leakyRepair, leakyDegraded)
+	}
+}
+
+func TestContractConveyanceRendering(t *testing.T) {
+	if got := contractConveyance(nil); got != "" {
+		t.Errorf("no contracts should render empty, got %q", got)
+	}
+	contracts := []*v2.OutcomeContract{
+		{Name: "approved", SchemaJson: []byte(`{"type":"object"}`)},
+		{Name: "unspecified"},
+		{Name: "stalled", Fallback: true},
+	}
+	out := contractConveyance(contracts)
+	for _, want := range []string{
+		"Finalization contracts for this step.",
+		`Outcome "approved": when finalizing with this outcome, the submit_outcome call must include a `+"`payload`",
+		"JSON Schema: {\"type\":\"object\"}",
+		`Outcome "unspecified": no additional requirements.`,
+		"fallback contract: if no other outcome can be finalized",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("conveyance missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRepairInSessionEpochMatrix(t *testing.T) {
+	cases := []struct {
+		finalizeEpoch, createdEpoch uint32
+		want                        bool
+	}{
+		{3, 3, true},   // finalize landed in the current session generation
+		{4, 3, true},   // newer-than-current: still the live conversation
+		{2, 3, false},  // finalize predates a fresh SDK create (CRI-272)
+		{1, 1, true},   // first-generation finalize
+		{0, 1, true},   // no finalize epoch yet; process attached the checkpointed conversation
+		{0, 0, true},   // bare unit-test state
+		{0, 2, false},  // bookkeeping lost + fresh create: degrade to re-execute
+		{1, 2, false},
+	}
+	for _, tc := range cases {
+		s := &sessionState{createdEpoch: tc.createdEpoch, finalizeSessionEpoch: tc.finalizeEpoch}
+		if got := s.repairInSession(); got != tc.want {
+			t.Errorf("repairInSession(finalize=%d created=%d) = %v, want %v", tc.finalizeEpoch, tc.createdEpoch, got, tc.want)
+		}
+	}
+}
+
+// handleIdleTurn (contract mode): terminal result carries the payload verbatim
+// and the comment, both secret-redacted, preceded by outcome.recovered only
+// for a host-rejection repair. No legacy outputs assembly.
+func TestHandleIdleTurnContractEmission(t *testing.T) {
+	newContractSession := func(t *testing.T) (*sessionState, *recordingSender) {
+		t.Helper()
+		s := contractTestState([]string{"approved"}, contractTestContract(t, "approved", `{"type":"object"}`, true, false))
+		sink := &recordingSender{}
+		s.active, s.sink = true, sink
+		s.heldSecrets = []string{"swordfish"}
+		s.finalizedOutcome = "approved"
+		s.finalizedComment = "note swordfish"
+		s.finalizedPayload = json.RawMessage(`{"verdict":"swordfish","score":2}`)
+		return s, sink
+	}
+	ctx := context.Background()
+
+	t.Run("recovered + payloads", func(t *testing.T) {
+		s, sink := newContractSession(t)
+		s.mu.Lock()
+		s.inRepairMode, s.inRepairAttempt = true, 2
+		s.mu.Unlock()
+		ts := newTurnState(3)
+		done, err := ts.handleIdleTurn(ctx, s, sink, 1)
+		if err != nil || !done {
+			t.Fatalf("done/err = %v/%v, want true/nil", done, err)
+		}
+		evs := sink.snapshot()
+		var recovered map[string]any
+		for _, ev := range evs {
+			if a := ev.GetAdapter(); a != nil && a.GetEventKind() == "outcome.recovered" {
+				recovered = a.GetPayload().AsMap()
+			}
+		}
+		if recovered == nil {
+			t.Fatal("expected an outcome.recovered event for a repaired finalize")
+		}
+		if recovered["outcome"] != "approved" || recovered["repair_attempt"] != float64(2) {
+			t.Errorf("outcome.recovered = %v, want outcome approved repair_attempt 2", recovered)
+		}
+		r := resultFromSender(sink)
+		if r.GetOutcome() != "approved" {
+			t.Fatalf("result outcome = %q, want approved", r.GetOutcome())
+		}
+		if got := string(r.GetOutputsJson()); strings.Contains(got, "swordfish") || !strings.Contains(got, "[REDACTED]") {
+			t.Errorf("outputs_json not redacted: %s", got)
+		}
+		if r.GetComment() != "note [REDACTED]" {
+			t.Errorf("comment = %q, want %q", r.GetComment(), "note [REDACTED]")
+		}
+		if bytes.Contains(s.finalizedPayload, []byte("[REDACTED]")) {
+			t.Errorf("stored payload must stay verbatim, got %s", s.finalizedPayload)
+		}
+	})
+
+	t.Run("no recovered without repair", func(t *testing.T) {
+		s, sink := newContractSession(t)
+		s.mu.Lock()
+		s.inRepairMode = false
+		s.mu.Unlock()
+		ts := newTurnState(3)
+		if done, err := ts.handleIdleTurn(ctx, s, sink, 1); err != nil || !done {
+			t.Fatalf("done/err = %v/%v, want true/nil", done, err)
+		}
+		for _, ev := range sink.snapshot() {
+			if a := ev.GetAdapter(); a != nil && a.GetEventKind() == "outcome.recovered" {
+				t.Fatal("outcome.recovered must not fire without repair mode")
+			}
+		}
+		if r := resultFromSender(sink); r.GetComment() == "" {
+			t.Error("contract result should carry the finalize comment")
+		}
+	})
+
+	t.Run("legacy shape byte-for-byte", func(t *testing.T) {
+		s, sink := newContractSession(t)
+		s.mu.Lock()
+		s.contractMode = false
+		s.finalizedReason = "looks good"
+		s.mu.Unlock()
+		ts := newTurnState(3)
+		if done, err := ts.handleIdleTurn(ctx, s, sink, 1); err != nil || !done {
+			t.Fatalf("done/err = %v/%v, want true/nil", done, err)
+		}
+		r := resultFromSender(sink)
+		out := outputsOf(t, r)
+		if len(out) != 2 || out["outcome"] != "approved" || out["reason"] != "looks good" {
+			t.Errorf("legacy outputs = %v, want exactly outcome+reason", out)
+		}
+		if r.GetComment() != "" {
+			t.Errorf("legacy result must not carry comment, got %q", r.GetComment())
+		}
+	})
+}
+
+// Contract-mode finalize loop, end to end through Execute: a rejected
+// payload submission (invalid type) triggers an outcome.payload_invalid event
+// and a reprompt carrying the structured issues; the repaired second
+// submission forwards its payload verbatim and the comment.
+func TestExecuteContractRejectionRepairsInTurn(t *testing.T) {
+	contracts := []*v2.OutcomeContract{
+		contractTestContract(t, "approved", `{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string"}}}`, true, false),
+	}
+	s := contractTestState([]string{"approved"}, contracts...)
+	p := outcomeAdapter(s)
+	fake := s.session.(*fakeSession)
+	fake.emitOnSend = []copilot.SessionEvent{{Data: &copilot.SessionIdleData{}}}
+	calls := 0
+	fake.onSend = func(_ int, _ copilot.MessageOptions) {
+		calls++
+		var err error
+		var res copilot.ToolResult
+		if calls == 1 {
+			res, err = p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+				Outcome: "approved", Comment: "note", Payload: json.RawMessage(`{"verdict": 9}`),
+			})
+		} else {
+			res, err = p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+				Outcome: "approved", Comment: "note", Payload: json.RawMessage(`{"verdict":"approved","n":1}`),
+			})
+		}
+		if err != nil {
+			t.Errorf("handler call %d: err=%v", calls, err)
+		}
+		wantType := "success"
+		if calls == 1 {
+			wantType = "failure" // stage 1 is deliberately invalid
+		}
+		if res.ResultType != wantType {
+			t.Errorf("handler call %d: resultType = %q, want %q (%s)", calls, res.ResultType, wantType, res.TextResultForLLM)
+		}
+	}
+	sender := &recordingSender{}
+
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:        "s1",
+		Input:            map[string]string{"prompt": "do work"},
+		AllowedOutcomes:  []string{"approved"},
+		OutcomeContracts: contracts,
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if fake.sendCount != 2 {
+		t.Errorf("sendCount = %d, want 2 (initial + one repair reprompt)", fake.sendCount)
+	}
+	// The reprompt must quote the structured issues.
+	if opts := fake.getSentOpts(); len(opts) < 2 || !strings.Contains(opts[1].Prompt, "Your last submission was rejected") || !strings.Contains(opts[1].Prompt, "verdict") {
+		t.Errorf("reprompt lacks issue list:\n%v", opts)
+	}
+	// The rejection was surfaced to the operator.
+	found := false
+	for _, ev := range sender.snapshot() {
+		if a := ev.GetAdapter(); a != nil && a.GetEventKind() == "outcome.payload_invalid" {
+			found = true
+			d := a.GetPayload().AsMap()
+			if d["kind"] != "invalid_payload" {
+				t.Errorf("payload_invalid kind = %v, want invalid_payload", d["kind"])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected an outcome.payload_invalid event")
+	}
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "approved" {
+		t.Fatalf("result outcome = %q, want approved", r.GetOutcome())
+	}
+	if got := string(r.GetOutputsJson()); got != `{"verdict":"approved","n":1}` {
+		t.Errorf("outputs_json = %s, want the repaired payload verbatim", got)
+	}
+	if r.GetComment() != "note" {
+		t.Errorf("comment = %q, want note", r.GetComment())
+	}
+}
+
+// Exhaustion under contracts with a fallback: turn.finalize_exhausted is kept
+// as operator evidence, the result finalizes with the fallback outcome (no
+// outputs, no comment), and the legacy outcome.failure event is skipped.
+func TestExecuteContractFallbackOnExhaustion(t *testing.T) {
+	contracts := []*v2.OutcomeContract{
+		contractTestContract(t, "approved", `{"type":"object"}`, false, false),
+		contractTestContract(t, "failure", "", false, true),
+	}
+	s := contractTestState([]string{"approved", "failure"}, contracts...)
+	p := outcomeAdapter(s)
+	fake := s.session.(*fakeSession)
+	idle := []copilot.SessionEvent{{Data: &copilot.SessionIdleData{}}}
+	fake.sendSequence = [][]copilot.SessionEvent{idle, idle, idle}
+	sender := &recordingSender{}
+
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:        "s1",
+		Input:            map[string]string{"prompt": "do work"},
+		AllowedOutcomes:  []string{"approved", "failure"},
+		OutcomeContracts: contracts,
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	hasExhausted := false
+	for _, ev := range sender.snapshot() {
+		a := ev.GetAdapter()
+		if a == nil {
+			continue
+		}
+		switch a.GetEventKind() {
+		case "turn.finalize_exhausted":
+			hasExhausted = true
+		case "outcome.failure":
+			t.Error("outcome.failure must be skipped when a fallback contract fires")
+		}
+	}
+	if !hasExhausted {
+		t.Error("turn.finalize_exhausted must be kept as operator evidence")
+	}
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "failure" {
+		t.Fatalf("result outcome = %q, want fallback failure", r.GetOutcome())
+	}
+	if len(r.GetOutputsJson()) != 0 || r.GetComment() != "" {
+		t.Errorf("fallback result must carry no outputs/comment, got %s/%q", r.GetOutputsJson(), r.GetComment())
+	}
+}
+
+// Max-turns reached under contracts with a fallback finalizes the fallback
+// outcome instead of the legacy failure/needs_review result.
+func TestExecuteContractFallbackOnMaxTurns(t *testing.T) {
+	contracts := []*v2.OutcomeContract{
+		contractTestContract(t, "approved", "", false, false),
+		contractTestContract(t, "stalled", "", false, true),
+	}
+	s := contractTestState([]string{"approved", "stalled"}, contracts...)
+	p := outcomeAdapter(s)
+	fake := s.session.(*fakeSession)
+	fake.emitOnSend = []copilot.SessionEvent{{Data: &copilot.SessionIdleData{}}}
+	sender := &recordingSender{}
+
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:        "s1",
+		Input:            map[string]string{"prompt": "do work", "max_turns": "1"},
+		AllowedOutcomes:  []string{"approved", "stalled"},
+		OutcomeContracts: contracts,
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "stalled" {
+		t.Fatalf("result outcome = %q, want fallback stalled", r.GetOutcome())
+	}
+	if len(r.GetOutputsJson()) != 0 || r.GetComment() != "" {
+		t.Errorf("fallback result must carry no outputs/comment, got %s/%q", r.GetOutputsJson(), r.GetComment())
+	}
+}
+
+// The corrective reprompt carries the rejected finalize's issue list,
+// truncated and secret-redacted.
+func TestRepromptCarriesContractIssues(t *testing.T) {
+	s := stateWithOutcomes("approved")
+	s.heldSecrets = []string{"swordfish"}
+	s.finalizeFailureIssues = []string{
+		"validating /properties/verdict: type: swordfish has type \"string\", want \"number\"",
+	}
+	fake := s.session.(*fakeSession)
+	ts := newTurnState(3)
+	if err := ts.reprompt(context.Background(), s); err != nil {
+		t.Fatalf("reprompt returned error: %v", err)
+	}
+	if opts := fake.getSentOpts(); len(opts) != 1 {
+		t.Fatalf("sentOpts = %d calls, want 1", len(opts))
+	}
+	prompt := fake.getSentOpts()[0].Prompt
+	if !strings.Contains(prompt, "Your last submission was rejected") {
+		t.Errorf("reprompt missing rejection marker:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "/properties/verdict") {
+		t.Errorf("reprompt missing the structured issue:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "swordfish") {
+		t.Errorf("reprompt leaks the held secret:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "[REDACTED]") {
+		t.Errorf("reprompt should show the redaction placeholder:\n%s", prompt)
 	}
 }
