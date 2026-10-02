@@ -126,6 +126,18 @@ func (p *copilotAdapter) Restore(ctx context.Context, req *v2.RestoreRequest) (*
 			sessionID)
 	}
 
+	// Serialize the whole reattach (check, resume, swap, persist) behind the
+	// same per-session lock reopenSession holds: a concurrent recovery sweep
+	// (CRI-272) reads the PRE-Restore persisted id, resumes it, and would
+	// otherwise land its swapSession after Restore's swap — leaving the
+	// adapter attached to the superseded conversation while Restore reports
+	// success and disk already reflects the checkpointed token (silent
+	// wrong-state restore). Taking the lock once here makes the sweep either
+	// run fully before Restore (its id is then re-superseded by this swap) or
+	// fully after (it reopens the address Restore just persisted).
+	s.reopenMu.Lock()
+	defer s.reopenMu.Unlock()
+
 	// Exact-address equivalence: the open path already reattached to this
 	// address (CRI-272 persisted-ID resume). Byte-equal token, same address —
 	// a second resume of the same conversation is skipped, not approximated.
@@ -152,6 +164,11 @@ func (p *copilotAdapter) Restore(ctx context.Context, req *v2.RestoreRequest) (*
 	}
 
 	s.swapSession(sess)
+	// Claim the runtime epoch this reattach ran on (same bookkeeping as
+	// reopenSession): a sweep started before Restore finished then sees a
+	// current binding and does not churn the just-restored session again,
+	// reopening it onto the stale persisted id a second time.
+	s.boundClientEpoch = p.currentClientEpoch()
 	persistSDKSessionID(sessionID, token)
 	slog.Info("copilot: state reattached to checkpointed conversation",
 		"adapterSession", sessionID, "sdkSession", token)

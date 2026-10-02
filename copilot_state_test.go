@@ -7,7 +7,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -258,4 +263,162 @@ func TestRestore_EmptyStateRefusesToGuess(t *testing.T) {
 	if resumes != 0 {
 		t.Fatalf("ResumeSessionWithOptions called %v times with an empty address", resumes)
 	}
+}
+
+// TestRestore_RacingRecoverySweepKeepsRestoredAddress (KB-65): a recovery
+// sweep (recoverTransport → reopenSession) running concurrently with Restore
+// must not re-attach the adapter to the pre-Restore persisted id after
+// Restore's swap. Restore used to run its check/swap/persist outside
+// reopenMu, so a sweep that resumed the stale persisted id could land its
+// swapSession afterwards — the adapter ends up attached to the superseded
+// conversation while Restore reports success and disk reflects the
+// checkpointed token (silent wrong-state restore). The choreography parks
+// both resumes on fakeClient gates so the interleaving is scripted, not
+// lucky: Restore's resume is released while the sweep is still parked (or
+// still queued on reopenMu), then the sweep's own resume is released last.
+func TestRestore_RacingRecoverySweepKeepsRestoredAddress(t *testing.T) {
+	withFastBackoff(t)
+	fc := &fakeClient{pingErr: errors.New("client not connected")}
+	p := withRecoverableClient(t, fc)
+	persistSDKSessionID("adapter-race", "A")
+
+	// Stale runtime binding by construction (epoch 0), a session attached to
+	// the stale persisted id, and the checkpointed token "T" to restore.
+	s := newWatchdogSession(t, p, "adapter-race", &fakeSession{sessionID: "A"})
+
+	// Park every ResumeSessionWithOptions until the choreography releases it.
+	// Gates are closed at most once (the body and the cleanup race otherwise).
+	gateT := make(chan struct{})
+	gateA := make(chan struct{})
+	closeOnceT, closeOnceA := &sync.Once{}, &sync.Once{}
+	release := func(once *sync.Once, gate chan struct{}) {
+		once.Do(func() { close(gate) })
+	}
+	fc.mu.Lock()
+	fc.holdResume = map[string]chan struct{}{"T": gateT, "A": gateA}
+	fc.mu.Unlock()
+	t.Cleanup(func() {
+		release(closeOnceT, gateT)
+		release(closeOnceA, gateA)
+	})
+
+	restoreErr := make(chan error, 1)
+	restoreFinished := make(chan struct{})
+	go func() {
+		_, err := p.Restore(context.Background(), &v2.RestoreRequest{
+			SessionId:     "adapter-race",
+			SchemaVersion: copilotStateSchemaVersion,
+			State:         []byte("T"),
+		})
+		restoreErr <- err
+		close(restoreFinished)
+	}()
+	sweepDone := make(chan struct{}, 1)
+	go func() {
+		// trigger=nil sweeps every registered session including ours.
+		p.recoverTransport(context.Background(), nil, false)
+		close(sweepDone)
+	}()
+
+	// Stage 1: let Restore reach (and finish) its reattach to "T" first. When
+	// the sweep won the reopenMu ordering post-fix, Restore never reaches its
+	// resume before the sweep's is parked — the timeout tolerates that order
+	// and closing the gate early is a no-op (nothing is parked on it yet;
+	// Restore's later resume then runs against an already-closed gate).
+	if !waitResumeArrived(fc, "T", 2*time.Second) {
+		slog.Info("restore resume of the checkpointed token not parked before timeout (sweep won the lock ordering)")
+	}
+	release(closeOnceT, gateT)
+	waitDoneOrDeadline(t, restoreFinished, 2*time.Second, "Restore")
+
+	// Stage 2: unstick the sweep's parked resume. Post-fix the sweep either
+	// already saw the epoch Restore claimed (no-op) or completes its reopen
+	// of the just-persisted address; pre-fix it lands swapSession("A") over
+	// the restored conversation here.
+	release(closeOnceA, gateA)
+	joinWithDeadline(t, sweepDone, 5*time.Second, "recovery sweep")
+
+	if err := <-restoreErr; err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if sess := s.currentSession(); sess == nil || sess.SessionID() != "T" {
+		t.Fatalf("adapter attached to %v after concurrent restore+sweep, want the checkpointed address %q restored",
+			sess, "T")
+	}
+	if got := loadPersistedSDKSessionID("adapter-race"); got != "T" {
+		t.Fatalf("persisted sdk session id = %q, want %q", got, "T")
+	}
+	if s.boundClientEpoch != p.currentClientEpoch() {
+		t.Fatalf("boundClientEpoch = %d after restore, want the current runtime epoch %d (a following sweep must be a no-op)",
+			s.boundClientEpoch, p.currentClientEpoch())
+	}
+
+	// The restored session reclaims its runtime binding: a follow-up sweep
+	// must not reopen it again (no new resumes, restarts or creations; ping
+	// probes are the liveness check itself and are expected to tick).
+	before, after := fc.activityCounts(func() {
+		p.recoverTransport(context.Background(), nil, false)
+	})
+	if after != before {
+		t.Fatalf("follow-up sweep churned the restored session: %v -> %v", before, after)
+	}
+}
+
+// waitResumeArrived polls the fake's recorded resume entries until id shows
+// up or the deadline passes. Returns false when the caller never parked.
+func waitResumeArrived(fc *fakeClient, id string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		fc.mu.Lock()
+		seen := slices.Contains(fc.resumeIDs, id)
+		fc.mu.Unlock()
+		if seen {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
+}
+
+// waitDoneOrDeadline waits for a resumer to finish or returns when the
+// deadline passes (the sweep-first lock ordering keeps Restore parked on
+// reopenMu until sweepDone's own join, below, unblocks it). Waiting on a
+// close-only channel keeps the restore error buffer intact for the final
+// assertions.
+func waitDoneOrDeadline(t *testing.T, done chan struct{}, timeout time.Duration, what string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Info("resumer not finished before deadline; releasing next stage", "resumer", what)
+	}
+}
+
+// joinWithDeadline waits for the sweep goroutine to finish; a goroutine still
+// parked past every gate release means the choreography wedged and the test
+// must fail rather than leak the goroutine into later assertions.
+func joinWithDeadline(t *testing.T, done chan struct{}, timeout time.Duration, what string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatalf("%s goroutine did not finish after both resume gates were released", what)
+	}
+}
+
+// activityCounts snapshots the fake's restart/resume activity around fn.
+// Ping probes are omitted — they are the follow-up sweep's liveness check
+// itself and are expected to tick; what must not change is any actual churn
+// (resumes, creations or CLI restarts).
+func (c *fakeClient) activityCounts(fn func()) (before, after string) {
+	c.mu.Lock()
+	before = fmt.Sprintf("resumes=%v creates=%d stops=%d starts=%d",
+		c.resumeIDs, c.createCount, c.stopCount, c.startCount)
+	c.mu.Unlock()
+	fn()
+	c.mu.Lock()
+	after = fmt.Sprintf("resumes=%v creates=%d stops=%d starts=%d",
+		c.resumeIDs, c.createCount, c.stopCount, c.startCount)
+	c.mu.Unlock()
+	return before, after
 }
