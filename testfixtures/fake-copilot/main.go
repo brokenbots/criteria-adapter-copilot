@@ -7,12 +7,22 @@
 //   - connect                                             => {ok:true, version, protocolVersion:3}
 //   - ping                                                => {timestamp, protocolVersion}
 //   - status.get                                         => {version, protocolVersion}
-//   - session.create                                     => {sessionId}
+//   - session.create                                     => {sessionId}; tools are recorded as the served set
+//   - session.resume                                     => {sessionId}; tools likewise recorded
 //   - session.send                                       => {messageId}; async events follow
 //   - session.destroy                                    => {}
 //   - session.permissions.handlePendingPermissionRequest => {}
 //   - session.tools.handlePendingToolCall                => {}
+//   - session.tools.getCurrentMetadata                   => {tools:[{name,description}...]}; null when no set captured
+//   - session.tools.initializeAndValidate                => {}
 //   - (all other methods)                                => {} (empty success)
+//
+// The served tool set is the custom tools from session.create/session.resume
+// merged with a fixed built-in catalog, mirroring the real CLI (custom
+// tools are always served; built-ins appear once the tool set initializes).
+// FAKE_COPILOT_OMIT_TOOLS (comma-separated names) drops tools from the
+// SERVED list — scripting a CLI that binds a tool but fails to present it
+// (KB-71's hypothesis-1 shape), without touching the captured set.
 //
 // session.send behaviour depends on FAKE_COPILOT_SCENARIO:
 //
@@ -30,6 +40,12 @@
 //	Turns 1-2: session.idle with no tool call
 //	Turn 3: submit_outcome("success") + session.idle
 //
+// "review-answers-prose" (KB-71):
+//
+//	Every turn: assistant.message_delta prose (per-turn message id) +
+//	session.idle — the reviewer answers with text and NEVER calls
+//	submit_outcome, exhausting the finalize loop.
+//
 // "invalid-outcome":
 //
 //	Turn 1: submit_outcome("not-a-real-outcome") + session.idle
@@ -42,6 +58,10 @@
 // "missing":
 //
 //	All turns: session.idle with no tool call (exhausts 3 attempts => failure)
+//
+// FAKE_COPILOT_OUTCOME overrides the outcome value submitted on success
+// paths (default "success") — used by review-step conformance tests, whose
+// steps declare outcomes like "approved".
 //
 // Permission prompt (contains "fetch"): emits permission.requested (auto-approved),
 // waits for handlePendingPermissionRequest, then emits session.idle with no tool call.
@@ -103,6 +123,72 @@ var (
 	stdout     io.Writer = os.Stdout
 )
 
+// fakeToolMeta is one name+description entry in the served tool set.
+type fakeToolMeta struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// servedToolSetMu guards servedToolSet (written by the serial request loop,
+// read by the metadata responder).
+var (
+	servedToolSetMu sync.Mutex
+	servedToolSet   []fakeToolMeta // nil = a tool set was never captured
+)
+
+// builtInToolCatalog is the fixed built-in tool catalog the fixture merges
+// into the served set, mirroring the real CLI: built-in tools are served
+// from tool-set initialization onward, alongside the custom tools the SDK
+// config binds.
+var builtInToolCatalog = []fakeToolMeta{
+	{Name: "bash", Description: "Run a shell command"},
+	{Name: "edit", Description: "Edit a file"},
+	{Name: "read", Description: "Read a file"},
+}
+
+// recordServedTools replaces the captured tool set from a session.create or
+// session.resume tools[] param.
+func recordServedTools(tools []fakeToolMeta) {
+	servedToolSetMu.Lock()
+	defer servedToolSetMu.Unlock()
+	servedToolSet = tools
+}
+
+// currentToolMetadata returns the served metadata list: the captured custom
+// tools merged with the built-in catalog, minus the FAKE_COPILOT_OMIT_TOOLS
+// names. nil when a tool set was never captured (= the real CLI's
+// "tools not initialized yet" null).
+func currentToolMetadata() []fakeToolMeta {
+	servedToolSetMu.Lock()
+	captured := servedToolSet
+	servedToolSetMu.Unlock()
+	if captured == nil {
+		return nil
+	}
+	omit := map[string]bool{}
+	for _, name := range strings.Split(os.Getenv("FAKE_COPILOT_OMIT_TOOLS"), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			omit[name] = true
+		}
+	}
+	out := make([]fakeToolMeta, 0, len(captured)+len(builtInToolCatalog))
+	for _, t := range append(append([]fakeToolMeta(nil), captured...), builtInToolCatalog...) {
+		if !omit[t.Name] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// submitOutcomeOverride returns the outcome to submit on success paths:
+// FAKE_COPILOT_OUTCOME when set (non-empty), else the given default.
+func submitOutcomeOverride(def string) string {
+	if v := strings.TrimSpace(os.Getenv("FAKE_COPILOT_OUTCOME")); v != "" {
+		return v
+	}
+	return def
+}
+
 func main() {
 	r := bufio.NewReader(os.Stdin)
 	for {
@@ -146,10 +232,32 @@ func handleRequest(msg *rpcMsg) {
 
 	case "session.create":
 		var p struct {
-			SessionID string `json:"sessionId"`
+			SessionID string         `json:"sessionId"`
+			Tools     []fakeToolMeta `json:"tools"`
 		}
 		_ = json.Unmarshal(msg.Params, &p)
+		if p.Tools != nil {
+			recordServedTools(p.Tools)
+		}
 		respond(msg.ID, map[string]any{"sessionId": p.SessionID})
+
+	case "session.resume":
+		var p struct {
+			SessionID string         `json:"sessionId"`
+			Tools     []fakeToolMeta `json:"tools"`
+		}
+		_ = json.Unmarshal(msg.Params, &p)
+		if p.Tools != nil {
+			recordServedTools(p.Tools)
+		}
+		respond(msg.ID, map[string]any{"sessionId": p.SessionID})
+
+	case "session.tools.getCurrentMetadata":
+		tools := currentToolMetadata()
+		respond(msg.ID, map[string]any{"tools": tools})
+
+	case "session.tools.initializeAndValidate":
+		respond(msg.ID, map[string]any{})
 
 	case "session.send":
 		handleSessionSend(msg)
@@ -254,27 +362,38 @@ func handleSessionSend(msg *rpcMsg) {
 	go func() {
 		switch scenario {
 		case "", "success":
-			sendToolCallAndIdle(p.SessionID, "success", "step completed")
+			sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "step completed")
 
 		case "success-after-reprompt-1":
 			if turn == 1 {
 				sendEvent(p.SessionID, "session.idle", map[string]any{})
 			} else {
-				sendToolCallAndIdle(p.SessionID, "success", "step completed")
+				sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "step completed")
 			}
 
 		case "success-after-reprompt-2":
 			if turn <= 2 {
 				sendEvent(p.SessionID, "session.idle", map[string]any{})
 			} else {
-				sendToolCallAndIdle(p.SessionID, "success", "step completed")
+				sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "step completed")
 			}
+
+		case "review-answers-prose":
+			// KB-71: the review-leg refusal shape — the model answers every
+			// turn with prose (a fresh message id per turn, so the adapter's
+			// delta accumulation restarts per turn) and never calls
+			// submit_outcome.
+			sendEvent(p.SessionID, "assistant.message_delta", map[string]any{
+				"messageId":    fmt.Sprintf("fake-message-%d", turn),
+				"deltaContent": fmt.Sprintf("prose answer turn %d: still examining the diff, no outcome yet", turn),
+			})
+			sendEvent(p.SessionID, "session.idle", map[string]any{})
 
 		case "invalid-outcome":
 			if turn == 1 {
 				sendToolCallAndIdle(p.SessionID, "not-a-real-outcome", "")
 			} else {
-				sendToolCallAndIdle(p.SessionID, "success", "step completed")
+				sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "step completed")
 			}
 
 		case "duplicate-call":
@@ -293,7 +412,7 @@ func handleSessionSend(msg *rpcMsg) {
 
 		default:
 			// Unknown scenario: treat as success.
-			sendToolCallAndIdle(p.SessionID, "success", "step completed")
+			sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "step completed")
 		}
 	}()
 }
