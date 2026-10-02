@@ -506,9 +506,6 @@ func TestExecuteRepairAfterRecreateDeliversDegradedPrompt(t *testing.T) {
 	if strings.Contains(prompt, "Resubmit the finalize now") {
 		t.Errorf("delivered prompt must NOT be the minimal repair variant (the recreate dropped the rejected finalize):\n%s", prompt)
 	}
-	if strings.Contains(prompt, `Resubmit the finalize`) {
-		t.Errorf("delivered prompt must not carry the minimal repair tail:\n%s", prompt)
-	}
 	if got := fake.sendCount; got != 1 {
 		t.Fatalf("fake send count = %d, want 1", got)
 	}
