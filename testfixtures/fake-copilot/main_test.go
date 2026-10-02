@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -106,6 +108,143 @@ func TestPingResponseUsesRFC3339Timestamp(t *testing.T) {
 	}
 	if _, err := time.Parse(time.RFC3339Nano, resp.Result.Timestamp); err != nil {
 		t.Fatalf("ping response timestamp %q is not RFC3339Nano: %v", resp.Result.Timestamp, err)
+	}
+}
+
+// ── KB-71: served tool set + metadata probe wire surface ─────────────────────
+
+// resetServedToolSet restores the global served-tool state after a test.
+func resetServedToolSet(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		servedToolSetMu.Lock()
+		servedToolSet = nil
+		servedToolSetMu.Unlock()
+	})
+}
+
+// TestCurrentToolMetadataNeverCapturedIsNil verifies the "uninitialized"
+// shape: with no session.create/session.resume seen, the metadata responder
+// returns nil so the wire response is {"tools": null}.
+func TestCurrentToolMetadataNeverCapturedIsNil(t *testing.T) {
+	resetServedToolSet(t)
+	t.Setenv("FAKE_COPILOT_OMIT_TOOLS", "")
+	if got := currentToolMetadata(); got != nil {
+		t.Fatalf("currentToolMetadata() = %#v, want nil before any tool-set capture", got)
+	}
+	// Wire-level: the responder's {"tools": null} JSON keeps "tools" present
+	// with a null value — what the SDK's ToolsGetCurrentMetadataResult
+	// decodes into a nil slice.
+	var buf bytes.Buffer
+	stdout = &buf
+	t.Cleanup(func() { stdout = os.Stdout })
+	handleRequest(&rpcMsg{
+		ID:     json.RawMessage(`7`),
+		Method: "session.tools.getCurrentMetadata",
+	})
+	frame, err := readFrame(bufio.NewReader(&buf))
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if !strings.Contains(string(frame), `"tools":null`) {
+		t.Fatalf("metadata response = %s, want \"tools\": null", frame)
+	}
+}
+
+func TestCurrentToolMetadataMergesBuiltins(t *testing.T) {
+	resetServedToolSet(t)
+	t.Setenv("FAKE_COPILOT_OMIT_TOOLS", "")
+	recordServedTools([]fakeToolMeta{
+		{Name: "submit_outcome", Description: "Submit the verdict"},
+		{Name: "adapter_tool", Description: "Call another adapter"},
+	})
+	got := currentToolMetadata()
+	names := map[string]bool{}
+	for _, tm := range got {
+		names[tm.Name] = true
+	}
+	for _, want := range []string{"submit_outcome", "adapter_tool", "bash", "edit", "read"} {
+		if !names[want] {
+			t.Errorf("served tools %v missing %q", got, want)
+		}
+	}
+}
+
+// TestCurrentToolMetadataOmitDropsServedOnly verifies FAKE_COPILOT_OMIT_TOOLS
+// removes names from the SERVED list at response time while the captured set
+// stays complete — so omitting submit_outcome leaves a NON-empty list (the
+// verified-missing shape the adapter must fail loudly on).
+func TestCurrentToolMetadataOmitDropsServedOnly(t *testing.T) {
+	resetServedToolSet(t)
+	t.Setenv("FAKE_COPILOT_OMIT_TOOLS", "submit_outcome")
+	recordServedTools([]fakeToolMeta{
+		{Name: "submit_outcome", Description: "Submit the verdict"},
+		{Name: "adapter_tool", Description: "Call another adapter"},
+	})
+	got := currentToolMetadata()
+	if len(got) == 0 {
+		t.Fatal("served list is empty; the omit filter must drop only the named tool, leaving the rest + built-ins")
+	}
+	for _, tm := range got {
+		if tm.Name == "submit_outcome" {
+			t.Errorf("served list still contains omit-marked tool submit_outcome: %v", got)
+		}
+	}
+	// All omitted: an explicitly emptied list stays [] (not null) — a verified
+	// empty serve is distinct from "never captured".
+	t.Setenv("FAKE_COPILOT_OMIT_TOOLS", "submit_outcome,adapter_tool,bash,edit,read")
+	got = currentToolMetadata()
+	if got == nil {
+		t.Fatal("all-omitted served list must be [] (verified empty), not nil (never captured)")
+	}
+	if len(got) != 0 {
+		t.Fatalf("all-omitted served list = %v, want empty", got)
+	}
+}
+
+// TestSessionCreateCapturesServedToolSet verifies session.create records the
+// tools[] param as the served set, and session.resume re-captures it.
+func TestSessionCreateCapturesServedToolSet(t *testing.T) {
+	resetServedToolSet(t)
+	t.Setenv("FAKE_COPILOT_OMIT_TOOLS", "")
+	var buf bytes.Buffer
+	stdout = &buf
+	t.Cleanup(func() { stdout = os.Stdout })
+	handleRequest(&rpcMsg{
+		ID:     json.RawMessage(`11`),
+		Method: "session.create",
+		Params: json.RawMessage(`{"sessionId":"sdk-s1","tools":[{"name":"submit_outcome","description":"Submit"},{"name":"adapter_tool","description":"Call"}]}`),
+	})
+	got := currentToolMetadata()
+	names := []string{}
+	for _, tm := range got {
+		names = append(names, tm.Name)
+	}
+	// Merged view: 2 captured custom tools + 3 built-ins.
+	if len(got) != 5 || !slices.Equal(names, []string{"submit_outcome", "adapter_tool", "bash", "edit", "read"}) {
+		t.Fatalf("served set after session.create = %v, want the 2 captured customs merged with 3 built-ins", got)
+	}
+	handleRequest(&rpcMsg{
+		ID:     json.RawMessage(`12`),
+		Method: "session.resume",
+		Params: json.RawMessage(`{"sessionId":"sdk-s1","tools":[{"name":"submit_outcome","description":"Submit"}]}`),
+	})
+	got = currentToolMetadata()
+	if len(got) != 4 {
+		t.Fatalf("after resume, served set = %v, want 1 custom entry (last capture wins) merged with 3 built-ins", got)
+	}
+}
+
+// TestSubmitOutcomeOverride verifies FAKE_COPILOT_OUTCOME overrides the
+// scenario's default submitted outcome, and the default wins when unset.
+func TestSubmitOutcomeOverride(t *testing.T) {
+	t.Setenv("FAKE_COPILOT_OUTCOME", "")
+	if got := submitOutcomeOverride("approved"); got != "approved" {
+		t.Fatalf("default = %q, want approved", got)
+	}
+	t.Setenv("FAKE_COPILOT_OUTCOME", "changes_requested")
+	if got := submitOutcomeOverride("approved"); got != "changes_requested" {
+		t.Fatalf("override = %q, want changes_requested", got)
 	}
 }
 
