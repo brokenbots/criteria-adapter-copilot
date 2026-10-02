@@ -491,6 +491,87 @@ func TestExecuteExhaustionCarriesDeltaEvidence(t *testing.T) {
 	if msg, _ := dbg["last_agent_message"].(string); msg != deltaText {
 		t.Errorf("turn.finalize_exhausted last_agent_message = %q, want %q", msg, deltaText)
 	}
+	// KB-71: turns 2 and 3 here are message-less reprompted turns, so the
+	// per-reprompt evidence must carry one empty entry per reprompt —
+	// positional proof of "reprompted turn sent no message" as opposed to an
+	// answered-prose refusal.
+	replies, _ := dbg["reprompt_replies"].([]any)
+	if len(replies) != 2 {
+		t.Fatalf("turn.finalize_exhausted reprompt_replies = %#v, want 2 entries (one per reprompt)", dbg["reprompt_replies"])
+	}
+	for i, r := range replies {
+		if s, _ := r.(string); s != "" {
+			t.Errorf("turn.finalize_exhausted reprompt_replies[%d] = %q, want empty (turn carried no message)", i, s)
+		}
+	}
+}
+
+// TestExecuteExhaustionCarriesPerRepromptReplyText (KB-71 regression): when
+// the reviewer answers the corrective reprompts with prose and still never
+// calls submit_outcome (the review-leg failure shape: attempts=0,
+// idle_signals=3, three finished turns), each reprompted turn's reply text
+// must be recorded in turn.finalize_exhausted so operators can tell
+// "answered prose" from "empty reprompt turn" without re-running the leg.
+func TestExecuteExhaustionCarriesPerRepromptReplyText(t *testing.T) {
+	withFastWatchdog(t, 20*time.Millisecond, time.Minute)
+	fc := &fakeClient{pingErr: nil}
+	p := withRecoverableClient(t, fc)
+
+	const initialReply = "I probed the diff and the policy bands."
+	const reprompt1Reply = "I looked again; the evidence is complete."
+	const reprompt2Reply = "I decline to submit without re-checking the upstream diff."
+	fake := &fakeSession{sessionID: "sdk-reprompt-refusal"}
+	fake.sendSequence = [][]copilot.SessionEvent{
+		{ // Turn 1: reply to the initial prompt, then idle with no finalize.
+			{Data: &copilot.AssistantMessageDeltaData{MessageID: "m1", DeltaContent: initialReply}},
+			{Data: &copilot.SessionIdleData{}},
+		},
+		{ // Turn 2: reply to corrective reprompt 1 — prose, still no finalize.
+			{Data: &copilot.AssistantMessageDeltaData{MessageID: "m2", DeltaContent: reprompt1Reply}},
+			{Data: &copilot.SessionIdleData{}},
+		},
+		{ // Turn 3: reply to corrective reprompt 2 — prose, still no finalize.
+			{Data: &copilot.AssistantMessageDeltaData{MessageID: "m3", DeltaContent: reprompt2Reply}},
+			{Data: &copilot.SessionIdleData{}},
+		},
+	}
+	newWatchdogSession(t, p, "adapter-reprompt-refusal", fake)
+
+	sender := &recordingSender{}
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:       "adapter-reprompt-refusal",
+		Input:           map[string]string{"prompt": "review the change"},
+		AllowedOutcomes: []string{"approved", "changes_requested", "failure", "need_help"},
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	assertOutcome(t, sender, "failure")
+	dbg := findAdapterEvent(t, sender, "turn.finalize_exhausted")
+	if dbg == nil {
+		t.Fatal("expected a turn.finalize_exhausted diagnostic event")
+	}
+	replies, _ := dbg["reprompt_replies"].([]any)
+	if len(replies) != 2 {
+		t.Fatalf("turn.finalize_exhausted reprompt_replies = %#v, want 2 entries (one per reprompt)", dbg["reprompt_replies"])
+	}
+	if s, _ := replies[0].(string); s != reprompt1Reply {
+		t.Errorf("turn.finalize_exhausted reprompt_replies[0] = %q, want the reply to reprompt 1 %q", s, reprompt1Reply)
+	}
+	if s, _ := replies[1].(string); s != reprompt2Reply {
+		t.Errorf("turn.finalize_exhausted reprompt_replies[1] = %q, want the reply to reprompt 2 %q", s, reprompt2Reply)
+	}
+	// The final turn's reply doubles as last_agent_message; attempts and idle
+	// accounting match the observed failure runs.
+	if msg, _ := dbg["last_agent_message"].(string); msg != reprompt2Reply {
+		t.Errorf("turn.finalize_exhausted last_agent_message = %q, want the final turn's reply %q", msg, reprompt2Reply)
+	}
+	if attempts, _ := dbg["attempts"].(float64); attempts != 0 {
+		t.Errorf("turn.finalize_exhausted attempts = %v, want 0 (no submit_outcome call landed)", attempts)
+	}
+	if idles, _ := dbg["idle_signals"].(float64); idles != 3 {
+		t.Errorf("turn.finalize_exhausted idle_signals = %v, want 3 (1 per finalize attempt)", idles)
+	}
 }
 
 // TestExecuteRepromptAfterIdleConvergesOnFinalize (KB-69 regression): a
