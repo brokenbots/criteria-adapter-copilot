@@ -98,11 +98,9 @@ func mustOpenConformanceSession(t *testing.T, p *copilotAdapter, adapterSessionI
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	resp, err := p.OpenSession(ctx, &v2.OpenSessionRequest{SessionId: adapterSessionID})
-	if err != nil {
+	if _, err := p.OpenSession(ctx, &v2.OpenSessionRequest{SessionId: adapterSessionID}); err != nil {
 		t.Fatalf("OpenSession(%s) returned error: %v", adapterSessionID, err)
 	}
-	_ = resp
 }
 
 // conformanceSessionTools reads the served tool names directly off the live
