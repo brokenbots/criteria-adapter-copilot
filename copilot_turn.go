@@ -163,6 +163,15 @@ type turnState struct {
 	// awaitOutcome goroutine, read by failExhausted on that same goroutine.
 	repromptReplies     []string
 	lastCapturedReplyID string
+
+	// execPrompt holds the composition inputs for this Execute's prompt: the
+	// step prompt, allowed outcomes, contracts, and an optional rejection.
+	// The prompt is composed at send time — not when Execute populates
+	// session state — because a repair Execute must observe the session
+	// generation AFTER sendWithRetry's lazy reopen has had its chance to
+	// re-create the SDK session (KB-47): a fresh create bumps createdEpoch
+	// and degrades the repair to the full re-execute prompt.
+	execPrompt executePrompt
 }
 
 func newTurnState(maxTurns int) *turnState {
@@ -170,6 +179,25 @@ func newTurnState(maxTurns int) *turnState {
 		turnDone: make(chan struct{}, 1),
 		errCh:    make(chan error, 1),
 		maxTurns: maxTurns,
+	}
+}
+
+// executePrompt carries the composition inputs for an Execute's prompt. The
+// prompt is composed lazily — at each send attempt — so a repair Execute can
+// observe the session generation after any lazy reopen (KB-47).
+type executePrompt struct {
+	stepPrompt string
+	allowed    []string
+	contracts  []*v2.OutcomeContract
+	rejection  *v2.ExecutionRejection
+}
+
+// messageOptions composes the prompt for the current session state. Called
+// outside s.mu: composeExecutePrompt reads session state (repair eligibility)
+// under s.mu itself.
+func (ep executePrompt) messageOptions(s *sessionState) *copilot.MessageOptions {
+	return &copilot.MessageOptions{
+		Prompt: composeExecutePrompt(ep.stepPrompt, ep.allowed, ep.contracts, ep.rejection, s, s.heldSecrets),
 	}
 }
 
@@ -763,12 +791,15 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	if s.inRepairMode {
 		s.inRepairAttempt = rejection.GetAttempt()
 	}
-	inSession := s.repairInSession()
 	s.mu.Unlock()
 
-	prompt = composeExecutePrompt(prompt, allowed, contracts, rejection, inSession, s.heldSecrets)
-
 	state := newTurnState(maxTurns)
+	state.execPrompt = executePrompt{
+		stepPrompt: prompt,
+		allowed:    allowed,
+		contracts:  contracts,
+		rejection:  rejection,
+	}
 	// Route the handler through the session's event fanout (CRI-272): if the
 	// CLI child dies mid-turn and the session is re-opened, the swapped-in SDK
 	// session re-registers the same fanout and this turn keeps its events.
@@ -794,8 +825,13 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	// The whole provider call (send + await outcome) is watchdog-supervised
 	// and retried by executeTurn: a hung send or a stream that opens and goes
 	// silent is failed and re-sent per the CRI-272 backoff path instead of
-	// wedging the turn (CRI-274).
-	return state.executeTurn(ctx, s, &copilot.MessageOptions{Prompt: prompt}, sink)
+	// wedging the turn (CRI-274). The prompt is composed at send time —
+	// inside executeTurn, per attempt (KB-47) — so a repair Execute observes
+	// the session generation after sendWithRetry's lazy reopen: a fresh SDK
+	// create bumps createdEpoch and degrades the repair to the full
+	// re-execute prompt instead of a minimal prompt into an empty
+	// conversation.
+	return state.executeTurn(ctx, s, sink)
 }
 
 // repairInSession reports whether a rejected finalize can be repaired with a
@@ -808,7 +844,12 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 // SDK session create after a CLI-child death (createdEpoch bumped by
 // reopenSession) starts an empty conversation and degrades the repair to a
 // full re-execute.
+//
+// Takes s.mu. Call it OUTSIDE s.mu — from prompt composition, which runs at
+// send time, never from code already holding the lock (KB-47).
 func (s *sessionState) repairInSession() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.finalizeSessionEpoch >= s.createdEpoch && s.finalizeSessionEpoch > 0 {
 		return true
 	}
@@ -821,7 +862,12 @@ func (s *sessionState) repairInSession() bool {
 // (in-session) or the full step prompt with the rejection note appended
 // (degraded re-execute). The no-contract, no-rejection result is byte-for-byte
 // today's preamble-wrapped step prompt.
-func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.OutcomeContract, rejection *v2.ExecutionRejection, inSession bool, secrets []string) string {
+//
+// Takes s *sessionState instead of a pre-decided inSession flag (KB-47): the
+// in-session decision is made HERE, at composition time (under s.mu), so a
+// lazy reopen that re-created the SDK session before the send is reflected.
+// s must not be nil; bare (&sessionState{}) works for stateless tests.
+func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.OutcomeContract, rejection *v2.ExecutionRejection, s *sessionState, secrets []string) string {
 	// Prepend the allowed-outcomes preamble so the model knows what to call.
 	if len(allowed) > 0 {
 		outcomeList := strings.Join(allowed, ", ") // already sorted ascending by W14 loader
@@ -840,6 +886,10 @@ func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.O
 		// host-provided diagnostic quoting model-generated content: truncate
 		// and secret-redact before echoing it back.
 		issues := truncateText(redactSecrets(rejection.GetIssues(), secrets), maxContractIssueLen)
+		// In-session decision at composition time (KB-47): a reopen that
+		// created a fresh SDK session before this send bumped createdEpoch,
+		// degrading the repair to the full re-execute.
+		inSession := s.repairInSession()
 		if inSession {
 			// Minimal repair prompt (KB-47): the live conversation already
 			// holds the full step context and the rejected finalize; resending

@@ -144,7 +144,13 @@ func isRetryableSendError(err error) bool {
 // SDK session — resume via the persisted ID, fallback CreateSession — before
 // the next attempt. Every sleep is capped by the remaining context deadline so
 // a step-level timeout still applies; exhaustion surfaces the last error.
-func (s *sessionState) sendWithRetry(ctx context.Context, opts *copilot.MessageOptions) (string, error) {
+//
+// The optional recompose hook re-composes the message options after a
+// recoverTransport — call it when the prompt depends on session state a
+// reopen may have changed (KB-47): a repair Execute must observe a fresh SDK
+// create's createdEpoch bump before its next send, so the repaired turn gets
+// the correct (degraded) prompt instead of one composed for a dead session.
+func (s *sessionState) sendWithRetry(ctx context.Context, opts *copilot.MessageOptions, recompose ...func() *copilot.MessageOptions) (string, error) {
 	var lastErr error
 	for attempt := 0; attempt < retryMaxAttempts; attempt++ {
 		// Re-read the session every attempt: a CLI-child restart mid-retry
@@ -179,6 +185,9 @@ func (s *sessionState) sendWithRetry(ctx context.Context, opts *copilot.MessageO
 			// liveness probe, so the gated probe would never restart it
 			// (CRI-274).
 			s.owner.recoverTransport(ctx, s, isProviderStallError(err))
+		}
+		if len(recompose) > 0 && recompose[0] != nil {
+			opts = recompose[0]()
 		}
 		sleep := backoffDelay(attempt)
 		if deadline, ok := ctx.Deadline(); ok {

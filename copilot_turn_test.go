@@ -10,7 +10,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -406,6 +408,115 @@ func TestExecuteContractFinalizeBeatsSessionLoss(t *testing.T) {
 	}
 }
 
+// reopenSimSession simulates the KB-47 recreate-during-repair ordering: the
+// first Send of a repair Execute dies with a transport error (the way a dead
+// CLI child is detected inside sendWithRetry), which drives recoverTransport →
+// reopenSession → a fresh SDK session create (resumed=false → createdEpoch
+// bumped). The wrapper stands in for the reopen's epoch bump so the test
+// observes composition against the POST-reopen generation.
+type reopenSimSession struct {
+	*fakeSession
+	state *sessionState
+	mu    sync.Mutex
+	calls int
+}
+
+func (w *reopenSimSession) Send(ctx context.Context, opts *copilot.MessageOptions) (string, error) {
+	w.mu.Lock()
+	call := w.calls
+	w.calls++
+	w.mu.Unlock()
+	if call == 0 {
+		// Transport death before the prompt reached a live conversation; the
+		// reopen's fresh create bumps the creation epoch (KB-47).
+		w.state.mu.Lock()
+		w.state.createdEpoch++
+		w.state.mu.Unlock()
+		return "", errors.New("connection closed")
+	}
+	return w.fakeSession.Send(ctx, opts)
+}
+
+// TestExecuteRepairAfterRecreateDeliversDegradedPrompt: a repair Execute whose
+// first send dies with a transport error gets its SDK session re-created
+// before the retry. The delivered (retry) prompt must be the DEGRADED
+// re-execute variant — full step prompt plus the rejection note — composed
+// against the bumped epoch, not the minimal repair variant that assumes the
+// rejected finalize is still in the conversation (KB-47 defect #3: the
+// in-session decision must be made after the lazy reopen, not when Execute
+// populates session state).
+func TestExecuteRepairAfterRecreateDeliversDegradedPrompt(t *testing.T) {
+	withFastWatchdog(t, 20*time.Millisecond, time.Minute)
+	sleeps := withRetryRecorder(t)
+	fc := &fakeClient{pingErr: nil}
+	p := withRecoverableClient(t, fc)
+
+	// Epochs (1,1): Execute #1 finalized in the live SDK session, so a repair
+	// WOULD be in-session — unless the session is re-created first.
+	fake := &fakeSession{sessionID: "sdk-reopen-repair"}
+	wrapped := &reopenSimSession{fakeSession: fake}
+	s := newWatchdogSession(t, p, "adapter-reopen-repair", wrapped)
+	wrapped.state = s
+	s.mu.Lock()
+	s.createdEpoch = 1
+	s.finalizeSessionEpoch = 1
+	s.mu.Unlock()
+
+	pHandle := p
+	fake.onSend = func(_ int, _ copilot.MessageOptions) {
+		if _, err := pHandle.handleSubmitOutcome("adapter-reopen-repair", SubmitOutcomeArgs{
+			Outcome: "approved",
+			Payload: json.RawMessage(`{"verdict":"approved"}`),
+			Comment: "repaired after recreate",
+		}); err != nil {
+			t.Errorf("handleSubmitOutcome: %v", err)
+		}
+	}
+	fake.emitOnSend = []copilot.SessionEvent{
+		{Data: &copilot.AssistantMessageData{MessageID: "m1", Content: "done"}},
+		{Data: &copilot.SessionIdleData{}},
+	}
+
+	sender := &recordingSender{}
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:        "adapter-reopen-repair",
+		Input:            map[string]string{"prompt": "do the full step"},
+		AllowedOutcomes:  []string{"approved", "needs_review"},
+		OutcomeContracts: []*v2.OutcomeContract{contractTestContract(t, "approved", verbatimSchema, false, false)},
+		Rejection:        &v2.ExecutionRejection{Outcome: "approved", Attempt: 2, Issues: "payload missing verdict"},
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	assertOutcome(t, sender, "approved")
+	if got := len(fake.sentOpts); got != 1 {
+		t.Fatalf("delivered prompts = %d, want 1 (only the retry send reaches the live conversation)", got)
+	}
+	prompt := fake.sentOpts[0].Prompt
+	for _, want := range []string{
+		"do the full step",
+		`(outcome "approved", attempt 2)`,
+		"payload missing verdict",
+		"Address these issues in your finalization",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("delivered prompt missing degraded re-execute content %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "Resubmit the finalize now") {
+		t.Errorf("delivered prompt must NOT be the minimal repair variant (the recreate dropped the rejected finalize):\n%s", prompt)
+	}
+	if strings.Contains(prompt, `Resubmit the finalize`) {
+		t.Errorf("delivered prompt must not carry the minimal repair tail:\n%s", prompt)
+	}
+	if got := fake.sendCount; got != 1 {
+		t.Fatalf("fake send count = %d, want 1", got)
+	}
+	if got := *sleeps; len(got) != 1 || got[0] != time.Second {
+		t.Fatalf("backoff sleeps = %v, want [1s] (one transport retry)", got)
+	}
+}
+
 // TestExecuteExhaustionPreservesLastAgentMessage: the failure result reason
 // and the structured outcome.failure event must carry the last agent message
 // when the finalize loop exhausts (KB-42 acceptance: evidence preserved on
@@ -745,10 +856,13 @@ func TestEvidenceSnippet(t *testing.T) {
 
 // composeExecutePrompt: four shapes — legacy (no contracts, no rejection),
 // contract conveyance appended, minimal in-session repair, degraded
-// re-execute with the rejection note.
+// re-execute with the rejection note. The in-session decision is a property
+// of the session state passed in (KB-47): epochs (1,1) mean the finalize
+// landed in the live conversation, (2,1) means a fresh SDK create predates
+// the finalize (degraded).
 func TestComposeExecutePromptShapes(t *testing.T) {
 	const stepPrompt = "review the worktree diff"
-	legacy := composeExecutePrompt(stepPrompt, []string{"approved", "failure"}, nil, nil, false, nil)
+	legacy := composeExecutePrompt(stepPrompt, []string{"approved", "failure"}, nil, nil, &sessionState{}, nil)
 	wantLegacy := "You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are: approved, failure. If you do not call the tool with a valid outcome, the step will fail.\n\nreview the worktree diff"
 	if legacy != wantLegacy {
 		t.Errorf("legacy shape drift:\n got %q\nwant %q", legacy, wantLegacy)
@@ -761,7 +875,7 @@ func TestComposeExecutePromptShapes(t *testing.T) {
 		{Name: "approved", SchemaJson: []byte(`{"type":"object"}`), RequireComment: true},
 		{Name: "stalled", Fallback: true},
 	}
-	withContract := composeExecutePrompt(stepPrompt, []string{"approved", "stalled"}, contracts, nil, false, nil)
+	withContract := composeExecutePrompt(stepPrompt, []string{"approved", "stalled"}, contracts, nil, &sessionState{}, nil)
 	for _, want := range []string{"Finalization contracts", `"approved"`, `"stalled"`, "require_comment", "fallback contract"} {
 		if !strings.Contains(withContract, want) {
 			t.Errorf("contract shape missing %q:\n%s", want, withContract)
@@ -769,7 +883,9 @@ func TestComposeExecutePromptShapes(t *testing.T) {
 	}
 
 	rejection := &v2.ExecutionRejection{Outcome: "approved", Issues: "the payload misses the verdict", Attempt: 2}
-	repair := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, true, nil)
+	liveSession := &sessionState{createdEpoch: 1, finalizeSessionEpoch: 1}
+	reopenedSession := &sessionState{createdEpoch: 2, finalizeSessionEpoch: 1}
+	repair := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, liveSession, nil)
 	for _, want := range []string{`Rejected outcome: "approved"`, "Issues reported by the workflow", "Resubmit the finalize now"} {
 		if !strings.Contains(repair, want) {
 			t.Errorf("in-session repair shape missing %q:\n%s", want, repair)
@@ -779,7 +895,7 @@ func TestComposeExecutePromptShapes(t *testing.T) {
 		t.Errorf("in-session repair shape must stay minimal, got the full step prompt:\n%s", repair)
 	}
 
-	degraded := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, false, nil)
+	degraded := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, reopenedSession, nil)
 	for _, want := range []string{stepPrompt, `(outcome "approved", attempt 2)`, "Its reported issues were", "Address these issues"} {
 		if !strings.Contains(degraded, want) {
 			t.Errorf("degraded shape missing %q:\n%s", want, degraded)
@@ -789,8 +905,8 @@ func TestComposeExecutePromptShapes(t *testing.T) {
 	// Issue text quotes model-generated content: it must not leak a held
 	// secret through either repair shape.
 	leaky := &v2.ExecutionRejection{Outcome: "approved", Issues: "verdict swordfish was not in the enum", Attempt: 1}
-	leakyRepair := composeExecutePrompt("step", []string{"approved"}, nil, leaky, true, []string{"swordfish"})
-	leakyDegraded := composeExecutePrompt("step", []string{"approved"}, nil, leaky, false, []string{"swordfish"})
+	leakyRepair := composeExecutePrompt("step", []string{"approved"}, nil, leaky, liveSession, []string{"swordfish"})
+	leakyDegraded := composeExecutePrompt("step", []string{"approved"}, nil, leaky, reopenedSession, []string{"swordfish"})
 	if strings.Contains(leakyRepair, "swordfish") || strings.Contains(leakyDegraded, "swordfish") {
 		t.Errorf("repair prompts leak held secrets:\n%s\n%s", leakyRepair, leakyDegraded)
 	}

@@ -458,11 +458,17 @@ func (ts *turnState) drainStaleSignals(s *sessionState) {
 // finalizing is not retried: the recorded outcome is returned directly, since
 // re-prompting would risk a duplicate-finalize failure on the resumed
 // conversation.
-func (ts *turnState) executeTurn(ctx context.Context, s *sessionState, opts *copilot.MessageOptions, sink adapterhost.ExecuteEventSender) error {
+func (ts *turnState) executeTurn(ctx context.Context, s *sessionState, sink adapterhost.ExecuteEventSender) error {
+	// The prompt is composed per attempt (KB-47): a repair Execute composes
+	// against the session generation live at send time, so a lazy reopen —
+	// which re-creates the SDK session and bumps createdEpoch — degrades the
+	// repair to the full re-execute prompt instead of sending a minimal
+	// repair prompt into a freshly created, empty conversation.
+	build := func() *copilot.MessageOptions { return ts.execPrompt.messageOptions(s) }
 	for attempt := 0; ; attempt++ {
 		ts.drainStaleSignals(s)
 
-		if _, err := s.sendWithRetry(ctx, opts); err != nil {
+		if _, err := s.sendWithRetry(ctx, build(), build); err != nil {
 			return fmt.Errorf("copilot: send prompt: %w", err)
 		}
 		err := ts.awaitOutcome(ctx, s, sink)
