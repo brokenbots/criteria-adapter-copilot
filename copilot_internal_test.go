@@ -70,6 +70,19 @@ type fakeSession struct {
 	sentOpts     []copilot.MessageOptions
 	onSend       func(callIndex int, opts copilot.MessageOptions)
 	sendSequence [][]copilot.SessionEvent
+
+	// KB-71: scripted served-tool metadata for the submit_outcome
+	// presentation probe. toolNames is returned by CurrentToolMetadata
+	// (nil scripts the CLI's "tools not initialized yet" empty metadata;
+	// an empty non-nil slice behaves the same) ; toolNamesErr scripts an
+	// RPC failure; toolNamesBlock, when non-nil, blocks until closed so a
+	// hung metadata RPC is scriptable (the probe deadline then decides).
+	// disconnectCount counts Disconnect calls, so tests can assert the
+	// probe's fail-loud path tears the unusable session down.
+	toolNames       []string
+	toolNamesErr    error
+	toolNamesBlock  chan struct{}
+	disconnectCount int
 }
 
 type setModelCall struct {
@@ -156,10 +169,30 @@ func (f *fakeSession) getSetModelCalls() []setModelCall {
 }
 
 func (f *fakeSession) Disconnect() error {
-	if f.disconnect != nil {
-		return f.disconnect()
+	f.mu.Lock()
+	f.disconnectCount++
+	hook := f.disconnect
+	f.mu.Unlock()
+	if hook != nil {
+		return hook()
 	}
 	return nil
+}
+
+// CurrentToolMetadata implements the toolMetadataSource capability with the
+// scripted toolNames/toolNamesErr/toolNamesBlock fields.
+func (f *fakeSession) CurrentToolMetadata(ctx context.Context) ([]string, error) {
+	f.mu.Lock()
+	names, err, block := f.toolNames, f.toolNamesErr, f.toolNamesBlock
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return names, err
 }
 
 func (f *fakeSession) SessionID() string {

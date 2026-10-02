@@ -86,6 +86,21 @@ type turnState struct {
 	errSignals   int
 	drainedIdles int
 	drainedErrs  int
+
+	// repromptReplies records the evidence snippet of each reprompted turn's
+	// own reply text (KB-71): repromptReplies[i] is the model's reply to
+	// corrective reprompt i+1, "" when that turn carried no assistant
+	// message. The initial prompt's reply is NOT here (it is
+	// last_agent_message). Captured per idle dispatch so an exhausted loop
+	// distinguishes "the model answered prose to every reprompt" (deliberate
+	// refusal; charter or convergence problem) from "the reprompted turn
+	// sent no message" (signal-level failure, KB-69). lastCapturedReplyID is
+	// the assistant-message id whose content the last capture drew from, so
+	// a turn without a fresh message cannot leak an earlier turn's text.
+	// Same goroutine discipline as the counters below: written from the
+	// awaitOutcome goroutine, read by failExhausted on that same goroutine.
+	repromptReplies     []string
+	lastCapturedReplyID string
 }
 
 func newTurnState(maxTurns int) *turnState {
@@ -392,6 +407,26 @@ func (ts *turnState) handleIdleTurn(ctx context.Context, s *sessionState, sink a
 	reason := s.finalizedReason
 	s.mu.Unlock()
 
+	// KB-71: from the second attempt on, the turn that just ended is the
+	// model's reply to a corrective reprompt. Capture the text produced by
+	// THIS turn only: a fresh assistant-message id marks a turn that carried
+	// a message (the reply text is the evidence), while a turn with no
+	// message leaves ts.finalContent stale from an earlier turn — that case
+	// records an empty entry instead, so per-reprompt positions stay
+	// one-per-reprompt and a future failure distinguishes "answered prose"
+	// from "empty reprompted turn". The finalContent/lastMessageID reads are
+	// synchronized the same way as in failExhausted: waitTurnSignal has
+	// received turnDone from the event-handler goroutine before this runs.
+	if ts.lastMessageID != ts.lastCapturedReplyID {
+		ts.lastCapturedReplyID = ts.lastMessageID
+		if attempt > 1 {
+			ts.repromptReplies = append(ts.repromptReplies, evidenceSnippet(ts.finalContent))
+		}
+	} else if attempt > 1 {
+		// This reprompted turn carried no message of its own.
+		ts.repromptReplies = append(ts.repromptReplies, "")
+	}
+
 	if outcome != "" {
 		return true, sink.Send(resultEvent(outcome, reason, s.heldSecrets...))
 	}
@@ -445,6 +480,14 @@ func (ts *turnState) reprompt(ctx context.Context, s *sessionState) error {
 // The failure result reason carries the same evidence: the engine records it
 // as the step failure reason, which is how a run that failed on a
 // missing-outcome turn keeps its last agent message visible (KB-42).
+//
+// Additionally, reprompt_replies carries the model's reply text for each
+// reprompted turn (KB-71): reprompt_replies[i] is the reply to corrective
+// reprompt i+1 (the initial-prompt reply is last_agent_message). A missing
+// finalize with answered prose in reprompt_replies points at the reviewer
+// charter / convergence failure (the model deliberately refuses), while
+// empty entries point at a signal-level failure like the KB-69 drained-idle
+// defect.
 func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEventSender) error {
 	s.mu.Lock()
 	attempts := s.finalizeAttempts
@@ -471,6 +514,11 @@ func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEven
 	for i, v := range allowedList {
 		allowedAny[i] = v
 	}
+	// repromptReplies is []string for the same structpb reason.
+	repromptAny := make([]any, len(ts.repromptReplies))
+	for i, v := range ts.repromptReplies {
+		repromptAny[i] = v
+	}
 	// ts.finalContent is written by the event-handler goroutine; every path
 	// into failExhausted has received turnDone from that goroutine (the
 	// channel send happens after the last assistant message was recorded),
@@ -492,6 +540,7 @@ func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEven
 		"leftover_err_signal":  ts.probeErrSignal(),
 		"finalize_kind":        kind,
 		"last_agent_message":   evidence,
+		"reprompt_replies":     repromptAny,
 	}))
 	_ = sink.Send(adapterEvent("outcome.failure", map[string]any{
 		"reason":             reason,

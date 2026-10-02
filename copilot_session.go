@@ -91,6 +91,26 @@ type sdkSession struct {
 	inner *copilot.Session
 }
 
+// CurrentToolMetadata reports the names of the tools the session currently
+// serves to the model, via the CLI's session.tools.getCurrentMetadata RPC.
+// An empty result is inconclusive, not proof of absence: the CLI returns
+// null (and here an empty slice) when the tool set has not been initialized
+// yet, and RPC failures are reported as such.
+func (s *sdkSession) CurrentToolMetadata(ctx context.Context) ([]string, error) {
+	res, err := s.inner.RPC.Tools.GetCurrentMetadata(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil || len(res.Tools) == 0 {
+		return []string{}, nil
+	}
+	names := make([]string, 0, len(res.Tools))
+	for _, t := range res.Tools {
+		names = append(names, t.Name)
+	}
+	return names, nil
+}
+
 func (s *sdkSession) On(handler copilot.SessionEventHandler) func() {
 	return s.inner.On(handler)
 }
@@ -520,25 +540,99 @@ func (p *copilotAdapter) OpenSession(ctx context.Context, req *v2.OpenSessionReq
 	return &v2.OpenSessionResponse{}, nil
 }
 
+// sessionProbeTimeout bounds the submit_outcome tool-presentation probe at
+// session open (KB-71): the RPC must never wedge the open when a CLI stops
+// answering, so the probe runs under its own deadline.
+var sessionProbeTimeout = 10 * time.Second
+
+// toolMetadataSource is an optional session capability to report the tool
+// names actually served to the model (KB-71). SDK sessions implement it via
+// the CLI's session.tools.getCurrentMetadata RPC; test fakes may or may not.
+type toolMetadataSource interface {
+	CurrentToolMetadata(ctx context.Context) ([]string, error)
+}
+
+// verifySubmitOutcomePresented asserts the structural precondition of the
+// finalize loop (KB-71): the session must actually PRESENT the
+// submit_outcome tool to the model. The adapter always registers it in the
+// CreateSession/ResumeSession config, but a CLI that drops custom tools on
+// session.resume — the KB-64 session-reuse shape: the reviewer inherits a
+// session whose served tool set differs from the review step's contract —
+// leaves the reviewer unable to finalize, and the corrective reprompt then
+// tells the model to call a tool it cannot see. A session verified missing
+// the tool fails the open loudly, with the served tool list in the error.
+//
+// Inconclusive outcomes (session without the capability, RPC error, empty
+// tool metadata for a not-yet-initialized tool set) only warn: they are CLI
+// API gaps, not proof that the tool is absent, and failing open on them
+// would break healthy opens across CLI versions.
+func verifySubmitOutcomePresented(ctx context.Context, sess copilotSession) error {
+	src, ok := sess.(toolMetadataSource)
+	if !ok {
+		slog.Warn("copilot: session cannot report served tools; submit_outcome presentation not verified",
+			"session", sess.SessionID())
+		return nil
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, sessionProbeTimeout)
+	defer cancel()
+	names, err := src.CurrentToolMetadata(probeCtx)
+	if err != nil {
+		slog.Warn("copilot: served-tool metadata probe failed; submit_outcome presentation not verified",
+			"session", sess.SessionID(), "err", err)
+		return nil
+	}
+	if len(names) == 0 {
+		slog.Warn("copilot: served-tool metadata empty (tools not initialized yet); submit_outcome presentation not verified",
+			"session", sess.SessionID())
+		return nil
+	}
+	for _, name := range names {
+		if name == submitOutcomeToolName {
+			return nil
+		}
+	}
+	return fmt.Errorf("copilot: CLI session does not present the %q tool to the model (served tools: %s); finalize cannot converge, failing the session open",
+		submitOutcomeToolName, strings.Join(names, ", "))
+}
+
 // openSDKSession resumes the persisted SDK session for adapterSessionID when
 // one exists (CRI-272: a resumed session restores the full conversation
 // history), falling back to CreateSession on first open, when no ID is
 // persisted, or when resume fails. A newly created session's ID is persisted
 // for later respawns. Returns the session and whether it was resumed.
+// A resumed session whose served tool set is missing submit_outcome is not
+// retried: the open falls through to a fresh create, which re-binds the tools
+// (KB-64 session-reuse precedent). A fresh create that still fails the probe
+// fails the open loudly.
 func (p *copilotAdapter) openSDKSession(ctx context.Context, client copilotClient, adapterSessionID string, sessionConfig *copilot.SessionConfig, resumeConfig *copilot.ResumeSessionConfig) (copilotSession, bool, error) {
 	if persistedID := loadPersistedSDKSessionID(adapterSessionID); persistedID != "" {
 		slog.Info("copilot: resuming persisted sdk session",
 			"adapterSession", adapterSessionID, "sdkSession", persistedID)
 		sess, err := client.ResumeSessionWithOptions(ctx, persistedID, resumeConfig)
 		if err == nil {
-			return sess, true, nil
+			if probeErr := verifySubmitOutcomePresented(ctx, sess); probeErr != nil {
+				slog.Warn("copilot: resumed sdk session does not present submit_outcome; creating a fresh session",
+					"adapterSession", adapterSessionID, "sdkSession", persistedID, "err", probeErr)
+				_ = sess.Disconnect()
+			} else {
+				return sess, true, nil
+			}
+		} else {
+			slog.Warn("copilot: sdk session resume failed; creating a fresh session",
+				"adapterSession", adapterSessionID, "sdkSession", persistedID, "err", err)
 		}
-		slog.Warn("copilot: sdk session resume failed; creating a fresh session",
-			"adapterSession", adapterSessionID, "sdkSession", persistedID, "err", err)
 	}
 	sess, err := client.CreateSession(ctx, sessionConfig)
 	if err != nil {
 		return nil, false, fmt.Errorf("copilot: create session: %w", err)
+	}
+	if probeErr := verifySubmitOutcomePresented(ctx, sess); probeErr != nil {
+		// The session cannot converge a finalize loop; fail the open loudly
+		// so the engine surfaces the misconfiguration instead of burning a
+		// review leg on reprompts for a tool the model cannot see (KB-71).
+		_ = sess.Disconnect()
+		return nil, false, probeErr
 	}
 	persistSDKSessionID(adapterSessionID, sess.SessionID())
 	return sess, false, nil
