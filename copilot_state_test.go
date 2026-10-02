@@ -329,7 +329,7 @@ func TestRestore_RacingRecoverySweepKeepsRestoredAddress(t *testing.T) {
 		slog.Info("restore resume of the checkpointed token not parked before timeout (sweep won the lock ordering)")
 	}
 	release(closeOnceT, gateT)
-	waitDoneOrDeadline(t, restoreFinished, 2*time.Second, "Restore")
+	waitDoneOrDeadline(restoreFinished, 2*time.Second, "Restore")
 
 	// Stage 2: unstick the sweep's parked resume. Post-fix the sweep either
 	// already saw the epoch Restore claimed (no-op) or completes its reopen
@@ -385,8 +385,7 @@ func waitResumeArrived(fc *fakeClient, id string, timeout time.Duration) bool {
 // reopenMu until sweepDone's own join, below, unblocks it). Waiting on a
 // close-only channel keeps the restore error buffer intact for the final
 // assertions.
-func waitDoneOrDeadline(t *testing.T, done chan struct{}, timeout time.Duration, what string) {
-	t.Helper()
+func waitDoneOrDeadline(done chan struct{}, timeout time.Duration, what string) {
 	select {
 	case <-done:
 	case <-time.After(timeout):
