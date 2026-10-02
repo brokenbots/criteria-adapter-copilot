@@ -349,6 +349,63 @@ func TestExecuteFinalizedOutcomeBeatsSessionLoss(t *testing.T) {
 	}
 }
 
+// TestExecuteContractFinalizeBeatsSessionLoss: the same trailing session-loss
+// scenario in contract mode (KB-47 review defect #2). The contract payload and
+// comment recorded by handleSubmitOutcome are forwarded verbatim through
+// ExecuteResult.outputs_json/comment; a legacy session-state outputs
+// assembly (holding only outcome/reason) must not replace them.
+func TestExecuteContractFinalizeBeatsSessionLoss(t *testing.T) {
+	withFastWatchdog(t, 20*time.Millisecond, time.Minute)
+	sleeps := withRetryRecorder(t)
+	fc := &fakeClient{pingErr: nil}
+	p := withRecoverableClient(t, fc)
+
+	fake := &fakeSession{sessionID: "sdk-contract-loss"}
+	pHandle := p
+	fake.onSend = func(_ int, _ copilot.MessageOptions) {
+		if _, err := pHandle.handleSubmitOutcome("adapter-contract-loss", SubmitOutcomeArgs{
+			Outcome: "approved",
+			Payload: json.RawMessage(`{"verdict":"approved","notes":"final"}`),
+			Comment: "all gates green",
+		}); err != nil {
+			t.Errorf("handleSubmitOutcome: %v", err)
+		}
+	}
+	fake.emitOnSend = []copilot.SessionEvent{
+		{Data: &copilot.AssistantMessageData{MessageID: "m1", Content: "done"}},
+		{Data: &copilot.SessionErrorData{ErrorType: "query", Message: "upstream closed"}},
+	}
+	newWatchdogSession(t, p, "adapter-contract-loss", fake)
+
+	sender := &recordingSender{}
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:        "adapter-contract-loss",
+		Input:            map[string]string{"prompt": "do work"},
+		AllowedOutcomes:  []string{"approved", "needs_review"},
+		OutcomeContracts: []*v2.OutcomeContract{contractTestContract(t, "approved", `{"type":"object"}`, false, false)},
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	assertOutcome(t, sender, "approved")
+	result := resultFromSender(sender)
+	if got := string(result.GetOutputsJson()); got != `{"verdict":"approved","notes":"final"}` {
+		t.Fatalf("outputs_json = %s, want the submitted payload verbatim", got)
+	}
+	if got := result.GetComment(); got != "all gates green" {
+		t.Fatalf("comment = %q, want the submitted comment verbatim", got)
+	}
+	if got := fake.sendCount; got != 1 {
+		t.Fatalf("send count = %d, want 1 (a finalized turn must not be re-prompted)", got)
+	}
+	if got := *sleeps; len(got) != 0 {
+		t.Fatalf("backoff sleeps = %v, want none (no retry after finalize)", got)
+	}
+	if ev := findAdapterEvent(t, sender, "outcome.recovered"); ev != nil {
+		t.Fatalf("outcome.recovered emitted for a non-repair finalize: %v", ev)
+	}
+}
+
 // TestExecuteExhaustionPreservesLastAgentMessage: the failure result reason
 // and the structured outcome.failure event must carry the last agent message
 // when the finalize loop exhausts (KB-42 acceptance: evidence preserved on
