@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -722,5 +723,73 @@ func TestExecutePreservesFinalizedOutcomeAcrossStall(t *testing.T) {
 	}
 	if fc.stopCount != 0 {
 		t.Fatalf("stop count = %d, want 0 (no recovery once the outcome is recorded)", fc.stopCount)
+	}
+}
+
+// TestExecutePreservesContractFinalizeAcrossStall: the same stall-after-
+// finalize scenario in contract mode (KB-47). The contract payload and comment
+// recorded by handleSubmitOutcome are forwarded verbatim — the legacy
+// session-state outputs assembly (which has no contract payload) must not leak
+// into ExecuteResult.outputs_json. A repair finalize (Rejection set on the
+// Execute) also emits outcome.recovered before the terminal result.
+func TestExecutePreservesContractFinalizeAcrossStall(t *testing.T) {
+	withFastWatchdog(t, 20*time.Millisecond, time.Minute)
+	sleeps := withRetryRecorder(t)
+	fc := &fakeClient{pingErr: nil}
+	p := withRecoverableClient(t, fc)
+
+	finalized := &fakeSession{sessionID: "sdk-contract-fin"}
+	pHandle := p
+	finalized.onSend = func(_ int, _ copilot.MessageOptions) {
+		if _, err := pHandle.handleSubmitOutcome("adapter-contract-fin", SubmitOutcomeArgs{
+			Outcome: "approved",
+			Payload: json.RawMessage(`{"verdict":"approved","notes":"clean"}`),
+			Comment: "repaired per rejection",
+		}); err != nil {
+			t.Errorf("handleSubmitOutcome: %v", err)
+		}
+	}
+	finalized.emitOnSend = []copilot.SessionEvent{
+		{Data: &copilot.AssistantMessageData{MessageID: "m1", Content: "done"}},
+	}
+	newWatchdogSession(t, p, "adapter-contract-fin", finalized)
+
+	sender := &recordingSender{}
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:        "adapter-contract-fin",
+		Input:            map[string]string{"prompt": "do work"},
+		AllowedOutcomes:  []string{"approved", "needs_review"},
+		OutcomeContracts: []*v2.OutcomeContract{contractTestContract(t, "approved", `{"type":"object"}`, false, false)},
+		Rejection:        &v2.ExecutionRejection{Outcome: "approved", Attempt: 2},
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	assertOutcome(t, sender, "approved")
+	result := resultFromSender(sender)
+	if got := result.GetOutputsJson(); string(got) != `{"verdict":"approved","notes":"clean"}` {
+		t.Fatalf("outputs_json = %s, want the submitted payload verbatim", got)
+	}
+	if got := result.GetComment(); got != "repaired per rejection" {
+		t.Fatalf("comment = %q, want the submitted comment verbatim", got)
+	}
+	if got := finalized.sendCount; got != 1 {
+		t.Fatalf("send count = %d, want 1 (a finalized turn must not be re-prompted)", got)
+	}
+	if got := *sleeps; len(got) != 0 {
+		t.Fatalf("backoff sleeps = %v, want none (no retry after finalize)", got)
+	}
+	if fc.stopCount != 0 {
+		t.Fatalf("stop count = %d, want 0 (no recovery once the outcome is recorded)", fc.stopCount)
+	}
+	recovered := findAdapterEvent(t, sender, "outcome.recovered")
+	if recovered == nil {
+		t.Fatal("expected an outcome.recovered adapter event for the repair finalize")
+	}
+	if got, _ := recovered["outcome"].(string); got != "approved" {
+		t.Errorf("outcome.recovered outcome = %v, want approved", got)
+	}
+	if n, ok := recovered["repair_attempt"].(float64); !ok || n != 2 {
+		t.Errorf("outcome.recovered repair_attempt = %v, want 2", recovered["repair_attempt"])
 	}
 }

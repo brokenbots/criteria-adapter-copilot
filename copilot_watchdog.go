@@ -476,13 +476,13 @@ func (ts *turnState) executeTurn(ctx context.Context, s *sessionState, opts *cop
 			return err
 		}
 
-		s.mu.Lock()
-		finalized := s.finalizedOutcome
-		reason := s.finalizedReason
-		secrets := s.heldSecrets
-		s.mu.Unlock()
-		if finalized != "" {
-			return sink.Send(resultEvent(finalized, reason, secrets...))
+		// A stall after a successfully recorded finalize ends the Execute
+		// here: the deliverable was already produced and re-prompting risks
+		// a duplicate-finalize failure on the resumed conversation. The
+		// emission mirrors handleIdleTurn (KB-47): contract payload/comment
+		// verbatim, outcome.recovered ahead of a repair result.
+		if snap, ok := s.snapshotRecordedFinalize(); ok {
+			return snap.send(sink)
 		}
 
 		if attempt+1 >= watchdogMaxCallAttempts {

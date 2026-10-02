@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -37,6 +38,67 @@ var errSessionLoss = errors.New("copilot developer turn lost before submitting a
 // (KB-42).
 func isSessionLossError(err error) bool {
 	return errors.Is(err, errSessionLoss)
+}
+
+// recordedFinalize captures an accepted submit_outcome whose terminal
+// ExecuteEvent must be emitted outside the turn's idle path: a provider stall
+// that struck after the finalize (CRI-274) or a session loss that trailed the
+// submit (KB-42). Emission mirrors handleIdleTurn exactly — an
+// outcome.recovered event precedes the terminal result for a repair finalize,
+// and contract mode forwards the schema-validated payload and comment
+// verbatim (through the secret-hygiene path) instead of the legacy
+// session-state outputs assembly.
+type recordedFinalize struct {
+	outcome       string
+	reason        string
+	contractMode  bool
+	inRepair      bool
+	repairAttempt uint32
+	payload       json.RawMessage
+	comment       string
+	secrets       []string
+}
+
+// snapshotRecordedFinalize captures the recorded finalize state under s.mu.
+// ok is false when no finalize was accepted, so the caller falls back to its
+// own error handling.
+func (s *sessionState) snapshotRecordedFinalize() (recordedFinalize, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome == "" {
+		return recordedFinalize{}, false
+	}
+	return recordedFinalize{
+		outcome:       s.finalizedOutcome,
+		reason:        s.finalizedReason,
+		contractMode:  s.contractMode,
+		inRepair:      s.inRepairMode,
+		repairAttempt: s.inRepairAttempt,
+		payload:       append(json.RawMessage(nil), s.finalizedPayload...),
+		comment:       s.finalizedComment,
+		secrets:       s.heldSecrets,
+	}, true
+}
+
+// send emits the captured terminal result (and the outcome.recovered event
+// ahead of it for a repair finalize).
+func (f recordedFinalize) send(sink adapterhost.ExecuteEventSender) error {
+	if f.inRepair {
+		// KB-47: a rejected finalize that the model repaired and resubmitted
+		// successfully — surface the recovery once, before the terminal result.
+		_ = sink.Send(adapterEvent("outcome.recovered", map[string]any{
+			"outcome":        f.outcome,
+			"repair_attempt": f.repairAttempt,
+		}))
+	}
+	if f.contractMode {
+		// Contract mode: outputs_json is exactly the model-submitted,
+		// schema-validated payload — never a session-state assembly — and the
+		// finalize comment rides ExecuteResult.comment. Both pass through the
+		// secret-hygiene path.
+		return sink.Send(contractResultEvent(f.outcome, f.payload, f.comment, f.secrets...))
+	}
+	return sink.Send(resultEvent(f.outcome, f.reason, f.secrets...))
 }
 
 // maxEvidenceLen bounds the last-agent-message evidence attached to turn
@@ -366,14 +428,12 @@ func (ts *turnState) awaitOutcome(ctx context.Context, s *sessionState, sink ada
 				// A session loss that trails a submitted outcome must not
 				// fail the step: the deliverable was already produced, the
 				// same way the stall path returns a finalized outcome
-				// directly instead of retrying (CRI-274, KB-42).
+				// directly instead of retrying (CRI-274, KB-42). In contract
+				// mode the recorded payload/comment ride the dedicated
+				// result fields, not the legacy outputs assembly (KB-47).
 				if errors.Is(err, errSessionLoss) {
-					s.mu.Lock()
-					outcome := s.finalizedOutcome
-					reason := s.finalizedReason
-					s.mu.Unlock()
-					if outcome != "" {
-						return sink.Send(resultEvent(outcome, reason, s.heldSecrets...))
+					if snap, ok := s.snapshotRecordedFinalize(); ok {
+						return snap.send(sink)
 					}
 				}
 				return err
