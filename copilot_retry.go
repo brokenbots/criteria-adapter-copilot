@@ -343,6 +343,16 @@ func (p *copilotAdapter) reopenSession(ctx context.Context, s *sessionState) {
 	}
 	s.swapSession(sess)
 	s.boundClientEpoch = epoch
+	// A fresh create starts a new, empty conversation: bump the creation epoch
+	// so a repair whose last finalize predates the restart degrades to a full
+	// re-execute instead of a minimal repair prompt into a conversation that
+	// no longer contains the finalize (KB-47). A resume keeps the conversation
+	// and the epoch unchanged.
+	if !resumed {
+		s.mu.Lock()
+		s.createdEpoch++
+		s.mu.Unlock()
+	}
 	slog.Info("copilot: reopened sdk session after cli restart",
 		"adapterSession", s.adapterSessionID, "sdkSession", sess.SessionID(), "resumed", resumed)
 }
