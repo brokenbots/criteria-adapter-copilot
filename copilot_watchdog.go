@@ -386,9 +386,11 @@ func (ts *turnState) waitTurnSignal(ctx context.Context, s *sessionState) (turnS
 				return turnSignalCtx, ctx.Err()
 			case err := <-ts.errCh:
 				timer.Stop()
+				ts.errSignals++
 				return turnSignalErr, err
 			case <-ts.turnDone:
 				timer.Stop()
+				ts.idleSignals++
 				return turnSignalIdle, nil
 			case <-s.stallNotify:
 				timer.Stop()
@@ -410,9 +412,11 @@ func (ts *turnState) waitTurnSignal(ctx context.Context, s *sessionState) (turnS
 			return turnSignalCtx, ctx.Err()
 		case err := <-ts.errCh:
 			timer.Stop()
+			ts.errSignals++
 			return turnSignalErr, err
 		case <-ts.turnDone:
 			timer.Stop()
+			ts.idleSignals++
 			return turnSignalIdle, nil
 		case <-s.stallNotify:
 			timer.Stop()
@@ -435,7 +439,9 @@ func (ts *turnState) drainStaleSignals(s *sessionState) {
 	for {
 		select {
 		case <-ts.turnDone:
+			ts.drainedIdles++
 		case <-ts.errCh:
+			ts.drainedErrs++
 		default:
 			s.closeAllToolGates()
 			return

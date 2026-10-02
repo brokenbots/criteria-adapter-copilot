@@ -395,6 +395,180 @@ func TestExecuteExhaustionPreservesLastAgentMessage(t *testing.T) {
 	}
 }
 
+// TestExecuteExhaustionCarriesDeltaEvidence (KB-69 regression): a streaming
+// review leg emits its prose as assistant.message_delta chunks, and the CLI
+// emits a complete assistant.message with EMPTY content for every requested
+// tool. When the finalize loop exhausts, the evidence (last_agent_message in
+// outcome.failure and the failure result) must carry the accumulated delta
+// text — an empty tool-request message must not erase it — and the
+// turn.finalize_exhausted diagnostic must report the loop's signal
+// accounting (observed runs d3f8c225/9b7495f1 reported
+// last_agent_message="" with attempts=0).
+func TestExecuteExhaustionCarriesDeltaEvidence(t *testing.T) {
+	withFastWatchdog(t, 20*time.Millisecond, time.Minute)
+	fc := &fakeClient{pingErr: nil}
+	p := withRecoverableClient(t, fc)
+
+	const deltaText = "Reviewing the diff for regressions."
+	fake := &fakeSession{sessionID: "sdk-delta-exhaust"}
+	fake.sendSequence = [][]copilot.SessionEvent{
+		{
+			{Data: &copilot.AssistantMessageDeltaData{MessageID: "m1", DeltaContent: "Reviewing "}},
+			{Data: &copilot.AssistantMessageDeltaData{MessageID: "m1", DeltaContent: "the diff "}},
+			{Data: &copilot.AssistantMessageDeltaData{MessageID: "m1", DeltaContent: "for regressions."}},
+			// A requested tool renders as a complete message with empty
+			// content plus a ToolRequests entry (CLI behavior). It must
+			// forward the tool invocation and keep the delta evidence.
+			{Data: &copilot.AssistantMessageData{
+				MessageID: "m2",
+				Content:   "",
+				ToolRequests: []copilot.AssistantMessageToolRequest{{
+					ToolCallID: "t1",
+					Name:       "bash",
+					Arguments:  map[string]any{"command": "grep -rn TODO ."},
+				}},
+			}},
+			{Data: &copilot.SessionIdleData{}},
+		},
+		{{Data: &copilot.SessionIdleData{}}},
+		{{Data: &copilot.SessionIdleData{}}},
+	}
+	newWatchdogSession(t, p, "adapter-delta-exhaust", fake)
+
+	sender := &recordingSender{}
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:       "adapter-delta-exhaust",
+		Input:           map[string]string{"prompt": "review the change"},
+		AllowedOutcomes: []string{"approved", "changes_requested", "failure", "need_help"},
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	assertOutcome(t, sender, "failure")
+	payload := findAdapterEvent(t, sender, "outcome.failure")
+	if payload == nil {
+		t.Fatal("expected an outcome.failure event")
+	}
+	if msg, _ := payload["last_agent_message"].(string); msg != deltaText {
+		t.Errorf("outcome.failure last_agent_message = %q, want the accumulated delta text %q", msg, deltaText)
+	}
+	if attempts, _ := payload["attempts"].(float64); attempts != 0 {
+		t.Errorf("outcome.failure attempts = %v, want 0 (no submit_outcome call ever landed)", attempts)
+	}
+	if toolPayload := findAdapterEvent(t, sender, "tool.invocation"); toolPayload == nil || toolPayload["tool_call_id"] != "t1" {
+		t.Errorf("tool.invocation event = %v, want the tool request forwarded from the empty-content message", toolPayload)
+	}
+
+	// The turn-level diagnostic must describe the exhausted loop: one
+	// assistant turn produced, three idle signals consumed, no leftover or
+	// drained signals, zero finalize attempts.
+	dbg := findAdapterEvent(t, sender, "turn.finalize_exhausted")
+	if dbg == nil {
+		t.Fatal("expected a turn.finalize_exhausted diagnostic event")
+	}
+	want := map[string]float64{
+		"attempts":             0,
+		"assistant_turns":      1,
+		"idle_signals":         3,
+		"err_signals":          0,
+		"drained_idle_signals": 0,
+		"drained_err_signals":  0,
+	}
+	for k, v := range want {
+		if got, _ := dbg[k].(float64); got != v {
+			t.Errorf("turn.finalize_exhausted %s = %v, want %v", k, got, v)
+		}
+	}
+	if leftover, _ := dbg["leftover_idle_signal"].(bool); leftover {
+		t.Errorf("turn.finalize_exhausted leftover_idle_signal = true, want false")
+	}
+	if leftover, _ := dbg["leftover_err_signal"].(bool); leftover {
+		t.Errorf("turn.finalize_exhausted leftover_err_signal = true, want false")
+	}
+	if dbg["finalize_kind"] != "missing" {
+		t.Errorf("turn.finalize_exhausted finalize_kind = %v, want missing", dbg["finalize_kind"])
+	}
+	if msg, _ := dbg["last_agent_message"].(string); msg != deltaText {
+		t.Errorf("turn.finalize_exhausted last_agent_message = %q, want %q", msg, deltaText)
+	}
+}
+
+// TestExecuteRepromptAfterIdleConvergesOnFinalize (KB-69 regression): a
+// review leg that idles without submit_outcome — the shape of the failing
+// runs (evidence loop, denied probes, then a turn end with no finalize) —
+// must produce a REAL reprompt send (a corrective finalize instruction, not
+// a silently consumed attempt), and a later turn that finalizes must
+// converge the step rather than failing.
+func TestExecuteRepromptAfterIdleConvergesOnFinalize(t *testing.T) {
+	withFastWatchdog(t, 20*time.Millisecond, time.Minute)
+	fc := &fakeClient{pingErr: nil}
+	p := withRecoverableClient(t, fc)
+
+	fake := &fakeSession{sessionID: "sdk-reprompt"}
+	var reprompts []string
+	fake.onSend = func(callIndex int, opts copilot.MessageOptions) {
+		if callIndex == 0 {
+			return
+		}
+		if !strings.Contains(opts.Prompt, "submit_outcome") {
+			t.Errorf("reprompt send %d prompt = %q, want a corrective submit_outcome instruction", callIndex+1, opts.Prompt)
+		}
+		reprompts = append(reprompts, opts.Prompt)
+		if callIndex == 2 {
+			if _, err := p.handleSubmitOutcome("adapter-reprompt", SubmitOutcomeArgs{Outcome: "approved", Reason: "finalize on final attempt"}); err != nil {
+				t.Errorf("handleSubmitOutcome: %v", err)
+			}
+		}
+	}
+	fake.sendSequence = [][]copilot.SessionEvent{
+		{ // Turn 1: evidence loop with tool activity, no finalize, then idle.
+			{Data: &copilot.AssistantMessageDeltaData{MessageID: "m1", DeltaContent: "Starting the review."}},
+			{Data: &copilot.AssistantMessageData{
+				MessageID: "m2",
+				Content:   "",
+				ToolRequests: []copilot.AssistantMessageToolRequest{{
+					ToolCallID: "t1",
+					Name:       "bash",
+					Arguments:  map[string]any{"command": "git diff --stat"},
+				}},
+			}},
+			{Data: &copilot.SessionIdleData{}},
+		},
+		{ // Turn 2 (after reprompt 1): model activity again, still no finalize.
+			{Data: &copilot.AssistantMessageDeltaData{MessageID: "m3", DeltaContent: "Continuing the review."}},
+			{Data: &copilot.SessionIdleData{}},
+		},
+		{ // Turn 3 (after reprompt 2, final attempt): the reviewer finalizes.
+			{Data: &copilot.AssistantMessageData{MessageID: "m4", Content: "Review complete."}},
+			{Data: &copilot.SessionIdleData{}},
+		},
+	}
+	newWatchdogSession(t, p, "adapter-reprompt", fake)
+
+	sender := &recordingSender{}
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:       "adapter-reprompt",
+		Input:           map[string]string{"prompt": "review the change"},
+		AllowedOutcomes: []string{"approved", "changes_requested", "failure", "need_help"},
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	assertOutcome(t, sender, "approved")
+	if got := fake.sendCount; got != 3 {
+		t.Fatalf("send count = %d, want 3 (initial prompt + 2 real reprompt sends)", got)
+	}
+	if len(reprompts) != 2 {
+		t.Fatalf("reprompt count = %d, want 2 (one per idle without finalize)", len(reprompts))
+	}
+	if findAdapterEvent(t, sender, "outcome.failure") != nil {
+		t.Fatal("a converged turn must not emit outcome.failure")
+	}
+	if dbg := findAdapterEvent(t, sender, "turn.finalize_exhausted"); dbg != nil {
+		t.Fatal("a converged turn must not emit turn.finalize_exhausted")
+	}
+}
+
 // TestEvidenceSnippet covers the truncation used for all failure evidence:
 // byte-budgeted, never splitting a rune, always marked when truncated.
 func TestEvidenceSnippet(t *testing.T) {

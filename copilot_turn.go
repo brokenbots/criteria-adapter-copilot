@@ -66,11 +66,26 @@ func evidenceSnippet(content string) string {
 // turnState tracks per-Execute state: final content, turn count, and channels
 // for coordinating the event handler goroutine with the wait loop.
 type turnState struct {
-	finalContent   string
+	finalContent string
+	// lastMessageID tracks the assistant message id the evidence text was
+	// last accumulated from (KB-69): a delta stream with a new id starts a
+	// new turn, so the previous turn's evidence must not bleed into it.
+	lastMessageID  string
 	assistantTurns int
 	turnDone       chan struct{}
 	errCh          chan error
 	maxTurns       int
+
+	// Turn-diagnostic counters for the missing-finalize failure path
+	// (KB-69): how many idle/error signals the wait loop consumed from the
+	// session event fanout, and how many buffered signals the inter-turn
+	// drains dropped. All four are written only from the goroutine running
+	// awaitOutcome/waitTurnSignal/drainStaleSignals, and failExhausted reads
+	// them on that same goroutine, so no extra synchronization is needed.
+	idleSignals  int
+	errSignals   int
+	drainedIdles int
+	drainedErrs  int
 }
 
 func newTurnState(maxTurns int) *turnState {
@@ -243,11 +258,24 @@ func sessionLossError(s *sessionState, cause string, finalContent string) error 
 	return fmt.Errorf("%s: %w", msg, errSessionLoss)
 }
 
-// handleAssistantDelta forwards a streaming delta event.
+// handleAssistantDelta forwards a streaming delta event and accumulates the
+// turn's evidence text (KB-69). On a streaming turn the model prose arrives
+// only as assistant.message_delta chunks; the complete assistant.message
+// events a requested tool produces carry EMPTY content (verified against the
+// CLI's event pipeline), so dropping the deltas leaves failure evidence
+// empty (observed runs d3f8c225/9b7495f1: last_agent_message="").
 func (ts *turnState) handleAssistantDelta(sink adapterhost.ExecuteEventSender, eventType copilot.SessionEventType, d *copilot.AssistantMessageDeltaData) {
 	if d.DeltaContent == "" {
 		return
 	}
+	if d.MessageID != ts.lastMessageID {
+		// A new message id starts a new turn's evidence. The previous
+		// message has ended (its complete content, when any, already
+		// replaced the accumulation), so it must not bleed into this one.
+		ts.finalContent = ""
+		ts.lastMessageID = d.MessageID
+	}
+	ts.finalContent += d.DeltaContent
 	ts.sendErr(sink.Send(adapterEvent("agent.message", map[string]any{
 		"message_id": d.MessageID,
 		"delta":      d.DeltaContent,
@@ -258,7 +286,14 @@ func (ts *turnState) handleAssistantDelta(sink adapterhost.ExecuteEventSender, e
 // handleAssistantMessage processes a complete assistant turn, forwarding
 // content and tool invocations, then enforcing the max_turns limit.
 func (ts *turnState) handleAssistantMessage(sink adapterhost.ExecuteEventSender, eventType copilot.SessionEventType, d *copilot.AssistantMessageData) {
-	ts.finalContent = d.Content
+	// Only a complete message with non-empty content replaces the evidence
+	// (KB-69): the CLI emits a complete assistant.message with empty content
+	// for every requested tool before the final content-bearing message, and
+	// overwriting on those erased the delta text already accumulated.
+	if d.Content != "" {
+		ts.finalContent = d.Content
+		ts.lastMessageID = d.MessageID
+	}
 	ts.sendErr(sink.Send(adapterEvent("agent.message", map[string]any{
 		"message_id": d.MessageID,
 		"content":    d.Content,
@@ -304,6 +339,9 @@ func (ts *turnState) awaitOutcome(ctx context.Context, s *sessionState, sink ada
 			// error — prefer it and let the finalize loop decide (KB-42).
 			select {
 			case <-ts.turnDone:
+				// The idle was buffered before the error was consumed:
+				// the turn survived the error (KB-42).
+				ts.idleSignals++
 				ts.drainStaleSignals(s)
 				done, idleErr := ts.handleIdleTurn(ctx, s, sink, attempt)
 				if done || idleErr != nil {
@@ -438,6 +476,23 @@ func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEven
 	// channel send happens after the last assistant message was recorded),
 	// so the read is synchronized (KB-42).
 	evidence := evidenceSnippet(ts.finalContent)
+	// KB-69: turn-level fail-path diagnostics. The outcome counts alone
+	// cannot distinguish a finalize loop whose reprompts carried real
+	// provider turns from one that consumed stale or duplicated idle
+	// signals instantly (observed runs d3f8c225/9b7495f1: attempts=0,
+	// zero reprompt turns). Report the loop's signal accounting.
+	_ = sink.Send(adapterEvent("turn.finalize_exhausted", map[string]any{
+		"attempts":             attempts,
+		"assistant_turns":      ts.assistantTurns,
+		"idle_signals":         ts.idleSignals,
+		"err_signals":          ts.errSignals,
+		"drained_idle_signals": ts.drainedIdles,
+		"drained_err_signals":  ts.drainedErrs,
+		"leftover_idle_signal": ts.probeIdleSignal(),
+		"leftover_err_signal":  ts.probeErrSignal(),
+		"finalize_kind":        kind,
+		"last_agent_message":   evidence,
+	}))
 	_ = sink.Send(adapterEvent("outcome.failure", map[string]any{
 		"reason":             reason,
 		"kind":               kind,
@@ -450,6 +505,29 @@ func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEven
 		resultReason += "; last agent message: " + evidence
 	}
 	return sink.Send(resultEvent("failure", resultReason, secrets...))
+}
+
+// probeIdleSignal reports (and consumes) whether an idle signal is still
+// buffered in turnDone. Only called after the finalize loop has decided to
+// fail, where consuming a leftover token cannot change the result; it keeps
+// the drain-state report from racing the loop's bookkeeping.
+func (ts *turnState) probeIdleSignal() bool {
+	select {
+	case <-ts.turnDone:
+		return true
+	default:
+		return false
+	}
+}
+
+// probeErrSignal is probeIdleSignal for the error channel.
+func (ts *turnState) probeErrSignal() bool {
+	select {
+	case <-ts.errCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // handleMaxTurnsReached returns failure unless "needs_review" is in the
@@ -593,7 +671,6 @@ func (s *sessionState) beginExecution(sink adapterhost.ExecuteEventSender) func(
 	}
 }
 
-
 // toolCommandFromStartArgs extracts the raw shell command from a native
 // ToolExecutionStart event's arguments (KB-57). The CLI delivers arguments as
 // a decoded JSON object; the shell tool carries its command under the
@@ -619,4 +696,3 @@ func toolCommandFromStartArgs(d *copilot.ToolExecutionStartData) string {
 	}
 	return ""
 }
-
