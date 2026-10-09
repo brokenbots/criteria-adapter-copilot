@@ -689,8 +689,10 @@ func (p *copilotAdapter) openSDKSession(ctx context.Context, client copilotClien
 // buildSessionConfig constructs the SDK SessionConfig from agent-level config fields.
 func (p *copilotAdapter) buildSessionConfig(cfg map[string]string, adapterSessionID string) *copilot.SessionConfig {
 	// Register submit_outcome once per session as a hand-built Tool (KB-47):
-	// a static structural parameter schema — outcome: string, comment: string,
-	// payload: {type: object} — with no per-step enum. Tools bind only at
+	// a static structural parameter schema — outcome: string, reason: string
+	// (both required), comment: string, payload: {type: object}, and
+	// additionalProperties: false (KB-216) — with no per-step enum. Tools bind
+	// only at
 	// session create/resume (the SDK has no Session-level tool mutation), so
 	// the enforceable per-step specifics (allowed outcome set, payload schema,
 	// require_comment) stay prompt-conveyed and handler-validated. Validation

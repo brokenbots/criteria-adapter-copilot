@@ -632,6 +632,7 @@ func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEven
 		"no_outcomes":     "step has no declared outcomes",
 		"invalid_payload": "invalid payload",
 		"comment_missing": "missing comment",
+		"invalid_params":  "invalid parameters",
 	}
 	reason, ok := reasonLabels[kind]
 	if !ok {
