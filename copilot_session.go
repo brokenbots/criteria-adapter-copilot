@@ -691,8 +691,8 @@ func (p *copilotAdapter) buildSessionConfig(cfg map[string]string, adapterSessio
 	// Register submit_outcome once per session as a hand-built Tool (KB-47):
 	// a static structural parameter schema — outcome: string, reason: string
 	// (both required), comment: string, payload: {type: object}, and
-	// additionalProperties: false (KB-216) — with no per-step enum. Tools bind
-	// only at
+	// additionalProperties: false (KB-216) — with no per-step enum. Tools
+	// bind only at
 	// session create/resume (the SDK has no Session-level tool mutation), so
 	// the enforceable per-step specifics (allowed outcome set, payload schema,
 	// require_comment) stay prompt-conveyed and handler-validated. Validation
