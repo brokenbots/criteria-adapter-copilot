@@ -151,7 +151,7 @@ func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeAr
 	if err := dec.Decode(&args); err != nil {
 		return SubmitOutcomeArgs{}, &submitArgsDecodeError{
 			kind:    "invalid_outcome",
-			message: fmt.Sprintf("submit_outcome arguments must be a JSON object with the declared fields: %w", err),
+			message: fmt.Sprintf("submit_outcome arguments must be a JSON object with the declared fields: %v", err),
 		}
 	}
 	return args, nil
@@ -416,7 +416,7 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 	// dropped — the exact class the observed calls failed with (findings
 	// submitted as a comment evaporating while reason was left empty). Reject
 	// them as a typed error pointing at the required reason instead of ever
-	// silently reinterpret them.
+	// silently reinterpreting them.
 	if !s.contractMode {
 		var notConsumed []string
 		if trimmedComment != "" {
