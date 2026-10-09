@@ -6,7 +6,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -1191,5 +1194,266 @@ func TestCheckContractFinalizeClassification(t *testing.T) {
 	}
 	if r := s.checkContractFinalize("approved", json.RawMessage(`{"verdict":"ok"}`), "note"); r != nil {
 		t.Errorf("clean payload + comment: %+v, want nil", r)
+	}
+}
+
+// ── strict parameter contract tests (KB-216) ─────────────────────────────────
+
+// The schema the model sees must declare the full parameter contract: exactly
+// the declared (declaredSubmitOutcomeParams) member set, outcome and reason
+// required, additionalProperties false, and per-parameter descriptions telling
+// the model what belongs where. The struct's JSON tags must match the declared
+// set so the decode accept-set cannot drift from either surface.
+func TestSubmitOutcomeToolParametersContract(t *testing.T) {
+	schema := submitOutcomeToolParameters()
+
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema.properties not a map: %T", schema["properties"])
+	}
+	gotProps := make([]string, 0, len(props))
+	for name := range props {
+		gotProps = append(gotProps, name)
+	}
+	sort.Strings(gotProps)
+	if !reflect.DeepEqual(gotProps, declaredSubmitOutcomeParams) {
+		t.Errorf("schema properties = %v, want declared set %v", gotProps, declaredSubmitOutcomeParams)
+	}
+
+	wantRequired := []string{"outcome", "reason"}
+	gotRequiredAny, ok := schema["required"].([]string)
+	if !ok {
+		t.Fatalf("schema.required is %T, want []string", schema["required"])
+	}
+	if !reflect.DeepEqual(gotRequiredAny, wantRequired) {
+		t.Errorf("schema.required = %v, want %v", gotRequiredAny, wantRequired)
+	}
+
+	if additional, ok := schema["additionalProperties"]; !ok || additional != false {
+		t.Errorf("schema.additionalProperties = %v (present=%t), want false", additional, ok)
+	}
+
+	for _, name := range declaredSubmitOutcomeParams {
+		prop, ok := props[name].(map[string]any)
+		if !ok {
+			t.Fatalf("property %q is %T, want a schema map", name, props[name])
+		}
+		if desc, _ := prop["description"].(string); !strings.EqualFold(desc, submitOutcomeParamDocs[name][1]) {
+			t.Errorf("property %q description %q does not match declared doc", name, desc)
+		}
+	}
+
+	// The doc text is part of the contract: findings must be pointed at
+	// reason, and comment must say when it is mandatory.
+	for _, fragment := range []string{"reason", "findings"} {
+		if !strings.Contains(submitOutcomeParamDocs["reason"][1], fragment) {
+			t.Errorf("reason doc %q should mention %q", submitOutcomeParamDocs["reason"][1], fragment)
+		}
+	}
+	if !strings.Contains(submitOutcomeParamDocs["comment"][1], "require_comment") {
+		t.Errorf("comment doc %q should mention require_comment", submitOutcomeParamDocs["comment"][1])
+	}
+
+	// Drift guard: the declared set must equal the struct's JSON tags.
+	typ := reflect.TypeOf(SubmitOutcomeArgs{})
+	structTags := make([]string, 0, typ.NumField())
+	for i := range typ.NumField() {
+		tag := typ.Field(i).Tag.Get("json")
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "-" {
+			t.Fatalf("field %d unmarshals under %q but decode is strict", i, name)
+		}
+		structTags = append(structTags, name)
+	}
+	sort.Strings(structTags)
+	if !reflect.DeepEqual(structTags, declaredSubmitOutcomeParams) {
+		t.Errorf("SubmitOutcomeArgs json tags = %v, want declared set %v", structTags, declaredSubmitOutcomeParams)
+	}
+}
+
+// decodeSubmitOutcomeArgs rejects keys outside the declared parameter set with
+// a typed error naming the unexpected keys — instead of Go's default
+// unknown-key tolerance silently dropping their values.
+func TestDecodeSubmitOutcomeArgsRejectsUnknownParams(t *testing.T) {
+	cases := []struct {
+		name       string
+		args       map[string]any
+		wantSubstr []string
+	}{
+		{
+			name:       "arbitrary unknown key",
+			args:       map[string]any{"outcome": "approved", "notes": "findings"},
+			wantSubstr: []string{`"notes"`, `"reason"`},
+		},
+		{
+			name:       "several unknown keys sorted",
+			args:       map[string]any{"outcome": "approved", "text": "x", "payload2": "y"},
+			wantSubstr: []string{`"payload2"`, `"text"`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: "submit_outcome", Arguments: tc.args})
+			var typed *submitArgsDecodeError
+			if !errors.As(err, &typed) {
+				t.Fatalf("err = %T(%v), want *submitArgsDecodeError", err, err)
+			}
+			if typed.kind != "invalid_params" {
+				t.Errorf("kind = %q, want invalid_params", typed.kind)
+			}
+			for _, fragment := range tc.wantSubstr {
+				if !strings.Contains(typed.message, fragment) {
+					t.Errorf("message %q missing fragment %q", typed.message, fragment)
+				}
+			}
+		})
+	}
+
+	// Declared-only and legacy nil envelopes still decode.
+	if _, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: "submit_outcome",
+		Arguments: map[string]any{"outcome": "approved", "reason": "done"}}); err != nil {
+		t.Errorf("declared args rejected: %v", err)
+	}
+	if args, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: "submit_outcome"}); err != nil || args.Outcome != "" {
+		t.Errorf("nil envelope: err=%v args=%+v, want zero args and no error", err, args)
+	}
+}
+
+// End-to-end drift behavior (card items 1+2): a reviewer call carrying
+// findings under the undeclared `comment` parameter on a contract-less step is
+// rejected with the typed unknown-parameter error, consumes one finalize
+// attempt, leaves the step unfinalized — and the model's retry with
+// `reason=` succeeds inside the existing finalize budget.
+func TestHandleSubmitOutcomeRawDriftRetryWithReason(t *testing.T) {
+	s := stateWithOutcomes("approved", "changes_requested")
+	p := outcomeAdapter(s)
+
+	drift := copilot.ToolInvocation{ToolName: "submit_outcome", Arguments: map[string]any{
+		"outcome": "changes_requested",
+		"comment": "3900 chars of review findings",
+	}}
+	res, err := p.handleSubmitOutcomeRaw("s1", drift)
+	if err != nil {
+		t.Fatalf("raw handler must return ToolResult, not Go error: %v", err)
+	}
+	if res.ResultType != "failure" {
+		t.Errorf("drift call ResultType = %q, want failure", res.ResultType)
+	}
+	for _, fragment := range []string{`"comment"`, `"reason"`, "silently dropped"} {
+		if !strings.Contains(res.TextResultForLLM, fragment) {
+			t.Errorf("drift text %q missing fragment %q", res.TextResultForLLM, fragment)
+		}
+	}
+	s.mu.Lock()
+	kind, attempts, finalized := s.finalizeFailureKind, s.finalizeAttempts, s.finalizedOutcome
+	s.mu.Unlock()
+	if kind != "invalid_params" || attempts != 1 || finalized != "" {
+		t.Errorf("after drift call: kind=%q attempts=%d finalized=%q, want invalid_params/1/empty", kind, attempts, finalized)
+	}
+
+	retry := copilot.ToolInvocation{ToolName: "submit_outcome", Arguments: map[string]any{
+		"outcome": "changes_requested",
+		"reason":  "3900 chars of review findings",
+	}}
+	res, err = p.handleSubmitOutcomeRaw("s1", retry)
+	if err != nil || res.ResultType != "success" {
+		t.Fatalf("retry: err=%v result=%q, want success", err, res.ResultType)
+	}
+	s.mu.Lock()
+	outcome, reason, tries := s.finalizedOutcome, s.finalizedReason, s.finalizeAttempts
+	s.mu.Unlock()
+	if outcome != "changes_requested" || reason != "3900 chars of review findings" || tries != 2 {
+		t.Errorf("after retry: outcome=%q reason=%q attempts=%d, want changes_requested/3900 chars of review findings/2", outcome, reason, tries)
+	}
+}
+
+// Contract-mode parameters on a contract-less step are rejected (never
+// silently dropped), and the guarded kinds stay distinct from the decode
+// classification.
+func TestHandleSubmitOutcomeRejectsContractParamsWithoutContracts(t *testing.T) {
+	cases := []struct {
+		name   string
+		args   SubmitOutcomeArgs
+		fragment []string
+	}{
+		{
+			name: "comment only",
+			args: SubmitOutcomeArgs{Outcome: "approved", Comment: "feedback"},
+			fragment: []string{`"comment"`, `"reason"`},
+		},
+		{
+			name: "payload only",
+			args: SubmitOutcomeArgs{Outcome: "approved", Payload: json.RawMessage(`{"verdict":"ok"}`)},
+			fragment: []string{`"payload"`, "silently dropped"},
+		},
+		{
+			name: "comment and payload",
+			args: SubmitOutcomeArgs{Outcome: "approved", Comment: "c", Payload: json.RawMessage(`{}`)},
+			fragment: []string{`"comment"`, `"payload"`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := stateWithOutcomes("approved")
+			p := outcomeAdapter(s)
+			res, err := p.handleSubmitOutcome("s1", tc.args)
+			if err != nil {
+				t.Fatalf("unexpected Go error: %v", err)
+			}
+			if res.ResultType != "failure" {
+				t.Errorf("ResultType = %q, want failure", res.ResultType)
+			}
+			for _, fragment := range tc.fragment {
+				if !strings.Contains(res.TextResultForLLM, fragment) {
+					t.Errorf("text %q missing fragment %q", res.TextResultForLLM, fragment)
+				}
+			}
+			s.mu.Lock()
+			kind, attempts, finalized := s.finalizeFailureKind, s.finalizeAttempts, s.finalizedOutcome
+			s.mu.Unlock()
+			if kind != "invalid_params" || attempts != 1 || finalized != "" {
+				t.Errorf("kind/attempts/finalized = %q/%d/%q, want invalid_params/1/empty", kind, attempts, finalized)
+			}
+		})
+	}
+}
+
+// KB-47 contract-mode semantics are preserved: comment and payload are
+// accepted on contract steps, a null payload stays empty-object normalized,
+// and an unknown key is rejected even in contract mode.
+func TestHandleSubmitOutcomeContractModeRoundTripUnchanged(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", `{"type":"object"}`, false, false))
+	p := outcomeAdapter(s)
+
+	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  "verdict attached",
+		Comment: "note",
+		Payload: json.RawMessage("null"),
+	})
+	if err != nil || res.ResultType != "success" {
+		t.Fatalf("contract args: err=%v result=%q, want success", err, res.ResultType)
+	}
+	s.mu.Lock()
+	kind, finalized := s.finalizeFailureKind, s.finalizedOutcome
+	s.mu.Unlock()
+	if kind != "" || finalized != "approved" {
+		t.Errorf("kind/finalized = %q/%q, want empty/approved", kind, finalized)
+	}
+
+	// Unknown key rejected in contract mode too — the raw handler's decode
+	// precedes handler validation (including the duplicate check), so the
+	// typed unknown-parameter error wins and names the unexpected key.
+	rawRes, _ := p.handleSubmitOutcomeRaw("s1", copilot.ToolInvocation{ToolName: "submit_outcome",
+		Arguments: map[string]any{"outcome": "approved", "comment": "c", "payload": map[string]any{"verdict": "ok"}, "notes": "extra"}})
+	if rawRes.ResultType != "failure" || !strings.Contains(rawRes.TextResultForLLM, `"notes"`) {
+		t.Errorf("raw call with unknown key: %q / %q, want failure naming \"notes\"", rawRes.ResultType, rawRes.TextResultForLLM)
+	}
+	s.mu.Lock()
+	kind, attempts := s.finalizeFailureKind, s.finalizeAttempts
+	s.mu.Unlock()
+	if kind != "invalid_params" || attempts != 2 {
+		t.Errorf("post-rejection kind/attempts = %q/%d, want invalid_params/2 (contract finalize + rejection each consume one)", kind, attempts)
 	}
 }

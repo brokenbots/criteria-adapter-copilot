@@ -6,8 +6,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	copilot "github.com/github/copilot-sdk/go"
@@ -22,7 +24,7 @@ import (
 const maxContractIssueLen = 2000
 
 // SubmitOutcomeArgs is the typed parameter struct for the `submit_outcome` tool.
-// The tool is registered as a hand-built SDK Tool (static structural schema via
+// The tool is registered as a hand-built SDK Tool (static parameter schema via
 // Tool.Parameters), not via DefineTool reflection, so the shape is
 // adapter-controlled. The schema deliberately does NOT encode an enum for
 // Outcome — the Copilot Go SDK (v1.0.0) binds tools only at
@@ -32,46 +34,100 @@ const maxContractIssueLen = 2000
 // against the active step's allowed_outcomes set and, when the step carries
 // outcome contracts (v0.7.0 contract mode), the matched contract's schema —
 // both carried on sessionState.
+//
+// KB-216: the parameter contract is DECLARED, not implicit. outcome and reason
+// are required members of the schema the model sees; comment and payload are
+// the optional contract-mode members; and a call carrying keys outside the
+// declared set fails loudly (decodeSubmitOutcomeArgs) instead of Go's default
+// unknown-key tolerance silently dropping the text — the observed failure had
+// all findings under an undeclared parameter name evaporate with no retry
+// signal. There is deliberately NO comment→reason alias (dave ruling
+// 2026-10-08): reason is the only findings surface, and the schema says so.
 type SubmitOutcomeArgs struct {
-	Outcome string          `json:"outcome"`           // required; must be a member of the active allowed set
-	Reason  string          `json:"reason,omitempty"`  // optional prose; surfaced in events for operator visibility
-	Comment string          `json:"comment,omitempty"` // optional finalize comment; mandatory when the matched contract sets require_comment
-	Payload json.RawMessage `json:"payload,omitempty"` // optional JSON object payload, kept verbatim; validated against the matched contract's schema_json when contract mode is active
+	Outcome string `json:"outcome"`          // required; must be a member of the active allowed set
+	Reason  string `json:"reason,omitempty"` // required by the declared schema; ALL of the step's findings/prose must be submitted here
+
+	// Comment and Payload are the optional contract-mode members: consumed only
+	// when the step carries outcome contracts (comment is mandatory when the
+	// matched contract sets require_comment). On contract-less steps the
+	// handler rejects a submission carrying either rather than silently
+	// dropping the bytes.
+	Comment string          `json:"comment,omitempty"`
+	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
-// submitOutcomeToolParameters is the static structural JSON Schema the
-// hand-built submit_outcome tool presents to the model. It is deliberately
-// structural only — no per-step enum on outcome (SDK tools bind per session)
-// and no property-level detail beyond the three fields: the enforceable
-// specifics (allowed set, payload schema, require_comment) are prompt-conveyed
-// and handler-validated, which is what makes per-step contracts possible with
-// a session-bound tool.
+// declaredSubmitOutcomeParams is the declared submit_outcome parameter set
+// (KB-216): the keys the tool's schema advertises to the model and exactly the
+// keys strict decoding accepts. It is one sorted source of truth on purpose —
+// the schema builder, the unknown-parameter rejection, and the retry guidance
+// all name the same set, so the declared contract cannot drift apart.
+var declaredSubmitOutcomeParams = []string{"comment", "outcome", "payload", "reason"}
+
+// submitOutcomeParamDocs is the parameter documentation the schema presents to
+// the model: type plus a description that says what belongs in each parameter
+// (the docs are the contract — the model cannot claim a parameter was
+// undeclared or that text belongs somewhere else).
+var submitOutcomeParamDocs = map[string][2]string{
+	"outcome": {"string", "Required. The step's final outcome; must be one of the allowed outcomes conveyed in the step prompt."},
+	"reason":  {"string", "Required. The finalize reason: ALL of the step's findings, review feedback, and prose justification belong here as the value of reason; the workflow renders the step's findings from reason. Never submit findings text under comment or any other parameter."},
+	"comment": {"string", "Optional finalize comment; consumed only when the step carries outcome contracts. Mandatory when the step's contract for the chosen outcome sets require_comment (the prompt says when). Findings text still belongs in reason — do not submit feedback as the comment."},
+	"payload": {"object", "Optional JSON object payload; consumed only when the step carries outcome contracts. When contracts are present, the payload must satisfy the contract's schema for the chosen outcome and is forwarded to the workflow verbatim."},
+}
+
+// submitOutcomeToolParameters is the static parameter JSON Schema the
+// hand-built submit_outcome tool presents to the model. KB-216: it declares
+// the full parameter contract — outcome and reason as required members, the
+// contract-mode comment/payload members as optional, and additionalProperties
+// false — so a call that does not match is a loud rejection instead of a
+// silently-accepted shape. The enforceable per-step specifics (allowed set,
+// payload schema, require_comment) remain prompt-conveyed and
+// handler-validated, and there is no per-step enum on outcome (SDK tools bind
+// per session), which is what makes per-step contracts possible with a
+// session-bound tool.
 func submitOutcomeToolParameters() map[string]any {
+	properties := make(map[string]any, len(declaredSubmitOutcomeParams))
+	for _, param := range declaredSubmitOutcomeParams {
+		docs := submitOutcomeParamDocs[param]
+		properties[param] = map[string]any{
+			"type":        docs[0],
+			"description": docs[1],
+		}
+	}
 	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"outcome": map[string]any{
-				"type":        "string",
-				"description": "Required. The step's final outcome; must be one of the allowed outcomes conveyed in the step prompt.",
-			},
-			"comment": map[string]any{
-				"type":        "string",
-				"description": "Optional finalize comment. Mandatory when the step's contract for the chosen outcome sets require_comment (the prompt says when).",
-			},
-			"payload": map[string]any{
-				"type":        "object",
-				"description": "Optional JSON object payload. When the step carries outcome contracts, the payload must satisfy the contract's schema for the chosen outcome and is forwarded to the workflow verbatim.",
-			},
-		},
-		"required": []string{"outcome"},
+		"type":                 "object",
+		"properties":           properties,
+		"required":             []string{"outcome", "reason"},
+		"additionalProperties": false,
 	}
 }
+
+// submitArgsDecodeError is a typed failure to decode the submit_outcome
+// invocation envelope against the declared parameter contract (KB-216). kind
+// selects the finalize-failure classification the raw handler records:
+// "invalid_params" for calls that carry keys outside the declared set or
+// contract-mode parameters on a contract-less step (a typed rejection the
+// model repairs from by retrying with the declared names), "invalid_outcome"
+// for structurally undecodable envelopes.
+type submitArgsDecodeError struct {
+	kind    string
+	message string
+}
+
+// Error returns the rejection text the model sees in the ToolResult.
+func (e *submitArgsDecodeError) Error() string { return e.message }
 
 // decodeSubmitOutcomeArgs converts the raw hand-built-tool invocation into
 // typed SubmitOutcomeArgs. Hand-built tools bypass DefineTool's reflection
 // decoding, so the arguments — already-decoded JSON carried as `any` — are
 // re-encoded and unmarshaled here. A nil envelope decodes to zero args (the
 // handler classifies the missing outcome); a non-object envelope is an error.
+//
+// KB-216: decoding is STRICT. Keys outside the declared parameter set are
+// rejected BEFORE the struct decode — encoding/json tolerates unknown fields
+// by silently dropping their values, which is exactly how the observed calls
+// lost the reviewer's findings text with no error and no retry signal — and
+// the rejection names the unexpected keys plus the declared set so the model
+// retries with the correct names inside the existing finalize budget.
 func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeArgs, error) {
 	if invocation.Arguments == nil {
 		return SubmitOutcomeArgs{}, nil
@@ -80,11 +136,58 @@ func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeAr
 	if err != nil {
 		return SubmitOutcomeArgs{}, fmt.Errorf("submit_outcome arguments could not be encoded: %w", err)
 	}
+	if unexpected := unexpectedSubmitArgsKeys(raw); len(unexpected) > 0 {
+		return SubmitOutcomeArgs{}, &submitArgsDecodeError{
+			kind: "invalid_params",
+			message: fmt.Sprintf(
+				"submit_outcome received unknown parameter(s) %s; the declared parameters are %s. Retry with the declared names — the step's findings text belongs in the required \"reason\" parameter.",
+				quoteJoin(unexpected), quoteJoin(declaredSubmitOutcomeParams),
+			),
+		}
+	}
 	var args SubmitOutcomeArgs
-	if err := json.Unmarshal(raw, &args); err != nil {
-		return SubmitOutcomeArgs{}, fmt.Errorf("submit_outcome arguments must be a JSON object with outcome, comment, and payload fields: %w", err)
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&args); err != nil {
+		return SubmitOutcomeArgs{}, &submitArgsDecodeError{
+			kind:    "invalid_outcome",
+			message: fmt.Sprintf("submit_outcome arguments must be a JSON object with the declared fields: %v", err),
+		}
 	}
 	return args, nil
+}
+
+// unexpectedSubmitArgsKeys returns the envelope keys outside the declared
+// parameter set, sorted for a deterministic rejection message. A non-object
+// envelope contributes no names — it is rejected by the struct decode with its
+// own guidance instead.
+func unexpectedSubmitArgsKeys(raw []byte) []string {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil || len(envelope) == 0 {
+		return nil
+	}
+	declared := make(map[string]struct{}, len(declaredSubmitOutcomeParams))
+	for _, key := range declaredSubmitOutcomeParams {
+		declared[key] = struct{}{}
+	}
+	var unexpected []string
+	for key := range envelope {
+		if _, ok := declared[key]; !ok {
+			unexpected = append(unexpected, key)
+		}
+	}
+	sort.Strings(unexpected)
+	return unexpected
+}
+
+// quoteJoin renders string list items as quoted, comma-separated text for
+// rejection messages.
+func quoteJoin(items []string) string {
+	quoted := make([]string, len(items))
+	for i, item := range items {
+		quoted[i] = strconv.Quote(item)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 // handleSubmitOutcomeRaw is the raw handler the SDK dispatches for the
@@ -96,10 +199,18 @@ func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeAr
 func (p *copilotAdapter) handleSubmitOutcomeRaw(adapterSessionID string, invocation copilot.ToolInvocation) (copilot.ToolResult, error) {
 	args, err := decodeSubmitOutcomeArgs(invocation)
 	if err != nil {
+		// A rejected call consumed one finalize attempt; the classification is
+		// the typed decode error's kind so operators can distinguish
+		// parameter-contract violations from undecodable envelopes.
+		kind := "invalid_outcome"
+		var decodeErr *submitArgsDecodeError
+		if errors.As(err, &decodeErr) {
+			kind = decodeErr.kind
+		}
 		if s := p.getSession(adapterSessionID); s != nil {
 			s.mu.Lock()
 			s.finalizeAttempts++
-			s.finalizeFailureKind = "invalid_outcome"
+			s.finalizeFailureKind = kind
 			s.mu.Unlock()
 		}
 		return submitOutcomeError(err.Error()), nil
@@ -299,6 +410,35 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 	trimmedReason := strings.TrimSpace(args.Reason)
 	trimmedComment := strings.TrimSpace(args.Comment)
 	canonicalPayload := normalizedFinalizePayload(args.Payload)
+
+	// KB-216 wire-call strictness: comment and payload are contract-mode
+	// members, and on a step without outcome contracts both would be silently
+	// dropped — the exact class the observed calls failed with (findings
+	// submitted as a comment evaporating while reason was left empty). Reject
+	// them as a typed error pointing at the required reason instead of ever
+	// silently reinterpreting them.
+	if !s.contractMode {
+		var notConsumed []string
+		if trimmedComment != "" {
+			notConsumed = append(notConsumed, "\"comment\"")
+		}
+		if trimmedPayload := bytes.TrimSpace(args.Payload); len(trimmedPayload) > 0 && !bytes.Equal(trimmedPayload, []byte("null")) {
+			notConsumed = append(notConsumed, "\"payload\"")
+		}
+		if len(notConsumed) > 0 {
+			subject := strings.Join(notConsumed, " and ")
+			verb := "is"
+			if len(notConsumed) > 1 {
+				verb = "are"
+			}
+			s.finalizeFailureKind = "invalid_params"
+			s.mu.Unlock()
+			return submitOutcomeError(fmt.Sprintf(
+				"submit_outcome rejected: %s %s not consumed by this step (no outcome contracts declared), so the value would be silently dropped. This step's findings text belongs in the required \"reason\" parameter. Call submit_outcome again with the declared parameters %s.",
+				subject, verb, quoteJoin(declaredSubmitOutcomeParams),
+			)), nil
+		}
+	}
 
 	// Contract mode (v0.7.0 OutcomeContracts present): enforce the matched
 	// contract's comment requirement and payload schema in-turn so the model

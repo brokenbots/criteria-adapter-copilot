@@ -76,10 +76,11 @@ const (
 
 	// submitOutcomeToolDescription is the description surfaced to the model for
 	// the submit_outcome tool. It conveys the contract: call exactly once with
-	// a valid outcome (an optional finalize comment and, under contract mode,
-	// a JSON object payload matching the step contract) before ending the
-	// turn, or the step fails.
-	submitOutcomeToolDescription = "Finalize the outcome for the current step. Call this exactly once with one of the allowed outcomes for the step. The list of allowed outcomes is provided in the user prompt; when the step carries finalization contracts, the prompt also conveys the required `payload` JSON object schema and whether a `comment` is mandatory for a given outcome. Failure to call this tool with a valid outcome will fail the step."
+	// a valid outcome and the finalize reason (where all findings text belongs;
+	// KB-216) — an optional finalize comment and, under contract mode, a JSON
+	// object payload matching the step contract, both consumed only when the
+	// step carries contracts — before ending the turn, or the step fails.
+	submitOutcomeToolDescription = "Finalize the outcome for the current step. Call this exactly once with one of the allowed outcomes for the step and put ALL of your findings, review feedback, and justification in the required `reason` parameter — the step's findings are rendered from reason. The list of allowed outcomes is provided in the user prompt; when the step carries finalization contracts, the prompt also conveys the required `payload` JSON object schema and whether a `comment` is mandatory for a given outcome. Parameters outside the declared set (outcome, reason, comment, payload) are rejected. Failure to call this tool with a valid outcome and reason will fail the step."
 
 	// adapterToolToolDescription is the description surfaced to the model for
 	// the adapter_tool tool. It conveys when to call it, which targets are
