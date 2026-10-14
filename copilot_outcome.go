@@ -5,6 +5,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +45,15 @@ const maxContractIssueLen = 2000
 // all findings under an undeclared parameter name evaporate with no retry
 // signal. There is deliberately NO comment→reason alias (dave ruling
 // 2026-10-08): reason is the only findings surface, and the schema says so.
+//
+// KB-263 ruling (dave, 10-14): reason is the findings surface for UNTYPED
+// outcomes only. On a typed step (the chosen outcome's contract declares a
+// payload schema) the payload IS the output and there is no top-level reason
+// lane — the handler rejects a finalize carrying reason (wrong-lane
+// submission) with the same typed not-consumed shape, and the
+// outcome.finalized event renders the operative prose from the payload. The
+// static schema still advertises reason as required to the model; that
+// mis-teaching is repaired by the KB-260 re-bind, not here.
 type SubmitOutcomeArgs struct {
 	Outcome string `json:"outcome"`          // required; must be a member of the active allowed set
 	Reason  string `json:"reason,omitempty"` // required by the declared schema; ALL of the step's findings/prose must be submitted here
@@ -216,6 +227,19 @@ func (p *copilotAdapter) handleSubmitOutcomeRaw(adapterSessionID string, invocat
 		return submitOutcomeError(err.Error()), nil
 	}
 	return p.handleSubmitOutcome(adapterSessionID, args)
+}
+
+// typedContractSchema returns the matched contract's schema_json for outcome
+// when the contract is present and declares a non-empty schema; nil otherwise.
+// A non-nil result marks the outcome TYPED (KB-263): the payload is the
+// output, the top-level reason lane does not exist, and the display lane
+// derives from the payload. Caller holds s.mu.
+func (s *sessionState) typedContractSchema(outcome string) []byte {
+	contract := s.activeContracts[outcome]
+	if contract == nil || len(contract.GetSchemaJson()) == 0 {
+		return nil
+	}
+	return contract.GetSchemaJson()
 }
 
 // contractRejection is an in-turn finalize rejection produced by the step's
@@ -440,10 +464,24 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 		}
 	}
 
-	// Contract mode (v0.7.0 OutcomeContracts present): enforce the matched
-	// contract's comment requirement and payload schema in-turn so the model
-	// can repair-and-resubmit within the same finalize budget.
+	// Contract mode (v0.7.0 OutcomeContracts present): enforce the typed-lane
+	// rule, then the matched contract's comment requirement and payload
+	// schema, in-turn so the model can repair-and-resubmit within the same
+	// finalize budget.
 	if s.contractMode {
+		// KB-263 ruling (dave, 10-14): on a typed outcome (schema-declaring
+		// contract) the payload is the output and there is no top-level
+		// reason lane. A finalize carrying findings prose under reason is a
+		// wrong-lane submission — reject it in-turn with the KB-216
+		// not-consumed shape, the exact symmetry of the comment/payload
+		// rejection applied to untyped steps above. The rejection consumes
+		// one finalize attempt and is repairable: a payload-only resubmit
+		// within the budget finalizes once.
+		if trimmedReason != "" && len(s.typedContractSchema(outcome)) > 0 {
+			s.finalizeFailureKind = "invalid_params"
+			s.mu.Unlock()
+			return submitOutcomeError(typedReasonNotConsumedMessage()), nil
+		}
 		if rejection := s.checkContractFinalize(outcome, args.Payload, trimmedComment); rejection != nil {
 			s.finalizeFailureKind = rejection.kind
 			s.finalizeFailureIssues = append([]string(nil), rejection.issues...)
@@ -466,17 +504,26 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 	}
 	sink := s.sink
 	heldSecrets := s.heldSecrets
+	// KB-263: the display lane resolves under the pre-unlock snapshot — typed
+	// steps render the payload's operative prose (schema reason, else digest);
+	// untyped steps keep the legacy finalize-reason render.
+	typedSchema := s.typedContractSchema(outcome)
 	s.mu.Unlock()
 
 	// Forward an adapter event so operators see the finalize call in the event
-	// stream. Use the active sink captured in beginExecution. Redact any
-	// adapter-held secrets from the event payload; this is best-effort hygiene,
-	// not a safety guarantee. (The validated payload itself is forwarded
-	// verbatim by contractResultEvent with redaction applied there.)
+	// stream. Use the active sink captured in beginExecution. The reason field
+	// is the event's DISPLAY lane (KB-263): on typed steps it renders the
+	// operative prose from the validated payload — the schema's reason field
+	// when the contract declares one, else a digest of the payload — so an
+	// emitted event is never the empty string merely because the legacy
+	// parameter was absent. Redact any adapter-held secrets from the rendered
+	// prose; this is best-effort hygiene, not a safety guarantee. (The
+	// validated payload itself is forwarded verbatim by contractResultEvent
+	// with redaction applied there.)
 	if sink != nil {
 		_ = sink.Send(adapterEvent("outcome.finalized", map[string]any{
 			"outcome": outcome,
-			"reason":  redactSecrets(trimmedReason, heldSecrets),
+			"reason":  finalizedDisplayReason(typedSchema, trimmedReason, canonicalPayload, heldSecrets),
 		}))
 	}
 
@@ -544,4 +591,68 @@ func sortedAllowedOutcomes(set map[string]struct{}) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// typedReasonNotConsumedMessage is the KB-216 not-consumed rejection text for
+// a wrong-lane finalize on a typed step (KB-263): the outcome contract
+// declares a payload schema, so reason is not consumed — the payload is the
+// output and the step's findings belong under the payload's declared fields.
+// Repairable in-turn within the finalize budget.
+func typedReasonNotConsumedMessage() string {
+	return `submit_outcome rejected: "reason" is not consumed by this typed outcome (its contract declares a payload schema, so the payload is the output). The step's findings belong under the payload's declared fields — the schema's reason field when the contract declares one. Call submit_outcome again without the "reason" parameter.`
+}
+
+// finalizedDisplayReason resolves the reason field of the outcome.finalized
+// adapter event (KB-263). Untyped steps keep the legacy render: the
+// finalize's top-level reason. Typed steps (a schema-declaring contract
+// matched) render the operative prose from the validated payload — the
+// schema's reason field when present — falling back to a digest of the
+// payload when the schema declares no reason field, so the display lane is
+// never empty on typed steps merely because the legacy parameter was absent.
+func finalizedDisplayReason(typedSchema []byte, legacyReason string, payload json.RawMessage, secrets []string) string {
+	if len(typedSchema) == 0 {
+		return redactSecrets(legacyReason, secrets)
+	}
+	return typedFinalizedDisplayReason(typedSchema, payload, secrets)
+}
+
+// typedFinalizedDisplayReason renders the display prose for a typed finalize:
+// the payload's "reason" property when the contract schema declares one and
+// the submitted payload carries non-empty prose, else a digest of the
+// secret-redacted payload. The digest path is the payload's fingerprint — the
+// full typed output travels on the result lane (contractResultEvent forwards
+// OutputsJson verbatim), so the display lane stays cheap and non-empty.
+func typedFinalizedDisplayReason(schemaJSON []byte, payload json.RawMessage, secrets []string) string {
+	if schemaDeclaresReason(schemaJSON) {
+		if prose := payloadStringField(payload, "reason"); prose != "" {
+			return redactSecrets(prose, secrets)
+		}
+	}
+	sum := sha256.Sum256([]byte(redactSecrets(string(payload), secrets)))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// schemaDeclaresReason reports whether the contract schema declares a
+// top-level "reason" property — the payload field whose prose the
+// outcome.finalized display lane mirrors on typed steps (KB-263).
+func schemaDeclaresReason(schemaJSON []byte) bool {
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(schemaJSON, &schema); err != nil {
+		return false
+	}
+	_, ok := schema.Properties["reason"]
+	return ok
+}
+
+// payloadStringField extracts a top-level string property from the submitted
+// payload; empty when the payload carries no such string.
+func payloadStringField(payload json.RawMessage, field string) string {
+	var top map[string]any
+	if err := json.Unmarshal(payload, &top); err != nil {
+		return ""
+	}
+	prose, _ := top[field].(string)
+	return prose
 }

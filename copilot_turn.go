@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	copilot "github.com/github/copilot-sdk/go"
@@ -172,14 +173,41 @@ type turnState struct {
 	// re-create the SDK session (KB-47): a fresh create bumps createdEpoch
 	// and degrades the repair to the full re-execute prompt.
 	execPrompt executePrompt
+
+	// announcedTools tracks the tool_call_ids already rendered as a
+	// tool.invocation row for this Execute (KB-263). The CLI announces a
+	// submit via the complete assistant.message's ToolRequests AND echoes it
+	// as external_tool.requested when the adapter handles the call — two
+	// events for one call that previously rendered as two identical-looking
+	// tool.invocation rows (seq 1196/1197, call_e4aoan72). The
+	// assistant-message row is the canonical invocation render; the echo of
+	// an already-announced call degrades to a thin, unmistakable
+	// tool.requested row carrying the request_id (the anchor tool.result
+	// correlates with). Guarded by announcedMu because events arrive from
+	// the SDK's goroutine, not the awaitOutcome goroutine.
+	announcedTools map[string]struct{}
+	announcedMu    sync.Mutex
 }
 
 func newTurnState(maxTurns int) *turnState {
 	return &turnState{
-		turnDone: make(chan struct{}, 1),
-		errCh:    make(chan error, 1),
-		maxTurns: maxTurns,
+		turnDone:       make(chan struct{}, 1),
+		errCh:          make(chan error, 1),
+		maxTurns:       maxTurns,
+		announcedTools: make(map[string]struct{}),
 	}
+}
+
+// announceToolCall marks a tool_call_id as rendered as a tool.invocation row
+// and reports whether this Execute had already announced it (KB-263).
+func (ts *turnState) announceToolCall(toolCallID string) bool {
+	ts.announcedMu.Lock()
+	defer ts.announcedMu.Unlock()
+	if _, seen := ts.announcedTools[toolCallID]; seen {
+		return true
+	}
+	ts.announcedTools[toolCallID] = struct{}{}
+	return false
 }
 
 // executePrompt carries the composition inputs for an Execute's prompt. The
@@ -238,6 +266,27 @@ func (ts *turnState) handleEvent(s *sessionState, sink adapterhost.ExecuteEventS
 			}
 			ts.handleAssistantMessage(sink, event.Type(), d)
 		case *copilot.ExternalToolRequestedData:
+			// KB-263: the CLI announces a submit via the complete
+			// assistant.message's ToolRequests (rendered by
+			// handleAssistantMessage as the canonical tool.invocation row)
+			// AND echoes it here when the adapter handles the call. Announce
+			// only the row whose kind is not already rendered: the echo of an
+			// already-announced call degrades to a thin tool.requested row
+			// carrying the request_id — the anchor tool.result correlates
+			// with — so one submit renders one invocation-class row, and the
+			// two kinds are unmistakable. The echo of an unannounced call
+			// (fixture path: the child announced the call without a
+			// first-class assistant message) still renders the invocation
+			// row, so no call goes unannounced.
+			if ts.announceToolCall(d.ToolCallID) {
+				ts.sendErr(sink.Send(adapterEvent("tool.requested", map[string]any{
+					"request_id":   d.RequestID,
+					"tool_call_id": d.ToolCallID,
+					"name":         d.ToolName,
+					"event_type":   string(event.Type()),
+				})))
+				break
+			}
 			ts.sendErr(sink.Send(adapterEvent("tool.invocation", map[string]any{
 				"request_id":   d.RequestID,
 				"tool_call_id": d.ToolCallID,
@@ -405,6 +454,9 @@ func (ts *turnState) handleAssistantMessage(sink adapterhost.ExecuteEventSender,
 		"event_type": string(eventType),
 	})))
 	for _, tr := range d.ToolRequests {
+		// KB-263: mark the call announced before rendering; the assistant
+		// message row is the canonical tool.invocation render for the call.
+		ts.announceToolCall(tr.ToolCallID)
 		ts.sendErr(sink.Send(adapterEvent("tool.invocation", map[string]any{
 			"tool_call_id": tr.ToolCallID,
 			"name":         tr.Name,
