@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,22 @@ import (
 
 func outcomeAdapter(s *sessionState) *copilotAdapter {
 	return &copilotAdapter{sessions: map[string]*sessionState{"s1": s}}
+}
+
+// verbatimReasonSchema: object with required string verdict AND reason
+// properties (the KB-263 display lane echoes the payload's reason prose).
+const verbatimReasonSchema = `{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string"},"reason":{"type":"string"}}}`
+
+// finalAdapterEvents returns the adapter events of the given kind carried by
+// the sender's snapshot.
+func finalAdapterEvents(sink *recordingSender, kind string) []*v2.ExecuteEvent {
+	var out []*v2.ExecuteEvent
+	for _, ev := range sink.snapshot() {
+		if a := ev.GetAdapter(); a != nil && a.GetEventKind() == kind {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 func stateWithOutcomes(allowed ...string) *sessionState {
@@ -904,6 +921,9 @@ const verbatimSchema = `{"type":"object","required":["verdict"],"properties":{"v
 
 // Contract-mode finalize accepted: outcome, verbatim payload, and trimmed
 // comment all land on sessionState, and the finalize session epoch is set.
+// The contract declares a schema (typed step, KB-263), so the finalize
+// carries NO top-level reason — the findings belong in the payload; the
+// legacy reason lane stays empty on the accepted finalize.
 func TestContractSubmitAcceptedStoresPayloadAndComment(t *testing.T) {
 	s := contractTestState([]string{"approved", "failure"},
 		contractTestContract(t, "approved", `{"type":"object"}`, false, false))
@@ -911,7 +931,6 @@ func TestContractSubmitAcceptedStoresPayloadAndComment(t *testing.T) {
 
 	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
 		Outcome: "approved",
-		Reason:  " ship it ",
 		Comment: " LGTM ",
 		Payload: json.RawMessage(`{"b":1,"a":2}`),
 	})
@@ -923,8 +942,8 @@ func TestContractSubmitAcceptedStoresPayloadAndComment(t *testing.T) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.finalizedOutcome != "approved" || s.finalizedReason != "ship it" || s.finalizedComment != "LGTM" {
-		t.Errorf("finalized = %q/%q/%q, want approved/ship it/LGTM", s.finalizedOutcome, s.finalizedReason, s.finalizedComment)
+	if s.finalizedOutcome != "approved" || s.finalizedReason != "" || s.finalizedComment != "LGTM" {
+		t.Errorf("finalized = %q/%q/%q, want approved/\"\"/LGTM", s.finalizedOutcome, s.finalizedReason, s.finalizedComment)
 	}
 	if string(s.finalizedPayload) != `{"b":1,"a":2}` {
 		t.Errorf("payload stored as %s, want the submitted bytes verbatim", s.finalizedPayload)
@@ -1372,23 +1391,23 @@ func TestHandleSubmitOutcomeRawDriftRetryWithReason(t *testing.T) {
 // classification.
 func TestHandleSubmitOutcomeRejectsContractParamsWithoutContracts(t *testing.T) {
 	cases := []struct {
-		name   string
-		args   SubmitOutcomeArgs
+		name     string
+		args     SubmitOutcomeArgs
 		fragment []string
 	}{
 		{
-			name: "comment only",
-			args: SubmitOutcomeArgs{Outcome: "approved", Comment: "feedback"},
+			name:     "comment only",
+			args:     SubmitOutcomeArgs{Outcome: "approved", Comment: "feedback"},
 			fragment: []string{`"comment"`, `"reason"`},
 		},
 		{
-			name: "payload only",
-			args: SubmitOutcomeArgs{Outcome: "approved", Payload: json.RawMessage(`{"verdict":"ok"}`)},
+			name:     "payload only",
+			args:     SubmitOutcomeArgs{Outcome: "approved", Payload: json.RawMessage(`{"verdict":"ok"}`)},
 			fragment: []string{`"payload"`, "silently dropped"},
 		},
 		{
-			name: "comment and payload",
-			args: SubmitOutcomeArgs{Outcome: "approved", Comment: "c", Payload: json.RawMessage(`{}`)},
+			name:     "comment and payload",
+			args:     SubmitOutcomeArgs{Outcome: "approved", Comment: "c", Payload: json.RawMessage(`{}`)},
 			fragment: []string{`"comment"`, `"payload"`},
 		},
 	}
@@ -1428,7 +1447,6 @@ func TestHandleSubmitOutcomeContractModeRoundTripUnchanged(t *testing.T) {
 
 	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
 		Outcome: "approved",
-		Reason:  "verdict attached",
 		Comment: "note",
 		Payload: json.RawMessage("null"),
 	})
@@ -1455,5 +1473,272 @@ func TestHandleSubmitOutcomeContractModeRoundTripUnchanged(t *testing.T) {
 	s.mu.Unlock()
 	if kind != "invalid_params" || attempts != 2 {
 		t.Errorf("post-rejection kind/attempts = %q/%d, want invalid_params/2 (contract finalize + rejection each consume one)", kind, attempts)
+	}
+}
+
+// ── KB-263: typed outcomes take the payload as the output ────────────────────
+
+// Typed finalize WITH a top-level reason → wrong-lane submission; rejected
+// in-turn with the KB-216 not-consumed shape so the model repairs within the
+// finalize budget. No adapter event fires for the rejection.
+func TestTypedSubmitRejectsTopLevelReason(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimSchema, false, false))
+	sink := &recordingSender{}
+	s.mu.Lock()
+	s.sink = sink
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  "ship it",
+		Payload: json.RawMessage(`{"verdict":"ok"}`),
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.ResultType != "failure" {
+		t.Fatalf("ResultType = %q, want failure", res.ResultType)
+	}
+	want := `submit_outcome rejected: "reason" is not consumed by this typed outcome (its contract declares a payload schema, so the payload is the output). The step's findings belong under the payload's declared fields — the schema's reason field when the contract declares one. Call submit_outcome again without the "reason" parameter.`
+	if res.TextResultForLLM != want {
+		t.Errorf("rejection text =\n%q\nwant\n%q", res.TextResultForLLM, want)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "" || s.finalizeFailureKind != "invalid_params" || s.finalizeAttempts != 1 {
+		t.Errorf("post-rejection state = outcome %q kind %q attempts %d, want \"\"/invalid_params/1", s.finalizedOutcome, s.finalizeFailureKind, s.finalizeAttempts)
+	}
+	for _, ev := range sink.snapshot() {
+		if a := ev.GetAdapter(); a != nil {
+			t.Errorf("rejection must emit no adapter event (the reprompt lane carries it), got %s", a.GetEventKind())
+		}
+	}
+}
+
+// A payload-only resubmit inside the finalize budget finalizes once: the
+// rejection was one consumed attempt, the repair is the second.
+func TestTypedSubmitWrongLaneRepairFinalizesOnce(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimSchema, false, false))
+	p := outcomeAdapter(s)
+
+	first, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  "ship it",
+		Payload: json.RawMessage(`{"verdict":"ok"}`),
+	})
+	if first.ResultType != "failure" {
+		t.Fatalf("wrong-lane submit: ResultType = %q, want failure", first.ResultType)
+	}
+
+	second, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Payload: json.RawMessage(`{"verdict":"ok","reason":"payload prose lands"}`),
+	})
+	if err != nil || second.ResultType != "success" {
+		t.Fatalf("repaired resubmit: err=%v result=%q (%s), want success", err, second.ResultType, second.TextResultForLLM)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "approved" || s.finalizeAttempts != 2 {
+		t.Errorf("finalized = outcome %q attempts %d, want approved/2 (one per submit)", s.finalizedOutcome, s.finalizeAttempts)
+	}
+	// finalizeFailureKind is cleared at the next Execute (per-execute reset),
+	// not on accept — same lifecycle the contract rejections follow, so the
+	// last-failure evidence stays available to the reprompt lane.
+	if s.finalizeFailureKind != "invalid_params" {
+		t.Errorf("finalizeFailureKind = %q, want invalid_params retained until next Execute", s.finalizeFailureKind)
+	}
+}
+
+// outcome.finalized on a typed step renders the payload's schema-reason prose
+// — the operative findings, not the absent legacy parameter.
+func TestTypedFinalizedEventRendersPayloadSchemaReason(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimReasonSchema, false, false))
+	sink := &recordingSender{}
+	s.mu.Lock()
+	s.sink = sink
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Payload: json.RawMessage(`{"verdict":"ok","reason":"findings: all five checks passed"}`),
+	})
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q, want success (%s)", res.ResultType, res.TextResultForLLM)
+	}
+
+	events := finalAdapterEvents(sink, "outcome.finalized")
+	if len(events) != 1 {
+		t.Fatalf("outcome.finalized events = %d, want 1", len(events))
+	}
+	d := events[0].GetAdapter().GetPayload().AsMap()
+	if d["reason"] != "findings: all five checks passed" {
+		t.Errorf("outcome.finalized reason = %v, want the payload's schema-reason prose", d["reason"])
+	}
+}
+
+// Schema declares a reason field but the submitted payload carries none (or a
+// non-string) → digest fallback, never an empty render.
+func TestTypedFinalizedEventFallsBackToPayloadDigest(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimReasonSchema, false, false))
+	s.mu.Lock()
+	s.sink = &recordingSender{}
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Payload: json.RawMessage(`{"verdict":"ok"}`),
+	})
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q, want success (%s)", res.ResultType, res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	want := "sha256:" + fmt.Sprintf("%x", sha256.Sum256([]byte(redactSecrets(string(s.finalizedPayload), nil))))
+	s.mu.Unlock()
+	sink := s.sink.(*recordingSender)
+	events := finalAdapterEvents(sink, "outcome.finalized")
+	if len(events) != 1 {
+		t.Fatalf("outcome.finalized events = %d, want 1", len(events))
+	}
+	d := events[0].GetAdapter().GetPayload().AsMap()
+	if got, _ := d["reason"].(string); got != want {
+		t.Errorf("digest fallback reason = %q, want %q", got, want)
+	}
+}
+
+// Schema declares NO reason field → payload digest even when the payload has
+// an undeclared reason-looking property; the undeclared field is noise, not
+// the operative prose lane.
+func TestTypedFinalizedEventDigestWhenSchemaDeclaresNoReason(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimSchema, false, false))
+	s.mu.Lock()
+	s.sink = &recordingSender{}
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Payload: json.RawMessage(`{"verdict":"ok","reason":"undeclared noise"}`),
+	})
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q, want success (%s)", res.ResultType, res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	want := "sha256:" + fmt.Sprintf("%x", sha256.Sum256([]byte(redactSecrets(`{"verdict":"ok","reason":"undeclared noise"}`, nil))))
+	s.mu.Unlock()
+	sink := s.sink.(*recordingSender)
+	events := finalAdapterEvents(sink, "outcome.finalized")
+	if len(events) != 1 {
+		t.Fatalf("outcome.finalized events = %d, want 1", len(events))
+	}
+	d := events[0].GetAdapter().GetPayload().AsMap()
+	if got, _ := d["reason"].(string); got != want {
+		t.Errorf("digest reason = %q, want %q", got, want)
+	}
+}
+
+// Held secrets are redacted from both display branches: the schema-reason
+// prose and the digest (computed over the redacted bytes so it matches the
+// wire OutputsJson redaction).
+func TestTypedFinalizedEventRedactsSecrets(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimReasonSchema, false, false))
+	s.mu.Lock()
+	s.heldSecrets = []string{"ghp_secret_token_value"}
+	s.sink = &recordingSender{}
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Payload: json.RawMessage(`{"verdict":"ok","reason":"leaked ghp_secret_token_value in prose"}`),
+	})
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q, want success (%s)", res.ResultType, res.TextResultForLLM)
+	}
+	sink := s.sink.(*recordingSender)
+	events := finalAdapterEvents(sink, "outcome.finalized")
+	if len(events) != 1 {
+		t.Fatalf("outcome.finalized events = %d, want 1", len(events))
+	}
+	d := events[0].GetAdapter().GetPayload().AsMap()
+	if got, _ := d["reason"].(string); got != "leaked [REDACTED] in prose" {
+		t.Errorf("redacted prose = %q, want leaked [REDACTED] in prose", got)
+	}
+
+	// Digest branch: same payload minus prose, with the secret embedded.
+	s2 := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimSchema, false, false))
+	s2.mu.Lock()
+	s2.heldSecrets = []string{"ghp_secret_token_value"}
+	sink2 := &recordingSender{}
+	s2.sink = sink2
+	s2.mu.Unlock()
+	p2 := outcomeAdapter(s2)
+	if res, _ := p2.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Payload: json.RawMessage(`{"verdict":"ghp_secret_token_value"}`),
+	}); res.ResultType != "success" {
+		t.Fatalf("digest-path finalize failed: %s", res.TextResultForLLM)
+	}
+	want := "sha256:" + fmt.Sprintf("%x", sha256.Sum256([]byte(redactSecrets(`{"verdict":"ghp_secret_token_value"}`, []string{"ghp_secret_token_value"}))))
+	events2 := finalAdapterEvents(sink2, "outcome.finalized")
+	if len(events2) != 1 {
+		t.Fatalf("digest events = %d, want 1", len(events2))
+	}
+	d2 := events2[0].GetAdapter().GetPayload().AsMap()
+	if got, _ := d2["reason"].(string); got != want {
+		t.Errorf("redacted digest = %q, want %q", got, want)
+	}
+}
+
+// Untyped steps keep the legacy display lane: schemaless contract-mode
+// outcomes and uncontracted outcomes render the finalize's top-level reason.
+func TestUntypedFinalizedEventKeepsLegacyReasonRender(t *testing.T) {
+	// Schemaless contract (empty schema_json): untyped, reason lane intact.
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", "", false, false))
+	s.mu.Lock()
+	s.sink = &recordingSender{}
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "approved", Reason: "legacy lane prose"})
+	if res.ResultType != "success" {
+		t.Fatalf("schemaless reason finalize: ResultType = %q, want success (%s)", res.ResultType, res.TextResultForLLM)
+	}
+	sink := s.sink.(*recordingSender)
+	events := finalAdapterEvents(sink, "outcome.finalized")
+	if len(events) != 1 {
+		t.Fatalf("schemaless events = %d, want 1", len(events))
+	}
+	if d := events[0].GetAdapter().GetPayload().AsMap(); d["reason"] != "legacy lane prose" {
+		t.Errorf("schemaless render = %v, want the legacy reason prose", d["reason"])
+	}
+
+	// Uncontracted outcome in contract mode: untyped, reason lane intact.
+	s2 := contractTestState([]string{"approved", "failure"},
+		contractTestContract(t, "approved", verbatimSchema, false, false))
+	s2.mu.Lock()
+	s2.sink = &recordingSender{}
+	s2.mu.Unlock()
+	p2 := outcomeAdapter(s2)
+	if res, _ := p2.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "failure", Reason: "uncontracted legacy prose"}); res.ResultType != "success" {
+		t.Fatalf("uncontracted reason finalize failed: %s", res.TextResultForLLM)
+	}
+	sink2 := s2.sink.(*recordingSender)
+	events2 := finalAdapterEvents(sink2, "outcome.finalized")
+	if len(events2) != 1 {
+		t.Fatalf("uncontracted events = %d, want 1", len(events2))
+	}
+	if d := events2[0].GetAdapter().GetPayload().AsMap(); d["reason"] != "uncontracted legacy prose" {
+		t.Errorf("uncontracted render = %v, want the legacy reason prose", d["reason"])
 	}
 }

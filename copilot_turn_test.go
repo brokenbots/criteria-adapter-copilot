@@ -1240,3 +1240,101 @@ func TestRepromptCarriesContractIssues(t *testing.T) {
 		t.Errorf("reprompt should show the redaction placeholder:\n%s", prompt)
 	}
 }
+
+// TestExecuteSubmitRendersOneInvocationRow (KB-263 regression): the CLI
+// announces one submit_outcome call via the complete assistant message's
+// ToolRequests AND echoes it as external_tool.requested when the adapter
+// handles the call. One call must render as ONE invocation-class row — the
+// assistant-message row stays the canonical tool.invocation — plus a thin,
+// unmistakable tool.requested row carrying the request_id anchor (what
+// tool.result correlates with). Live run kb-246-1791991941 rendered the same
+// call as two identical-looking tool.invocation rows (seq 1196/1197,
+// call_e4aoan72), and the finalize guard never fired against it.
+func TestExecuteSubmitRendersOneInvocationRow(t *testing.T) {
+	withFastWatchdog(t, 20*time.Millisecond, time.Minute)
+	fc := &fakeClient{pingErr: nil}
+	p := withRecoverableClient(t, fc)
+
+	fake := &fakeSession{sessionID: "sdk-echo-row"}
+	fake.sendSequence = [][]copilot.SessionEvent{
+		{
+			// The complete message with empty content announcing the submit
+			// call (CLI behavior for requested tools).
+			{Data: &copilot.AssistantMessageData{
+				MessageID: "m1",
+				Content:   "",
+				ToolRequests: []copilot.AssistantMessageToolRequest{{
+					ToolCallID: "t1",
+					Name:       "submit_outcome",
+					Arguments:  map[string]any{"outcome": "success", "reason": "done"},
+				}},
+			}},
+			// The echo of the same call as the adapter handles it.
+			{Data: &copilot.ExternalToolRequestedData{
+				ToolCallID: "t1",
+				ToolName:   "submit_outcome",
+				RequestID:  "req_1",
+				Arguments:  map[string]any{"outcome": "success", "reason": "done"},
+			}},
+			// The completion anchor: tool.result correlates on request_id.
+			{Data: &copilot.ExternalToolCompletedData{RequestID: "req_1"}},
+			{Data: &copilot.SessionIdleData{}},
+		},
+		{{Data: &copilot.SessionIdleData{}}},
+		{{Data: &copilot.SessionIdleData{}}},
+	}
+	newWatchdogSession(t, p, "adapter-echo-row", fake)
+
+	sender := &recordingSender{}
+	if err := p.Execute(context.Background(), &v2.ExecuteRequest{
+		SessionId:       "adapter-echo-row",
+		Input:           map[string]string{"prompt": "do the step"},
+		AllowedOutcomes: []string{"success", "failure"},
+	}, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	// Exactly one tool.invocation row for the call, carrying the announced
+	// arguments.
+	var invocations []*v2.ExecuteEvent
+	for _, ev := range sender.snapshot() {
+		if a := ev.GetAdapter(); a != nil && a.GetEventKind() == "tool.invocation" {
+			invocations = append(invocations, ev)
+		}
+	}
+	if len(invocations) != 1 {
+		t.Fatalf("tool.invocation rows = %d, want 1 (one call, one invocation render): %v", len(invocations), invocations)
+	}
+	inv := invocations[0].GetAdapter().GetPayload().AsMap()
+	if inv["tool_call_id"] != "t1" || inv["name"] != "submit_outcome" {
+		t.Errorf("tool.invocation = %v, want the t1 submit_outcome call", inv)
+	}
+	if inv["request_id"] != nil && inv["request_id"] != "" && inv["request_id"] != "req_1" {
+		t.Errorf("tool.invocation request_id = %v, want nil/empty (assistant-message row) or req_1 (echo row)", inv["request_id"])
+	}
+
+	// The echo degrades to exactly one thin tool.requested row with the
+	// request_id anchor.
+	var requested []*v2.ExecuteEvent
+	for _, ev := range sender.snapshot() {
+		if a := ev.GetAdapter(); a != nil && a.GetEventKind() == "tool.requested" {
+			requested = append(requested, ev)
+		}
+	}
+	if len(requested) != 1 {
+		t.Fatalf("tool.requested rows = %d, want 1", len(requested))
+	}
+	req := requested[0].GetAdapter().GetPayload().AsMap()
+	if req["request_id"] != "req_1" || req["tool_call_id"] != "t1" {
+		t.Errorf("tool.requested = %v, want request_id req_1 for tool_call_id t1", req)
+	}
+	if _, hasArgs := req["arguments"]; hasArgs {
+		t.Errorf("tool.requested = %v, want a thin row without arguments (the invocation row carries them)", req)
+	}
+
+	// The tool.result still anchors on the request_id.
+	result := findAdapterEvent(t, sender, "tool.result")
+	if result == nil || result["request_id"] != "req_1" {
+		t.Errorf("tool.result = %v, want request_id req_1", result)
+	}
+}

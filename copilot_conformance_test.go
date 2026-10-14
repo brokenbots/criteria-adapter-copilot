@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
@@ -585,5 +586,109 @@ func TestConformanceRejectionRepairInLiveSession(t *testing.T) {
 	}
 	if adapterEventPayload(sender2, "outcome.payload_invalid") != nil {
 		t.Error("a HOST rejection is not an in-turn payload rejection; no payload_invalid event expected")
+	}
+}
+
+// ── KB-263 conformance tests ────────────────────────────────────────────────
+
+// Acceptance (KB-263): a wrong-lane finalize on a typed step — findings prose
+// under the legacy top-level reason — is rejected in-turn with the typed
+// not-consumed message, and the repaired payload-only resubmit inside the
+// same turn's finalize budget finalizes once. The wire lane stays untouched:
+// the repaired payload still reaches the host verbatim with any comment on
+// ExecuteResult.comment, and the outcome.finalized display lane renders from
+// the payload (digest — conformanceApprovedSchema declares no reason field),
+// never the legacy reason prose.
+func TestConformanceContractWrongLaneReasonRejectedInTurn(t *testing.T) {
+	const payload = `{"note":"wrong-lane repair","verdict":"approved"}`
+	p := newConformanceAdapter(t, map[string]string{
+		"FAKE_COPILOT_SCENARIO": "contract-wronglane-repair",
+		"FAKE_COPILOT_OUTCOME":  "approved",
+		"FAKE_COPILOT_PAYLOAD":  payload,
+	})
+	mustOpenConformanceSession(t, p, "kb263-wronglane")
+	sender := runConformanceExecuteWith(t, p, "kb263-wronglane", conformanceExecuteOpts{
+		contracts: []*v2.OutcomeContract{conformanceContract("approved", conformanceApprovedSchema, false, false)},
+	})
+
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "approved" {
+		t.Fatalf("outcome = %q, want approved after in-turn repair", r.GetOutcome())
+	}
+	if got := string(r.GetOutputsJson()); got != payload {
+		t.Errorf("outputs_json = %s, want the repaired payload verbatim %s (wire lane unchanged)", got, payload)
+	}
+	if adapterEventPayload(sender, "outcome.payload_invalid") != nil {
+		t.Error("unexpected outcome.payload_invalid event (the typed wrong-lane rejection mirrors the untyped not-consumed shape: no adapter event)")
+	}
+	if adapterEventPayload(sender, "turn.finalize_exhausted") != nil {
+		t.Error("turn.finalize_exhausted must not fire when the repair lands inside the budget")
+	}
+
+	// One finalize: exactly one outcome.finalized event, rendered from the
+	// payload digest — the conformance schema declares no reason field.
+	var finalized []*v2.ExecuteEvent
+	for _, ev := range sender.snapshot() {
+		if a := ev.GetAdapter(); a != nil && a.GetEventKind() == "outcome.finalized" {
+			finalized = append(finalized, ev)
+		}
+	}
+	if len(finalized) != 1 {
+		t.Fatalf("outcome.finalized events = %d, want 1 (the repaired resubmit finalizes once)", len(finalized))
+	}
+	d := finalized[0].GetAdapter().GetPayload().AsMap()
+	wantDigest := "sha256:" + fmt.Sprintf("%x", sha256.Sum256([]byte(payload)))
+	if reason, _ := d["reason"].(string); reason != wantDigest {
+		t.Errorf("outcome.finalized reason = %q, want the payload digest %q", reason, wantDigest)
+	}
+
+	// One submit call renders one invocation-class row at the conformance
+	// boundary too: the fixture announces only via external_tool.requested,
+	// so both calls render their invocation row from the echo path.
+	invocations := 0
+	for _, ev := range sender.snapshot() {
+		if a := ev.GetAdapter(); a != nil {
+			switch a.GetEventKind() {
+			case "tool.invocation":
+				invocations++
+			case "tool.requested":
+				t.Error("unexpected tool.requested row on the fixture path (the echo was the first announcement of the call)")
+			}
+		}
+	}
+	if invocations != 2 {
+		t.Errorf("tool.invocation rows = %d, want 2 (wrong-lane submit + payload-only repair, one row each)", invocations)
+	}
+}
+
+// Acceptance (KB-263): outcome.finalized.reason mirrors the payload's
+// schema-reason prose when the contract schema declares a reason field — the
+// operative findings, not the legacy parameter.
+func TestConformanceTypedFinalizedRendersPayloadSchemaReason(t *testing.T) {
+	const schemaWithReason = `{"type":"object","required":["verdict","reason"],"properties":{"reason":{"type":"string"},"verdict":{"type":"string"}}}`
+	const payload = `{"reason":"findings: payload prose through the wire","verdict":"approved"}`
+	p := newConformanceAdapter(t, map[string]string{
+		"FAKE_COPILOT_SCENARIO": "contract-payload-ok",
+		"FAKE_COPILOT_OUTCOME":  "approved",
+		"FAKE_COPILOT_PAYLOAD":  payload,
+	})
+	mustOpenConformanceSession(t, p, "kb263-schema-reason")
+	sender := runConformanceExecuteWith(t, p, "kb263-schema-reason", conformanceExecuteOpts{
+		contracts: []*v2.OutcomeContract{conformanceContract("approved", schemaWithReason, false, false)},
+	})
+
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "approved" {
+		t.Fatalf("outcome = %q, want approved", r.GetOutcome())
+	}
+	if got := string(r.GetOutputsJson()); got != payload {
+		t.Errorf("outputs_json = %s, want the payload verbatim %s", got, payload)
+	}
+	a := adapterEventPayload(sender, "outcome.finalized")
+	if a == nil {
+		t.Fatal("expected an outcome.finalized adapter event")
+	}
+	if reason, _ := a["reason"].(string); reason != "findings: payload prose through the wire" {
+		t.Errorf("outcome.finalized reason = %q, want the payload's schema-reason prose", reason)
 	}
 }
