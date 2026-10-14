@@ -79,6 +79,20 @@
 //	say the finalize was "rejected by the workflow" — resubmit with
 //	FAKE_COPILOT_PAYLOAD2 (/ FAKE_COPILOT_COMMENT2).
 //
+// "contract-wronglane-repair" (KB-263):
+//
+//	Turn 1: submit_outcome carrying BOTH a top-level reason AND the
+//	FAKE_COPILOT_PAYLOAD payload on a typed (schema-declaring) contract — the
+//	wrong-lane submission. The adapter rejects in-turn with the typed
+//	not-consumed message; the fixture observes the rejection in the handler
+//	result and resubmits payload-only (no reason) before idling, so the repair
+//	lands inside the same turn's finalize budget and the finalize happens once.
+//
+// The contract-* scenarios submit NO top-level reason on their own submits:
+// conformance contracts declare payload schemas (typed outcomes, KB-263), so
+// the payload is the output and a schema-declaring contract never consumes the
+// reason parameter.
+//
 // FAKE_COPILOT_OUTCOME overrides the outcome value submitted on success
 // paths (default "success") — used by review-step conformance tests, whose
 // steps declare outcomes like "approved".
@@ -133,6 +147,10 @@ var (
 	// pendingToolCalls maps a requestId to a channel that is closed
 	// when session.tools.handlePendingToolCall arrives.
 	pendingToolCalls = map[string]chan struct{}{}
+
+	// toolCallResults maps a requestId to the adapter handler's returned
+	// textResultForLlm (recorded from session.tools.handlePendingToolCall).
+	toolCallResults = map[string]string{}
 
 	// toolCallSessions maps a requestId to its sessionId so that
 	// handlePendingToolCall can emit external_tool.completed to the right session.
@@ -307,14 +325,23 @@ func handleRequest(msg *rpcMsg) {
 		respond(msg.ID, map[string]any{"success": true})
 
 	case "session.tools.handlePendingToolCall":
+		// The result carries the adapter handler's outcome (textResultForLlm,
+		// resultType, error) — record it so scenarios can branch on a
+		// rejection (e.g. KB-263 wrong-lane in-turn repair) before idling.
 		var p struct {
 			RequestID string `json:"requestId"`
+			Result    struct {
+				TextResultForLlm string `json:"textResultForLlm"`
+				ResultType       string `json:"resultType"`
+				Error            string `json:"error"`
+			} `json:"result"`
 		}
 		_ = json.Unmarshal(msg.Params, &p)
 
 		toolsMu.Lock()
 		ch := pendingToolCalls[p.RequestID]
 		sessionID := toolCallSessions[p.RequestID]
+		toolCallResults[p.RequestID] = p.Result.TextResultForLlm
 		toolsMu.Unlock()
 
 		// Emit completion and signal waiters BEFORE removing the map entries.
@@ -392,8 +419,10 @@ func handleSessionSend(msg *rpcMsg) {
 		case "contract-payload-ok":
 			// KB-47: submit the env-provided payload and comment so the
 			// adapter's contract validation and verbatim forwarding can be
-			// observed end to end.
-			sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "step completed", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+			// observed end to end. No top-level reason: the conformance
+			// contracts declare payload schemas (typed outcomes, KB-263), so
+			// the payload is the output and the reason lane does not exist.
+			sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
 
 		case "contract-payload-repair":
 			// KB-47: turn 1 submits the (contract-invalid) first-stage
@@ -401,9 +430,9 @@ func handleSessionSend(msg *rpcMsg) {
 			// the host-rejection repair prompt — resubmits with the
 			// second-stage payload.
 			if isRepairPrompt(p.Prompt) {
-				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "repaired submission", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
 			} else {
-				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "step completed", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
 			}
 
 		case "contract-repair":
@@ -411,10 +440,29 @@ func handleSessionSend(msg *rpcMsg) {
 			// host later rejects); the host-rejection repair execute resubmits
 			// with the second-stage payload.
 			if strings.Contains(p.Prompt, repairPromptMarker) {
-				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "repaired submission", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
 			} else {
-				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "step completed", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
 			}
+
+		case "contract-wronglane-repair":
+			// KB-263: the initial execute submits the WRONG lane on a typed
+			// contract — findings prose under the legacy top-level reason
+			// alongside a schema-valid payload. The adapter rejects in-turn
+			// with the typed not-consumed message; the fixture observes the
+			// rejection in the handler result and resubmits payload-only
+			// BEFORE idling, so the repair lands inside the same turn's
+			// finalize budget and the finalize happens once.
+			args := submitArgs(submitOutcomeOverride("success"), "step completed prose in the legacy reason lane", scenarioContractFields(p.Prompt, scenarioPayload1Env))
+			reqID := sendToolCall(p.SessionID, args)
+			waitForToolCall(reqID)
+			if toolCallRejected(reqID) {
+				repairID := sendToolCall(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+				waitForToolCall(repairID)
+			} else {
+				fmt.Fprintf(os.Stderr, "fake-copilot: wrong-lane submit was NOT rejected: %q\n", toolCallResults[reqID])
+			}
+			sendEvent(p.SessionID, "session.idle", map[string]any{})
 
 		case "success-after-reprompt-1":
 			if turn == 1 {
@@ -545,6 +593,16 @@ func scenarioContractFields(prompt string, payloadEnv string) map[string]any {
 		fields["comment"] = c
 	}
 	return fields
+}
+
+// toolCallRejected reports whether the adapter handler rejected the submit
+// carried on requestId: a failure ToolResult (toolCallResults records the
+// textResultForLlm from session.tools.handlePendingToolCall).
+func toolCallRejected(reqID string) bool {
+	toolsMu.Lock()
+	defer toolsMu.Unlock()
+	text, ok := toolCallResults[reqID]
+	return ok && strings.Contains(text, "submit_outcome rejected")
 }
 
 // waitForToolCall blocks until handlePendingToolCall has been received for

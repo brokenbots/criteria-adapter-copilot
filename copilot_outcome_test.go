@@ -1391,23 +1391,23 @@ func TestHandleSubmitOutcomeRawDriftRetryWithReason(t *testing.T) {
 // classification.
 func TestHandleSubmitOutcomeRejectsContractParamsWithoutContracts(t *testing.T) {
 	cases := []struct {
-		name   string
-		args   SubmitOutcomeArgs
+		name     string
+		args     SubmitOutcomeArgs
 		fragment []string
 	}{
 		{
-			name: "comment only",
-			args: SubmitOutcomeArgs{Outcome: "approved", Comment: "feedback"},
+			name:     "comment only",
+			args:     SubmitOutcomeArgs{Outcome: "approved", Comment: "feedback"},
 			fragment: []string{`"comment"`, `"reason"`},
 		},
 		{
-			name: "payload only",
-			args: SubmitOutcomeArgs{Outcome: "approved", Payload: json.RawMessage(`{"verdict":"ok"}`)},
+			name:     "payload only",
+			args:     SubmitOutcomeArgs{Outcome: "approved", Payload: json.RawMessage(`{"verdict":"ok"}`)},
 			fragment: []string{`"payload"`, "silently dropped"},
 		},
 		{
-			name: "comment and payload",
-			args: SubmitOutcomeArgs{Outcome: "approved", Comment: "c", Payload: json.RawMessage(`{}`)},
+			name:     "comment and payload",
+			args:     SubmitOutcomeArgs{Outcome: "approved", Comment: "c", Payload: json.RawMessage(`{}`)},
 			fragment: []string{`"comment"`, `"payload"`},
 		},
 	}
