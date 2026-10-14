@@ -317,6 +317,32 @@ func validateContractPayload(payload json.RawMessage, schemaJSON []byte) []strin
 // semantics and normalizing those cases to `{}` for verbatim storage. The
 // second return is an issue string when the payload bytes do not decode to a
 // single JSON value.
+
+// payloadProse surfaces the operative human-readable text of a typed
+// (contract-mode) payload for the outcome.finalized event (KB-263): the
+// schema's reason field when the payload carries one, else the empty string.
+// The payload remains the output lane verbatim; this only feeds the
+// operator-facing event so the stream never shows an empty finalize reason
+// for a finalize that carried content.
+func payloadProse(payload json.RawMessage) string {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil {
+		return ""
+	}
+	raw, ok := fields["reason"]
+	if !ok {
+		return ""
+	}
+	var prose string
+	if err := json.Unmarshal(raw, &prose); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(prose)
+}
 func payloadInstance(payload json.RawMessage) (any, string) {
 	trimmed := bytes.TrimSpace(payload)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -442,8 +468,21 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 
 	// Contract mode (v0.7.0 OutcomeContracts present): enforce the matched
 	// contract's comment requirement and payload schema in-turn so the model
-	// can repair-and-resubmit within the same finalize budget.
+	// can repair-and-resubmit within the same finalize budget. KB-263 (dave
+	// ruling): the payload IS the output of a typed outcome — the top-level
+	// reason param is legacy for untyped outcomes only, so a finalize that
+	// carries both lanes is a wrong-lane submission rejected in-turn (the
+	// exact symmetry of the payload/comment rejection on untyped steps), not
+	// silently reinterpreted.
 	if s.contractMode {
+		if trimmedReason != "" {
+			s.finalizeFailureKind = "invalid_params"
+			s.mu.Unlock()
+			return submitOutcomeError(fmt.Sprintf(
+				"submit_outcome rejected: \"reason\" is not consumed by this step (the outcome is typed: the payload is the output — the legacy top-level reason lane applies only to untyped outcomes). Submit all findings under the payload's declared fields; the contract for the chosen outcome is enforced from the payload. Call submit_outcome again with the declared parameters %s.",
+				quoteJoin([]string{"outcome", "payload", "comment"}),
+			)), nil
+		}
 		if rejection := s.checkContractFinalize(outcome, args.Payload, trimmedComment); rejection != nil {
 			s.finalizeFailureKind = rejection.kind
 			s.finalizeFailureIssues = append([]string(nil), rejection.issues...)

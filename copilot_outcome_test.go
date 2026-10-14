@@ -909,9 +909,10 @@ func TestContractSubmitAcceptedStoresPayloadAndComment(t *testing.T) {
 		contractTestContract(t, "approved", `{"type":"object"}`, false, false))
 	p := outcomeAdapter(s)
 
+	// KB-263 doctrine: typed steps take payload-only submissions; the legacy
+	// reason param is a wrong-lane rejection.
 	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
 		Outcome: "approved",
-		Reason:  " ship it ",
 		Comment: " LGTM ",
 		Payload: json.RawMessage(`{"b":1,"a":2}`),
 	})
@@ -923,8 +924,8 @@ func TestContractSubmitAcceptedStoresPayloadAndComment(t *testing.T) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.finalizedOutcome != "approved" || s.finalizedReason != "ship it" || s.finalizedComment != "LGTM" {
-		t.Errorf("finalized = %q/%q/%q, want approved/ship it/LGTM", s.finalizedOutcome, s.finalizedReason, s.finalizedComment)
+	if s.finalizedOutcome != "approved" || s.finalizedComment != "LGTM" {
+		t.Errorf("finalized = %q/%q, want approved/empty-comment LGTM", s.finalizedOutcome, s.finalizedComment)
 	}
 	if string(s.finalizedPayload) != `{"b":1,"a":2}` {
 		t.Errorf("payload stored as %s, want the submitted bytes verbatim", s.finalizedPayload)
@@ -1428,7 +1429,6 @@ func TestHandleSubmitOutcomeContractModeRoundTripUnchanged(t *testing.T) {
 
 	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
 		Outcome: "approved",
-		Reason:  "verdict attached",
 		Comment: "note",
 		Payload: json.RawMessage("null"),
 	})
@@ -1455,5 +1455,64 @@ func TestHandleSubmitOutcomeContractModeRoundTripUnchanged(t *testing.T) {
 	s.mu.Unlock()
 	if kind != "invalid_params" || attempts != 2 {
 		t.Errorf("post-rejection kind/attempts = %q/%d, want invalid_params/2 (contract finalize + rejection each consume one)", kind, attempts)
+	}
+}
+
+
+// KB-263: payloadProse surfaces the payload's reason prose for the
+// outcome.finalized event on typed steps.
+func TestKB263_PayloadProseMirrored(t *testing.T) {
+	if got := payloadProse(json.RawMessage(`{"reason":"verdict prose"}`)); got != "verdict prose" {
+		t.Fatalf("payloadProse = %q, want verdict prose", got)
+	}
+	if got := payloadProse(json.RawMessage(`{"verdict":"swordfish"}`)); got != "" {
+		t.Fatalf("payloadProse without reason field = %q, want empty", got)
+	}
+	if got := payloadProse(json.RawMessage(`null`)); got != "" {
+		t.Fatalf("payloadProse(null) = %q, want empty", got)
+	}
+	if got := payloadProse(json.RawMessage(`{"reason":42}`)); got != "" {
+		t.Fatalf("payloadProse non-string reason = %q, want empty", got)
+	}
+}
+
+// KB-263: the typed wrong-lane rejection through the real handler — contract
+// mode + a top-level reason alongside the payload is rejected in-turn
+// (invalid_params) naming the reason parameter; the finalize does NOT land.
+func TestKB263_TypedReasonLaneRejectedByHandler(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", `{"type":"object","properties":{"reason":{"type":"string"}},"required":["reason"]}`, false, false))
+	p := outcomeAdapter(s)
+
+	rawRes, err := p.handleSubmitOutcomeRaw("s1", copilot.ToolInvocation{ToolName: "submit_outcome",
+		Arguments: map[string]any{"outcome": "approved",
+			"reason":  "legacy lane prose",
+			"payload": map[string]any{"reason": "payload lane prose"}}})
+	if err != nil {
+		t.Fatalf("raw call: %v", err)
+	}
+	if rawRes.ResultType != "failure" || !strings.Contains(rawRes.TextResultForLLM, `"reason"`) {
+		t.Errorf("wrong-lane call: %q / %q, want failure naming \"reason\"", rawRes.ResultType, rawRes.TextResultForLLM)
+	}
+	s.mu.Lock()
+	kind, attempts, finalized := s.finalizeFailureKind, s.finalizeAttempts, s.finalizedOutcome
+	s.mu.Unlock()
+	if kind != "invalid_params" || attempts != 1 || finalized != "" {
+		t.Errorf("kind/attempts/finalized = %q/%d/%q, want invalid_params/1/empty", kind, attempts, finalized)
+	}
+
+	// The repaired payload-only resubmit inside the finalize budget lands.
+	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Payload: json.RawMessage(`{"reason":"payload lane prose"}`),
+	})
+	if err != nil || res.ResultType != "success" {
+		t.Fatalf("repaired submit: err=%v result=%q, want success", err, res.ResultType)
+	}
+	s.mu.Lock()
+	finalized = s.finalizedOutcome
+	s.mu.Unlock()
+	if finalized != "approved" {
+		t.Errorf("finalized = %q, want approved after repair", finalized)
 	}
 }

@@ -393,7 +393,7 @@ func handleSessionSend(msg *rpcMsg) {
 			// KB-47: submit the env-provided payload and comment so the
 			// adapter's contract validation and verbatim forwarding can be
 			// observed end to end.
-			sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "step completed", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+			sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
 
 		case "contract-payload-repair":
 			// KB-47: turn 1 submits the (contract-invalid) first-stage
@@ -401,9 +401,9 @@ func handleSessionSend(msg *rpcMsg) {
 			// the host-rejection repair prompt — resubmits with the
 			// second-stage payload.
 			if isRepairPrompt(p.Prompt) {
-				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "repaired submission", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
 			} else {
-				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "step completed", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
 			}
 
 		case "contract-repair":
@@ -411,9 +411,9 @@ func handleSessionSend(msg *rpcMsg) {
 			// host later rejects); the host-rejection repair execute resubmits
 			// with the second-stage payload.
 			if strings.Contains(p.Prompt, repairPromptMarker) {
-				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "repaired submission", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload2Env)))
 			} else {
-				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "step completed", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
 			}
 
 		case "success-after-reprompt-1":
