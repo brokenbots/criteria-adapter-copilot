@@ -262,6 +262,27 @@ func TestOutcomeEnvOverride(t *testing.T) {
 	}
 }
 
+// TestEchoMenuLine verifies the menu-line extractor the payload/reason echo
+// scenarios feed on (KB-260): it returns the exact "- <name> — <description>"
+// line the adapter rendered, scanning the whole prompt, and "" when the
+// prompt carries no described line for the outcome.
+func TestEchoMenuLine(t *testing.T) {
+	prompt := "You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are:\n" +
+		"- approved — the work meets the review criteria; sign off\n" +
+		"- failure\n" +
+		"\nIf you do not call the tool with a valid outcome, the step will fail."
+	want := "- approved — the work meets the review criteria; sign off"
+	if got := echoMenuLine(prompt, "approved"); got != want {
+		t.Errorf("echoMenuLine approved = %q, want %q", got, want)
+	}
+	if got := echoMenuLine(prompt, "failure"); got != "" {
+		t.Errorf("echoMenuLine failure (bare name) = %q, want empty", got)
+	}
+	if got := echoMenuLine("no menu here", "approved"); got != "" {
+		t.Errorf("echoMenuLine with no menu = %q, want empty", got)
+	}
+}
+
 // TestNewPermIDUniqueness verifies that newPermID returns distinct values on
 // successive calls, preventing the map-key collision that would cause a
 // deadlock when multiple permission requests are in-flight.

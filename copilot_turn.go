@@ -219,11 +219,12 @@ type executePrompt struct {
 	contracts  []*v2.OutcomeContract
 	rejection  *v2.ExecutionRejection
 	// descriptions carries the per-outcome presentation description from the
-	// Execute handshake (KB-260: outcome-description rendering rides the
-	// proto's outcome-description carrier). Nil/empty today — the carrier
-	// lands with the additive criteria-adapter-proto ExecuteRequest field;
-	// when populated, composeExecutePrompt renders the "name — description"
-	// menu instead of the flat name list.
+	// Execute handshake (KB-260): splitAllowedOutcomeProse unwraps the
+	// host-supplied "name — description" prompt-prose carrier that rides the
+	// AllowedOutcomes entries (the additive criteria-adapter-proto
+	// ExecuteRequest field remains the preferred future carrier), and
+	// composeExecutePrompt renders the "name — description" menu when it is
+	// populated instead of the flat name list.
 	descriptions map[string]string
 }
 
@@ -825,7 +826,13 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	// Populate allowed set before the prompt is sent so the tool handler can
 	// validate on the very first turn. Contract mode (v0.7.0 OutcomeContracts)
 	// and repair-mode state ride the same lock.
-	allowed := req.GetAllowedOutcomes()
+	// KB-260: the allowed-outcome prose carrier. A host supplies an
+	// outcome's presentation description inside its AllowedOutcomes entry as
+	// "name — description" prompt-prose until the additive
+	// criteria-adapter-proto ExecuteRequest field lands; the bare name
+	// remains the submission/validation surface, so the split feeds both the
+	// allowed set and the prompt's verdict menu.
+	allowed, outcomeDescriptions := splitAllowedOutcomeProse(req.GetAllowedOutcomes())
 	contracts := req.GetOutcomeContracts()
 	rejection := req.GetRejection()
 	s.mu.Lock()
@@ -855,10 +862,11 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 
 	state := newTurnState(maxTurns)
 	state.execPrompt = executePrompt{
-		stepPrompt: prompt,
-		allowed:    allowed,
-		contracts:  contracts,
-		rejection:  rejection,
+		stepPrompt:   prompt,
+		allowed:      allowed,
+		contracts:    contracts,
+		rejection:    rejection,
+		descriptions: outcomeDescriptions,
 	}
 	// Route the handler through the session's event fanout (CRI-272): if the
 	// CLI child dies mid-turn and the session is re-opened, the swapped-in SDK
@@ -987,6 +995,46 @@ func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.O
 	}
 
 	return stepPrompt
+}
+
+// outcomeProseSeparator separates an allowed-outcome entry's name from the
+// description prose riding its AllowedOutcomes entry (KB-260: the
+// host-supplied prompt-prose carrier; the additive proto field on
+// ExecuteRequest remains the preferred future carrier). Outcome names are
+// identifier-like, so a space-em-dash-space separator never appears in a
+// bare name.
+const outcomeProseSeparator = " — "
+
+// splitAllowedOutcomeProse splits each AllowedOutcomes entry into its bare
+// outcome name and optional description prose (KB-260). When NO entry carries
+// describable prose, the input slice is returned as-is with a nil map, so
+// hosts that travel no descriptions keep every legacy path byte-for-byte
+// (allowed set, error lists, prompt preamble). Otherwise the returned names
+// are TrimSpace'd split results (an entry whose name part is empty keeps its
+// whole trimmed text as the name) and the map carries a non-empty description
+// per named outcome; the map is the only render input, so a description for
+// an outcome that is not in the allowed set cannot surface.
+func splitAllowedOutcomeProse(entries []string) ([]string, map[string]string) {
+	descriptions := map[string]string{}
+	sawProse := false
+	names := make([]string, len(entries))
+	for i, entry := range entries {
+		name, description := strings.TrimSpace(entry), ""
+		if before, after, ok := strings.Cut(entry, outcomeProseSeparator); ok {
+			trimmedName := strings.TrimSpace(before)
+			if trimmedName != "" {
+				name, description, sawProse = trimmedName, strings.TrimSpace(after), true
+			}
+		}
+		names[i] = name
+		if description != "" {
+			descriptions[name] = description
+		}
+	}
+	if !sawProse {
+		return entries, nil
+	}
+	return names, descriptions
 }
 
 // outcomeMenu renders the allowed-outcomes menu for the Execute preamble

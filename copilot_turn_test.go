@@ -956,8 +956,9 @@ func TestContractConveyancePayloadAsOutputOnTypedContracts(t *testing.T) {
 	}
 }
 
-// KB-260: once outcome descriptions travel (the proto carrier), the
-// allowed-outcomes menu renders one "name — description" line per outcome so
+// KB-260: once outcome descriptions travel (the host-supplied
+// "name — description" AllowedOutcomes prose carrier; the additive proto
+// field remains the preferred future channel), the allowed-outcomes menu renders one "name — description" line per outcome so
 // the verdict menu is prompt-visible prose — and a bare name renders alone
 // when its individual description is empty. With no descriptions the legacy
 // flat preamble renders byte-for-byte (asserted at
@@ -992,6 +993,97 @@ func TestComposeExecutePromptDescriptionMenu(t *testing.T) {
 	if !strings.Contains(legacy, wantLegacy) {
 		t.Errorf("legacy shape drifted under nil descriptions:\n%s", legacy)
 	}
+}
+
+// splitAllowedOutcomeProse is the AllowedOutcomes prose carrier unwrapper
+// (KB-260): entries without the " — " separator pass through unchanged (with
+// a nil map), described entries split into bare-name + description, and the
+// split is byte-stable for every legacy shape a host already sends.
+func TestSplitAllowedOutcomeProse(t *testing.T) {
+	cases := []struct {
+		name     string
+		entries  []string
+		want     []string
+		wantDesc map[string]string
+	}{
+		{
+			name:    "nil entries",
+			entries: nil,
+			want:    nil,
+		},
+		{
+			name:    "bare names stay byte-for-byte",
+			entries: []string{"approved", "changes_requested", " failure "},
+			want:    []string{"approved", "changes_requested", " failure "},
+		},
+		{
+			name:    "described entries split into bare names",
+			entries: []string{"approved — the work meets the review criteria; sign off", "failure"},
+			want:    []string{"approved", "failure"},
+			wantDesc: map[string]string{
+				"approved": "the work meets the review criteria; sign off",
+			},
+		},
+		{
+			name:    "all entries described",
+			entries: []string{"approved — sign off", "failure — the verdict the step rejects"},
+			want:    []string{"approved", "failure"},
+			wantDesc: map[string]string{
+				"approved": "sign off",
+				"failure":  "the verdict the step rejects",
+			},
+		},
+		{
+			name:    "empty description keeps the split name but no description",
+			entries: []string{"approved — ", "failure"},
+			want:    []string{"approved", "failure"},
+		},
+		{
+			name:    "lone separator with no name part stays the raw entry (legacy passthrough)",
+			entries: []string{" — stall prose"},
+			want:    []string{" — stall prose"},
+		},
+		{
+			name:    "only the first separator splits",
+			entries: []string{"approved — dash — in prose"},
+			want:    []string{"approved"},
+			wantDesc: map[string]string{
+				"approved": "dash — in prose",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, descriptions := splitAllowedOutcomeProse(tc.entries)
+			if !slicesEqual(got, tc.want) {
+				t.Errorf("names = %q, want %q", got, tc.want)
+			}
+			if tc.wantDesc == nil && len(descriptions) != 0 {
+				t.Errorf("descriptions = %v, want empty/nil", descriptions)
+			}
+			if len(descriptions) != len(tc.wantDesc) {
+				t.Errorf("descriptions = %v, want %v", descriptions, tc.wantDesc)
+			}
+			for name, want := range tc.wantDesc {
+				if descriptions[name] != want {
+					t.Errorf("descriptions[%s] = %q, want %q", name, descriptions[name], want)
+				}
+			}
+		})
+	}
+}
+
+// slicesEqual compares string slices treating nil and empty as equal.
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestRepairInSessionEpochMatrix(t *testing.T) {
