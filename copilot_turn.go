@@ -218,6 +218,13 @@ type executePrompt struct {
 	allowed    []string
 	contracts  []*v2.OutcomeContract
 	rejection  *v2.ExecutionRejection
+	// descriptions carries the per-outcome presentation description from the
+	// Execute handshake (KB-260: outcome-description rendering rides the
+	// proto's outcome-description carrier). Nil/empty today — the carrier
+	// lands with the additive criteria-adapter-proto ExecuteRequest field;
+	// when populated, composeExecutePrompt renders the "name — description"
+	// menu instead of the flat name list.
+	descriptions map[string]string
 }
 
 // messageOptions composes the prompt for the current session state. Called
@@ -225,7 +232,7 @@ type executePrompt struct {
 // under s.mu itself.
 func (ep executePrompt) messageOptions(s *sessionState) *copilot.MessageOptions {
 	return &copilot.MessageOptions{
-		Prompt: composeExecutePrompt(ep.stepPrompt, ep.allowed, ep.contracts, ep.rejection, s, s.heldSecrets),
+		Prompt: composeExecutePrompt(ep.stepPrompt, ep.allowed, ep.contracts, ep.rejection, s, s.heldSecrets, ep.descriptions),
 	}
 }
 
@@ -920,14 +927,25 @@ func (s *sessionState) repairInSession() bool {
 // in-session decision is made HERE, at composition time (under s.mu), so a
 // lazy reopen that re-created the SDK session before the send is reflected.
 // s must not be nil; bare (&sessionState{}) works for stateless tests.
-func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.OutcomeContract, rejection *v2.ExecutionRejection, s *sessionState, secrets []string) string {
+func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.OutcomeContract, rejection *v2.ExecutionRejection, s *sessionState, secrets []string, descriptions map[string]string) string {
 	// Prepend the allowed-outcomes preamble so the model knows what to call.
+	// KB-260: when per-outcome descriptions travel (the proto carrier), the
+	// menu renders one "name — description" line per outcome; with no
+	// descriptions the flat name list stays byte-for-byte the legacy
+	// preamble.
 	if len(allowed) > 0 {
-		outcomeList := strings.Join(allowed, ", ") // already sorted ascending by W14 loader
-		stepPrompt = fmt.Sprintf(
-			"You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are: %s. If you do not call the tool with a valid outcome, the step will fail.\n\n%s",
-			outcomeList, stepPrompt,
-		)
+		if menu := outcomeMenu(allowed, descriptions); menu != "" {
+			stepPrompt = fmt.Sprintf(
+				"You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are:\n%s\n\nIf you do not call the tool with a valid outcome, the step will fail.\n\n%s",
+				menu, stepPrompt,
+			)
+		} else {
+			outcomeList := strings.Join(allowed, ", ") // already sorted ascending by W14 loader
+			stepPrompt = fmt.Sprintf(
+				"You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are: %s. If you do not call the tool with a valid outcome, the step will fail.\n\n%s",
+				outcomeList, stepPrompt,
+			)
+		}
 	}
 
 	if contracts := contractConveyance(contracts); contracts != "" {
@@ -971,9 +989,43 @@ func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.O
 	return stepPrompt
 }
 
+// outcomeMenu renders the allowed-outcomes menu for the Execute preamble
+// (KB-260). When at least one allowed outcome carries a description, the menu
+// is one line per outcome — "- name — description" (bare "- name" when an
+// individual description is empty) — so the verdict menu is prompt-prose
+// visible at the step where the model finalizes ("stop Remain swallowing it"
+// — KB-259 acceptance: names compiled with descriptions must render both).
+// When no description travels, the flat legacy name list renders instead
+// (composeExecutePrompt keeps the legacy preamble byte-for-byte). Callers
+// keep the loader's sorted order; the menu must not re-sort.
+func outcomeMenu(allowed []string, descriptions map[string]string) string {
+	hasDescriptions := false
+	for _, name := range allowed {
+		if strings.TrimSpace(descriptions[name]) != "" {
+			hasDescriptions = true
+			break
+		}
+	}
+	if !hasDescriptions {
+		return ""
+	}
+	lines := make([]string, 0, len(allowed))
+	for _, name := range allowed {
+		if d := strings.TrimSpace(descriptions[name]); d != "" {
+			lines = append(lines, fmt.Sprintf("- %s — %s", name, d))
+		} else {
+			lines = append(lines, fmt.Sprintf("- %s", name))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // contractConveyance renders the per-step contract block the model sees: what
 // each contracted outcome requires of the payload and comment, and which
-// outcome is the fallback. Empty when there are no contracts.
+// outcome is the fallback. Empty when there are no contracts. Typed
+// (schema-declaring) contracts also convey the payload-as-output doctrine:
+// the payload is the output and a top-level reason is a wrong-lane
+// submission (KB-263; the static schema's docs teach the same lane split).
 func contractConveyance(contracts []*v2.OutcomeContract) string {
 	if len(contracts) == 0 {
 		return ""
@@ -986,6 +1038,7 @@ func contractConveyance(contracts []*v2.OutcomeContract) string {
 		if schema := string(contract.GetSchemaJson()); strings.TrimSpace(schema) != "" {
 			reqs = append(reqs, fmt.Sprintf(
 				"when finalizing with this outcome, the submit_outcome call must include a `payload` argument — a JSON object matching this JSON Schema: %s", schema))
+			reqs = append(reqs, "the payload is the output — findings belong under the payload's declared fields and the finalization must not carry a top-level `reason`")
 		}
 		if contract.GetRequireComment() {
 			reqs = append(reqs, "when finalizing with this outcome, the submit_outcome call must include a non-empty `comment` argument (require_comment)")

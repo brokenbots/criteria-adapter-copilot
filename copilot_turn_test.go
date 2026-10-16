@@ -859,7 +859,7 @@ func TestEvidenceSnippet(t *testing.T) {
 // the finalize (degraded).
 func TestComposeExecutePromptShapes(t *testing.T) {
 	const stepPrompt = "review the worktree diff"
-	legacy := composeExecutePrompt(stepPrompt, []string{"approved", "failure"}, nil, nil, &sessionState{}, nil)
+	legacy := composeExecutePrompt(stepPrompt, []string{"approved", "failure"}, nil, nil, &sessionState{}, nil, nil)
 	wantLegacy := "You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are: approved, failure. If you do not call the tool with a valid outcome, the step will fail.\n\nreview the worktree diff"
 	if legacy != wantLegacy {
 		t.Errorf("legacy shape drift:\n got %q\nwant %q", legacy, wantLegacy)
@@ -872,7 +872,7 @@ func TestComposeExecutePromptShapes(t *testing.T) {
 		{Name: "approved", SchemaJson: []byte(`{"type":"object"}`), RequireComment: true},
 		{Name: "stalled", Fallback: true},
 	}
-	withContract := composeExecutePrompt(stepPrompt, []string{"approved", "stalled"}, contracts, nil, &sessionState{}, nil)
+	withContract := composeExecutePrompt(stepPrompt, []string{"approved", "stalled"}, contracts, nil, &sessionState{}, nil, nil)
 	for _, want := range []string{"Finalization contracts", `"approved"`, `"stalled"`, "require_comment", "fallback contract"} {
 		if !strings.Contains(withContract, want) {
 			t.Errorf("contract shape missing %q:\n%s", want, withContract)
@@ -882,7 +882,7 @@ func TestComposeExecutePromptShapes(t *testing.T) {
 	rejection := &v2.ExecutionRejection{Outcome: "approved", Issues: "the payload misses the verdict", Attempt: 2}
 	liveSession := &sessionState{createdEpoch: 1, finalizeSessionEpoch: 1}
 	reopenedSession := &sessionState{createdEpoch: 2, finalizeSessionEpoch: 1}
-	repair := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, liveSession, nil)
+	repair := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, liveSession, nil, nil)
 	for _, want := range []string{`Rejected outcome: "approved"`, "Issues reported by the workflow", "Resubmit the finalize now"} {
 		if !strings.Contains(repair, want) {
 			t.Errorf("in-session repair shape missing %q:\n%s", want, repair)
@@ -892,7 +892,7 @@ func TestComposeExecutePromptShapes(t *testing.T) {
 		t.Errorf("in-session repair shape must stay minimal, got the full step prompt:\n%s", repair)
 	}
 
-	degraded := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, reopenedSession, nil)
+	degraded := composeExecutePrompt(stepPrompt, []string{"approved"}, nil, rejection, reopenedSession, nil, nil)
 	for _, want := range []string{stepPrompt, `(outcome "approved", attempt 2)`, "Its reported issues were", "Address these issues"} {
 		if !strings.Contains(degraded, want) {
 			t.Errorf("degraded shape missing %q:\n%s", want, degraded)
@@ -902,8 +902,8 @@ func TestComposeExecutePromptShapes(t *testing.T) {
 	// Issue text quotes model-generated content: it must not leak a held
 	// secret through either repair shape.
 	leaky := &v2.ExecutionRejection{Outcome: "approved", Issues: "verdict swordfish was not in the enum", Attempt: 1}
-	leakyRepair := composeExecutePrompt("step", []string{"approved"}, nil, leaky, liveSession, []string{"swordfish"})
-	leakyDegraded := composeExecutePrompt("step", []string{"approved"}, nil, leaky, reopenedSession, []string{"swordfish"})
+	leakyRepair := composeExecutePrompt("step", []string{"approved"}, nil, leaky, liveSession, []string{"swordfish"}, nil)
+	leakyDegraded := composeExecutePrompt("step", []string{"approved"}, nil, leaky, reopenedSession, []string{"swordfish"}, nil)
 	if strings.Contains(leakyRepair, "swordfish") || strings.Contains(leakyDegraded, "swordfish") {
 		t.Errorf("repair prompts leak held secrets:\n%s\n%s", leakyRepair, leakyDegraded)
 	}
@@ -929,6 +929,68 @@ func TestContractConveyanceRendering(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("conveyance missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// KB-260: typed (schema-declaring) contracts convey the payload-as-output
+// doctrine alongside the schema — findings belong under the payload's
+// declared fields and a top-level reason is a wrong-lane submission; the
+// schemaless and fallback contracts gain no such clause (their lanes are not
+// payload-schema lanes).
+func TestContractConveyancePayloadAsOutputOnTypedContracts(t *testing.T) {
+	typedOnly := contractConveyance([]*v2.OutcomeContract{
+		{Name: "approved", SchemaJson: []byte(`{"type":"object"}`)},
+	})
+	for _, want := range []string{"the payload is the output", "findings belong under the payload's declared fields", "must not carry a top-level `reason`"} {
+		if !strings.Contains(typedOnly, want) {
+			t.Errorf("typed contract conveyance missing %q:\n%s", want, typedOnly)
+		}
+	}
+
+	schemaless := contractConveyance([]*v2.OutcomeContract{
+		{Name: "unspecified"},
+		{Name: "stalled", Fallback: true},
+	})
+	if strings.Contains(schemaless, "the payload is the output") {
+		t.Errorf("schemaless/fallback conveyance must not teach payload-as-output:\n%s", schemaless)
+	}
+}
+
+// KB-260: once outcome descriptions travel (the proto carrier), the
+// allowed-outcomes menu renders one "name — description" line per outcome so
+// the verdict menu is prompt-visible prose — and a bare name renders alone
+// when its individual description is empty. With no descriptions the legacy
+// flat preamble renders byte-for-byte (asserted at
+// TestComposeExecutePromptShapes); partial/described menus take the
+// multi-line branch.
+func TestComposeExecutePromptDescriptionMenu(t *testing.T) {
+	const stepPrompt = "review the worktree diff"
+	prompt := composeExecutePrompt(stepPrompt,
+		[]string{"approved", "failure"}, nil, nil, &sessionState{}, nil,
+		map[string]string{
+			"approved": "the work meets the review criteria; sign off",
+			"failure":  "",
+		})
+	wantMenu := "You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are:\n" +
+		"- approved — the work meets the review criteria; sign off\n" +
+		"- failure\n" +
+		"\nIf you do not call the tool with a valid outcome, the step will fail.\n\n" +
+		"review the worktree diff"
+	if prompt != wantMenu {
+		t.Errorf("described menu drift:\n got %q\nwant %q", prompt, wantMenu)
+	}
+
+	// Descriptions only for names outside the allowed set do not flip the
+	// menu to the described branch.
+	legacy := composeExecutePrompt(stepPrompt,
+		[]string{"approved", "failure"}, nil, nil, &sessionState{}, nil,
+		map[string]string{"stalled": "stalled prose"})
+	if strings.Contains(legacy, "- approved") || strings.Contains(legacy, "The allowed outcomes are:\n") {
+		t.Errorf("descriptions for unallowed outcomes must not flip the menu:\n%s", legacy)
+	}
+	wantLegacy := "The allowed outcomes are: approved, failure."
+	if !strings.Contains(legacy, wantLegacy) {
+		t.Errorf("legacy shape drifted under nil descriptions:\n%s", legacy)
 	}
 }
 
