@@ -37,26 +37,38 @@ const maxContractIssueLen = 2000
 // outcome contracts (v0.7.0 contract mode), the matched contract's schema —
 // both carried on sessionState.
 //
-// KB-216: the parameter contract is DECLARED, not implicit. outcome and reason
-// are required members of the schema the model sees; comment and payload are
+// KB-216: the parameter contract is DECLARED, not implicit. outcome is the
+// required member of the schema the model sees (the only per-lane
+// universal); reason is the findings surface of the contract-less legacy
+// lane — its requirement is lane-specific; comment and payload are
 // the optional contract-mode members; and a call carrying keys outside the
 // declared set fails loudly (decodeSubmitOutcomeArgs) instead of Go's default
 // unknown-key tolerance silently dropping the text — the observed failure had
 // all findings under an undeclared parameter name evaporate with no retry
 // signal. There is deliberately NO comment→reason alias (dave ruling
-// 2026-10-08): reason is the only findings surface, and the schema says so.
+// 2026-10-08): reason is the only findings surface of the legacy lane, and
+// the schema says so.
 //
 // KB-263 ruling (dave, 10-14): reason is the findings surface for UNTYPED
 // outcomes only. On a typed step (the chosen outcome's contract declares a
 // payload schema) the payload IS the output and there is no top-level reason
 // lane — the handler rejects a finalize carrying reason (wrong-lane
 // submission) with the same typed not-consumed shape, and the
-// outcome.finalized event renders the operative prose from the payload. The
-// static schema still advertises reason as required to the model; that
-// mis-teaching is repaired by the KB-260 re-bind, not here.
+// outcome.finalized event renders the operative prose from the payload.
+//
+// KB-260 re-bind (dave, 10-14): the static schema previously advertised
+// top-level reason as uniformly required, mis-teaching typed steps (the
+// model paid a reason onto a lane whose output is the payload). The schema's
+// docs now teach the per-step lanes — reason required on contract-less
+// steps, payload-as-output on schema-declaring contracts — while the
+// per-step truth stays prompt-conveyed and handler-enforced: SDK tools bind
+// per session, so no per-step required list is expressible on the static
+// schema itself, and the legacy lane's reason requirement is enforced in
+// turn (an empty/absent reason on a step without outcome contracts is
+// rejected — KB-260 review B1).
 type SubmitOutcomeArgs struct {
 	Outcome string `json:"outcome"`          // required; must be a member of the active allowed set
-	Reason  string `json:"reason,omitempty"` // required by the declared schema; ALL of the step's findings/prose must be submitted here
+	Reason  string `json:"reason,omitempty"` // required-and-enforced on contract-less steps; typed steps must not send it (KB-263 wrong-lane)
 
 	// Comment and Payload are the optional contract-mode members: consumed only
 	// when the step carries outcome contracts (comment is mandatory when the
@@ -80,21 +92,23 @@ var declaredSubmitOutcomeParams = []string{"comment", "outcome", "payload", "rea
 // undeclared or that text belongs somewhere else).
 var submitOutcomeParamDocs = map[string][2]string{
 	"outcome": {"string", "Required. The step's final outcome; must be one of the allowed outcomes conveyed in the step prompt."},
-	"reason":  {"string", "Required. The finalize reason: ALL of the step's findings, review feedback, and prose justification belong here as the value of reason; the workflow renders the step's findings from reason. Never submit findings text under comment or any other parameter."},
+	"reason":  {"string", "Required on steps without outcome contracts (an empty reason is rejected in-turn on such steps): ALL of the step's findings, review feedback, and prose justification belong here as the value of reason, and the workflow renders the step's findings from reason. Never submit findings text under comment or any other parameter."},
 	"comment": {"string", "Optional finalize comment; consumed only when the step carries outcome contracts. Mandatory when the step's contract for the chosen outcome sets require_comment (the prompt says when). Findings text still belongs in reason — do not submit feedback as the comment."},
-	"payload": {"object", "Optional JSON object payload; consumed only when the step carries outcome contracts. When contracts are present, the payload must satisfy the contract's schema for the chosen outcome and is forwarded to the workflow verbatim."},
+	"payload": {"object", "Optional JSON object payload; consumed only when the step carries outcome contracts. When the contract for the chosen outcome declares a payload schema, the payload IS the output — the declared schema's fields are the submission surface; the payload must satisfy that schema and is forwarded to the workflow verbatim, and no top-level reason is consumed (submitting one is a wrong-lane rejection)."},
 }
 
 // submitOutcomeToolParameters is the static parameter JSON Schema the
 // hand-built submit_outcome tool presents to the model. KB-216: it declares
-// the full parameter contract — outcome and reason as required members, the
-// contract-mode comment/payload members as optional, and additionalProperties
-// false — so a call that does not match is a loud rejection instead of a
-// silently-accepted shape. The enforceable per-step specifics (allowed set,
-// payload schema, require_comment) remain prompt-conveyed and
-// handler-validated, and there is no per-step enum on outcome (SDK tools bind
-// per session), which is what makes per-step contracts possible with a
-// session-bound tool.
+// the full parameter contract — additionalProperties false and per-parameter
+// descriptions that say what belongs where — so a call that does not match is
+// a loud rejection instead of a silently-accepted shape. KB-260 re-bind:
+// `outcome` is the only required member (the per-lane universal); reason's
+// requirement is lane-specific (required on contract-less steps — enforced
+// in-turn — and wrong-lane-rejected on typed steps). The enforceable
+// per-step specifics (allowed set, payload schema, require_comment) remain
+// prompt-conveyed and handler-validated, and there is no per-step enum or
+// required list on outcome (SDK tools bind per session), which is what makes
+// per-step contracts possible with a session-bound tool.
 func submitOutcomeToolParameters() map[string]any {
 	properties := make(map[string]any, len(declaredSubmitOutcomeParams))
 	for _, param := range declaredSubmitOutcomeParams {
@@ -107,7 +121,7 @@ func submitOutcomeToolParameters() map[string]any {
 	return map[string]any{
 		"type":                 "object",
 		"properties":           properties,
-		"required":             []string{"outcome", "reason"},
+		"required":             []string{"outcome"},
 		"additionalProperties": false,
 	}
 }
@@ -462,6 +476,20 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 				subject, verb, quoteJoin(declaredSubmitOutcomeParams),
 			)), nil
 		}
+		// KB-260 (review B1): the legacy lane still requires the reason —
+		// enforced here, not merely doc-taught, because the session-bound
+		// static schema cannot carry a per-step required list. A
+		// contract-less finalize without reason is the KB-216
+		// silent-findings-evaporation class: reject in-turn,
+		// budget-consuming and repairable, mirroring the not-consumed shape
+		// above. Contract-mode steps keep their own lanes: typed outcomes
+		// reject reason as wrong-lane (KB-263), and schemaless contracts
+		// surface findings through the comment lane.
+		if trimmedReason == "" {
+			s.finalizeFailureKind = "invalid_params"
+			s.mu.Unlock()
+			return submitOutcomeError(legacyReasonRequiredMessage()), nil
+		}
 	}
 
 	// Contract mode (v0.7.0 OutcomeContracts present): enforce the typed-lane
@@ -600,6 +628,15 @@ func sortedAllowedOutcomes(set map[string]struct{}) []string {
 // Repairable in-turn within the finalize budget.
 func typedReasonNotConsumedMessage() string {
 	return `submit_outcome rejected: "reason" is not consumed by this typed outcome (its contract declares a payload schema, so the payload is the output). The step's findings belong under the payload's declared fields — the schema's reason field when the contract declares one. Call submit_outcome again without the "reason" parameter.`
+}
+
+// legacyReasonRequiredMessage is the KB-216 rejection text for a
+// contract-less finalize whose top-level reason is empty or absent (KB-260
+// review B1): the workflow renders the step's findings from reason, so an
+// empty reason would silently drop the findings. Repairable in-turn within
+// the finalize budget.
+func legacyReasonRequiredMessage() string {
+	return fmt.Sprintf(`submit_outcome rejected: "reason" is required by this step (no outcome contracts declared): the workflow renders the step's findings from reason, so an empty reason would silently drop the findings. Call submit_outcome again with the declared parameters %s.`, quoteJoin(declaredSubmitOutcomeParams))
 }
 
 // finalizedDisplayReason resolves the reason field of the outcome.finalized

@@ -661,6 +661,99 @@ func TestConformanceContractWrongLaneReasonRejectedInTurn(t *testing.T) {
 	}
 }
 
+// Acceptance (KB-260 review B1, end to end): the legacy lane's reason
+// requirement is enforced in-turn — a contract-less finalize with an empty
+// reason is rejected (budget-consuming), and a reason-bearing resubmit on
+// the same Execute's repair reprompt finalizes with the findings prose
+// reaching the step's outputs.
+func TestConformanceLegacyReasonRequiredRepairInTurn(t *testing.T) {
+	p := newConformanceAdapter(t, map[string]string{
+		"FAKE_COPILOT_SCENARIO": "legacy-reason-repair",
+		"FAKE_COPILOT_OUTCOME":  "approved",
+	})
+	mustOpenConformanceSession(t, p, "kb260-legacy-reason-required")
+	sender := runConformanceExecuteWith(t, p, "kb260-legacy-reason-required", conformanceExecuteOpts{})
+
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "approved" {
+		t.Fatalf("result outcome = %q, want approved after the reason-bearing repair", r.GetOutcome())
+	}
+	// The findings prose reaches the step outputs: steps.<name>.reason is
+	// the legacy lane's workflow surface for finalize findings.
+	if got := outputsOf(t, r)["reason"]; got != "repaired: the findings prose the step required" {
+		t.Errorf("outputs reason = %q, want the resubmitted findings prose", got)
+	}
+	if adapterEventPayload(sender, "turn.finalize_exhausted") != nil {
+		t.Error("finalize_exhausted must not fire on a repaired legacy finalize")
+	}
+}
+
+// Acceptance (KB-260, end to end): described allowed-outcome entries —
+// "name — description" prompt-prose riding AllowedOutcomes through the real
+// Execute handshake — reach the rendered prompt as the verdict menu, so the
+// menu render leg lives in production rather than behind an injected map.
+// The typed step's payload (with the echoed menu line) travels verbatim.
+func TestConformanceDescriptionMenuRenderedInTurn(t *testing.T) {
+	p := newConformanceAdapter(t, map[string]string{
+		"FAKE_COPILOT_SCENARIO": "menu-render-echo",
+		"FAKE_COPILOT_OUTCOME":  "approved",
+		"FAKE_COPILOT_PAYLOAD":  `{"verdict":"approved"}`,
+	})
+	mustOpenConformanceSession(t, p, "kb260-menu-render")
+	sender := runConformanceExecuteWith(t, p, "kb260-menu-render", conformanceExecuteOpts{
+		allowed:   []string{"approved — the work meets the review criteria; sign off", "failure"},
+		contracts: []*v2.OutcomeContract{conformanceContract("approved", conformanceApprovedSchema, false, false)},
+	})
+
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "approved" {
+		t.Fatalf("outcome = %q, want approved", r.GetOutcome())
+	}
+	// The fake echoed the rendered menu line INTO its payload: the described
+	// menu traveled the handshake to the prompt — "- <name> — <description>".
+	const menuLine = "- approved — the work meets the review criteria; sign off"
+	if got := string(r.GetOutputsJson()); !strings.Contains(got, `"menu_line":"`+menuLine+`"`) {
+		t.Errorf("outputs_json = %s, want the rendered menu line carried in payload key menu_line (%s)", got, menuLine)
+	}
+	if r.GetComment() != "" {
+		t.Errorf("comment = %q, want empty on the typed lane", r.GetComment())
+	}
+	if adapterEventPayload(sender, "turn.finalize_exhausted") != nil {
+		t.Error("finalize_exhausted must not fire for the described payload finalize")
+	}
+}
+
+// Acceptance (KB-260): a described AllowedOutcomes carrier on a step WITHOUT
+// outcome contracts must not flip contract mode — the step stays on the
+// legacy lane (reason consumed), which this fake scenario proves
+// behaviorally: its reason prose IS the echoed menu line, and only a
+// legacy-mode finalize would accept and forward it to the step outputs.
+func TestConformanceDescriptionsDoNotFlipContractMode(t *testing.T) {
+	p := newConformanceAdapter(t, map[string]string{
+		"FAKE_COPILOT_SCENARIO": "legacy-reason-echo",
+		"FAKE_COPILOT_OUTCOME":  "approved",
+	})
+	mustOpenConformanceSession(t, p, "kb260-menu-no-flip")
+	sender := runConformanceExecuteWith(t, p, "kb260-menu-no-flip", conformanceExecuteOpts{
+		allowed: []string{"approved — the work meets the review criteria; sign off", "failure"},
+	})
+
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "approved" {
+		t.Fatalf("outcome = %q, want approved (descriptions must not change the lane)", r.GetOutcome())
+	}
+	const menuLine = "- approved — the work meets the review criteria; sign off"
+	if got := outputsOf(t, r); got["reason"] != menuLine {
+		t.Errorf("outputs reason = %q, want the echoed menu line (legacy reason lane consumed it)", got["reason"])
+	}
+	if r.GetComment() != "" {
+		t.Errorf("comment = %q, want empty (legacy result carries no comment)", r.GetComment())
+	}
+	if adapterEventPayload(sender, "turn.finalize_exhausted") != nil {
+		t.Error("finalize_exhausted must not fire for the described legacy finalize")
+	}
+}
+
 // Acceptance (KB-263): outcome.finalized.reason mirrors the payload's
 // schema-reason prose when the contract schema declares a reason field — the
 // operative findings, not the legacy parameter.
@@ -690,5 +783,91 @@ func TestConformanceTypedFinalizedRendersPayloadSchemaReason(t *testing.T) {
 	}
 	if reason, _ := a["reason"].(string); reason != "findings: payload prose through the wire" {
 		t.Errorf("outcome.finalized reason = %q, want the payload's schema-reason prose", reason)
+	}
+}
+
+// ── KB-260 conformance tests ────────────────────────────────────────────────
+
+// Acceptance (KB-260): a mixed-shape step uses its per-step binding. The
+// Execute handshake carries BOTH lanes — a typed (schema-declaring) contract
+// and an untyped one — and one session finalizes each outcome in its own
+// lane: the typed lane payload-only (the payload is the output, forwarded
+// verbatim, no top-level reason), and the untyped lane with the legacy
+// reason prose and no payload (carrying reason is correct on a schemaless
+// contract; the reason lane is unconsumed wire-side there — it belongs to
+// the legacy lane's display surface only).
+func TestConformanceMixedLanePerStepBinding(t *testing.T) {
+	const payload = `{"note":"typed lane","verdict":"approved"}`
+	p := newConformanceAdapter(t, map[string]string{
+		"FAKE_COPILOT_SCENARIO": "mixed-lane-contract",
+		"FAKE_COPILOT_OUTCOME":  "approved",
+		"FAKE_COPILOT_PAYLOAD":  payload,
+		"FAKE_COPILOT_OUTCOME2": "failure",
+		"FAKE_COPILOT_REASON2":  "legacy lane prose for the untyped contract outcome",
+	})
+	mustOpenConformanceSession(t, p, "kb260-mixed")
+	// Mixed step: the typed approved contract next to a schemaless failure
+	// contract.
+	contracts := []*v2.OutcomeContract{
+		conformanceContract("approved", conformanceApprovedSchema, false, false),
+		conformanceContract("failure", "", false, false),
+	}
+	opts := conformanceExecuteOpts{
+		allowed:   []string{"approved", "failure"},
+		contracts: contracts,
+	}
+
+	// Execute #1: the typed lane — payload-only finalization accepted.
+	sender1 := runConformanceExecuteWith(t, p, "kb260-mixed", opts)
+	r1 := resultFromSender(sender1)
+	if r1.GetOutcome() != "approved" {
+		t.Fatalf("execute #1 outcome = %q, want approved (typed lane)", r1.GetOutcome())
+	}
+	if got := string(r1.GetOutputsJson()); got != payload {
+		t.Errorf("execute #1 outputs_json = %s, want the payload verbatim %s", got, payload)
+	}
+	if adapterEventPayload(sender1, "turn.finalize_exhausted") != nil {
+		t.Error("unexpected finalize_exhausted on the typed lane")
+	}
+	// The typed lane carries no comment either (the contract sets no
+	// require_comment), and the finalize is payload-as-output.
+	if r1.GetComment() != "" {
+		t.Errorf("execute #1 comment = %q, want empty", r1.GetComment())
+	}
+
+	// Execute #2: the untyped lane — the legacy reason prose finalization is
+	// accepted (per-step binding), with no payload and no comment.
+	sender2 := runConformanceExecuteWith(t, p, "kb260-mixed", opts)
+	r2 := resultFromSender(sender2)
+	if r2.GetOutcome() != "failure" {
+		t.Fatalf("execute #2 outcome = %q, want failure (untyped lane)", r2.GetOutcome())
+	}
+	if got := string(r2.GetOutputsJson()); got != `{}` {
+		t.Errorf("execute #2 outputs_json = %s, want the normalized empty payload {}", got)
+	}
+	if r2.GetComment() != "" {
+		t.Errorf("execute #2 comment = %q, want empty (reason is the untyped submission's findings lane)", r2.GetComment())
+	}
+	if adapterEventPayload(sender2, "turn.finalize_exhausted") != nil {
+		t.Error("a schemaless contract finalize carrying reason must not be rejected as a wrong-lane submission")
+	}
+
+	// KB-260 review B3: the untyped lane's reason prose must survive to its
+	// render lane — the outcome.finalized display reason carries the legacy
+	// finalize prose on schemaless lanes (proto v0.7.0 ExecuteResult has no
+	// reason field; the schemaless lane's findings surface is the display
+	// event's reason, with the result lane riding the comment).
+	if finalized := adapterEventPayload(sender2, "outcome.finalized"); finalized == nil {
+		t.Error("outcome.finalized event missing on the untyped lane")
+	} else if got, _ := finalized["reason"].(string); got != "legacy lane prose for the untyped contract outcome" {
+		t.Errorf("untyped lane outcome.finalized display reason = %q, want the finalize's legacy reason prose (the findings must not evaporate)", got)
+	}
+	// ...and the typed lane renders payload-sourced prose or nothing — never
+	// the legacy reason parameter (the lane split is observable on the
+	// display lane too).
+	if finalized := adapterEventPayload(sender1, "outcome.finalized"); finalized == nil {
+		t.Error("outcome.finalized event missing on the typed lane")
+	} else if got, _ := finalized["reason"].(string); got == "" || got == "legacy lane prose for the untyped contract outcome" {
+		t.Errorf("typed lane outcome.finalized display reason = %q, want a payload-sourced render (the legacy prose must not leak onto the typed lane)", got)
 	}
 }
