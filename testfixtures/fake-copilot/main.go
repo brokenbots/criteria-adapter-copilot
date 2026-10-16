@@ -256,6 +256,20 @@ func outcomeEnvOverride(envKey, def string) string {
 	return def
 }
 
+// echoMenuLine returns the rendered allowed-outcomes menu line for the given
+// outcome in a copilot prompt ("- <name> — <description>", KB-260): the
+// description carrier the adapter renders into the prompt prose. Returns ""
+// when the prompt carries no such menu line.
+func echoMenuLine(prompt, outcome string) string {
+	prefix := "- " + outcome + " — "
+	for _, line := range strings.Split(prompt, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	return ""
+}
+
 func main() {
 	r := bufio.NewReader(os.Stdin)
 	for {
@@ -545,6 +559,42 @@ func handleSessionSend(msg *rpcMsg) {
 
 		case "missing":
 			sendEvent(p.SessionID, "session.idle", map[string]any{})
+
+		case "legacy-reason-repair":
+			// KB-260 review B1: the model finalizes the contract-less step
+			// with an empty reason — rejected in-turn because the legacy
+			// lane's reason is enforced — then resubmits with the reason
+			// prose on the same Execute's repair reprompt.
+			if turn == 1 {
+				sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "")
+			} else {
+				sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "repaired: the findings prose the step required")
+			}
+
+		case "menu-render-echo":
+			// KB-260: echo the rendered allowed-outcomes menu line for the
+			// described outcome into the submitted payload, so a conformance
+			// test can prove the "name — description" menu traveled the real
+			// Execute handshake into the prompt.
+			fields := scenarioContractFields(p.Prompt, scenarioPayload1Env)
+			if menuLine := echoMenuLine(p.Prompt, submitOutcomeOverride("approved")); menuLine != "" {
+				if obj, _ := fields["payload"].(map[string]any); obj != nil {
+					obj["menu_line"] = menuLine
+				}
+			}
+			sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", fields))
+
+		case "legacy-reason-echo":
+			// KB-260: submit the bare outcome name with the rendered menu
+			// line as the legacy-lane reason prose. If the described
+			// carrier had flipped contract mode, the reason would be
+			// unconsumed on a contract-less-turned-typed step and the
+			// finalize would fail — the flip is observable in the test.
+			menuLine := echoMenuLine(p.Prompt, submitOutcomeOverride("approved"))
+			if menuLine == "" {
+				menuLine = "menu missing: the prompt carried no described outcome line"
+			}
+			sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), menuLine)
 
 		default:
 			// Unknown scenario: treat as success.

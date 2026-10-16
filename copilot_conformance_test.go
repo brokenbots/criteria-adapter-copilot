@@ -661,6 +661,33 @@ func TestConformanceContractWrongLaneReasonRejectedInTurn(t *testing.T) {
 	}
 }
 
+// Acceptance (KB-260 review B1, end to end): the legacy lane's reason
+// requirement is enforced in-turn — a contract-less finalize with an empty
+// reason is rejected (budget-consuming), and a reason-bearing resubmit on
+// the same Execute's repair reprompt finalizes with the findings prose
+// reaching the step's outputs.
+func TestConformanceLegacyReasonRequiredRepairInTurn(t *testing.T) {
+	p := newConformanceAdapter(t, map[string]string{
+		"FAKE_COPILOT_SCENARIO": "legacy-reason-repair",
+		"FAKE_COPILOT_OUTCOME":  "approved",
+	})
+	mustOpenConformanceSession(t, p, "kb260-legacy-reason-required")
+	sender := runConformanceExecuteWith(t, p, "kb260-legacy-reason-required", conformanceExecuteOpts{})
+
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "approved" {
+		t.Fatalf("result outcome = %q, want approved after the reason-bearing repair", r.GetOutcome())
+	}
+	// The findings prose reaches the step outputs: steps.<name>.reason is
+	// the legacy lane's workflow surface for finalize findings.
+	if got := outputsOf(t, r)["reason"]; got != "repaired: the findings prose the step required" {
+		t.Errorf("outputs reason = %q, want the resubmitted findings prose", got)
+	}
+	if adapterEventPayload(sender, "turn.finalize_exhausted") != nil {
+		t.Error("finalize_exhausted must not fire on a repaired legacy finalize")
+	}
+}
+
 // Acceptance (KB-263): outcome.finalized.reason mirrors the payload's
 // schema-reason prose when the contract schema declares a reason field — the
 // operative findings, not the legacy parameter.

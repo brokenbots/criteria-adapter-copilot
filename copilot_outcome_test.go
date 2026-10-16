@@ -189,7 +189,7 @@ func TestHandleSubmitOutcomeDuplicate(t *testing.T) {
 	s := stateWithOutcomes("success", "failure")
 	p := outcomeAdapter(s)
 
-	if _, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success"}); err != nil {
+	if _, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success", Reason: "first-pass findings"}); err != nil {
 		t.Fatalf("first call: unexpected Go error: %v", err)
 	}
 
@@ -226,7 +226,7 @@ func TestHandleSubmitOutcomeDuplicateInvalidArgs(t *testing.T) {
 	s := stateWithOutcomes("success", "failure")
 	p := outcomeAdapter(s)
 
-	if _, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success"}); err != nil {
+	if _, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success", Reason: "first-pass findings"}); err != nil {
 		t.Fatalf("first call: unexpected Go error: %v", err)
 	}
 
@@ -259,6 +259,83 @@ func TestHandleSubmitOutcomeUnknownSession(t *testing.T) {
 	}
 	if res.ResultType != "failure" {
 		t.Errorf("ResultType = %q, want %q", res.ResultType, "failure")
+	}
+}
+
+// Test (KB-260 review B1): the contract-less lane still REQUIRES the reason,
+// enforced in-turn. A finalize with an allowed outcome but an empty/absent
+// reason is rejected (loud, repairable, budget-consuming — the KB-216
+// not-consumed shape), a reason-bearing resubmit finalizes with the findings
+// preserved, and contract-mode lanes are NOT subject to this check
+// (schemaless contracts accept an empty reason — findings ride the comment
+// lane — and typed ones reject it as wrong-lane, KB-263).
+func TestHandleSubmitOutcomeLegacyReasonRequired(t *testing.T) {
+	s := stateWithOutcomes("success", "failure")
+	p := outcomeAdapter(s)
+
+	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success"})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.ResultType != "failure" {
+		t.Errorf("ResultType = %q, want %q (empty reason must be rejected)", res.ResultType, "failure")
+	}
+	if !strings.Contains(res.TextResultForLLM, `"reason" is required by this step`) {
+		t.Errorf("TextResultForLLM %q should name the missing reason", res.TextResultForLLM)
+	}
+	if !strings.Contains(res.TextResultForLLM, "renders the step's findings from reason") {
+		t.Errorf("TextResultForLLM %q should teach where the findings belong (KB-216 shape)", res.TextResultForLLM)
+	}
+
+	s.mu.Lock()
+	attempts, kind := s.finalizeAttempts, s.finalizeFailureKind
+	s.mu.Unlock()
+	if attempts != 1 {
+		t.Errorf("finalizeAttempts = %d, want 1 (the rejection must be budget-consuming)", attempts)
+	}
+	if kind != "invalid_params" {
+		t.Errorf("finalizeFailureKind = %q, want %q", kind, "invalid_params")
+	}
+
+	// Resubmit with the reason: accepted, findings preserved.
+	if res, err = p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success", Reason: "legacy findings prose"}); err != nil {
+		t.Fatalf("resubmit: unexpected Go error: %v", err)
+	}
+	if res.ResultType != "success" {
+		t.Errorf("resubmit ResultType = %q, want %q", res.ResultType, "success")
+	}
+	s.mu.Lock()
+	outcome, reason := s.finalizedOutcome, s.finalizedReason
+	s.mu.Unlock()
+	if outcome != "success" {
+		t.Errorf("finalizedOutcome = %q, want %q", outcome, "success")
+	}
+	if reason != "legacy findings prose" {
+		t.Errorf("finalizedReason = %q, want the resubmitted findings prose", reason)
+	}
+
+	// The contract-mode untyped lane is unchanged: a schemaless contract
+	// matched with an empty reason is still accepted (findings ride the
+	// comment lane; the legacy reason check is scoped to contract-less
+	// steps).
+	cs := &sessionState{
+		session:               &fakeSession{},
+		activeAllowedOutcomes: map[string]struct{}{"unspecified": {}, "approved": {}},
+		contractMode:          true,
+		activeContracts:       map[string]*v2.OutcomeContract{"unspecified": {Name: "unspecified"}},
+	}
+	cp := outcomeAdapter(cs)
+	if res, err = cp.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "unspecified"}); err != nil {
+		t.Fatalf("schemaless empty-reason finalize: unexpected Go error: %v", err)
+	}
+	if res.ResultType != "success" {
+		t.Errorf("schemaless empty-reason ResultType = %q, want %q (contract lanes are not legacy-reason-scoped)", res.ResultType, "success")
+	}
+	cs.mu.Lock()
+	untypedOutcome := cs.finalizedOutcome
+	cs.mu.Unlock()
+	if untypedOutcome != "unspecified" {
+		t.Errorf("finalizedOutcome = %q, want %q", untypedOutcome, "unspecified")
 	}
 }
 
@@ -720,8 +797,10 @@ func TestSubmitOutcome_InvalidEnumThenSuccess(t *testing.T) {
 			}
 		case 1:
 			// Turn 2: model corrects the call; handler accepts and sets
-			// finalizedOutcome = "success".
-			if _, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success"}); err != nil {
+			// finalizedOutcome = "success". The legacy lane's reason is
+			// enforced in-turn (KB-260 review B1), so the corrected call
+			// carries it.
+			if _, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "success", Reason: "success lane findings"}); err != nil {
 				t.Errorf("handleSubmitOutcome turn 2: unexpected error: %v", err)
 			}
 		}
