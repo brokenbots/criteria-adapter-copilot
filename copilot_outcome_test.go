@@ -1219,10 +1219,13 @@ func TestCheckContractFinalizeClassification(t *testing.T) {
 // ── strict parameter contract tests (KB-216) ─────────────────────────────────
 
 // The schema the model sees must declare the full parameter contract: exactly
-// the declared (declaredSubmitOutcomeParams) member set, outcome and reason
-// required, additionalProperties false, and per-parameter descriptions telling
-// the model what belongs where. The struct's JSON tags must match the declared
-// set so the decode accept-set cannot drift from either surface.
+// the declared (declaredSubmitOutcomeParams) member set, `outcome` as the
+// only uniformly-required member (KB-260 re-bind: reason's requirement is
+// lane-specific — schema-less legacy steps require it in the docs, typed
+// steps reject it as a wrong-lane submission), additionalProperties false,
+// and per-parameter descriptions telling the model what belongs where. The
+// struct's JSON tags must match the declared set so the decode accept-set
+// cannot drift from either surface.
 func TestSubmitOutcomeToolParametersContract(t *testing.T) {
 	schema := submitOutcomeToolParameters()
 
@@ -1239,7 +1242,7 @@ func TestSubmitOutcomeToolParametersContract(t *testing.T) {
 		t.Errorf("schema properties = %v, want declared set %v", gotProps, declaredSubmitOutcomeParams)
 	}
 
-	wantRequired := []string{"outcome", "reason"}
+	wantRequired := []string{"outcome"}
 	gotRequiredAny, ok := schema["required"].([]string)
 	if !ok {
 		t.Fatalf("schema.required is %T, want []string", schema["required"])
@@ -1263,10 +1266,21 @@ func TestSubmitOutcomeToolParametersContract(t *testing.T) {
 	}
 
 	// The doc text is part of the contract: findings must be pointed at
-	// reason, and comment must say when it is mandatory.
+	// reason, comment must say when it is mandatory, and (KB-260) the docs
+	// must teach the per-step lanes — reason's requirement is scoped to
+	// steps without outcome contracts, and the payload doc must carry the
+	// payload-as-output doctrine for typed (schema-declaring) contracts.
 	for _, fragment := range []string{"reason", "findings"} {
 		if !strings.Contains(submitOutcomeParamDocs["reason"][1], fragment) {
 			t.Errorf("reason doc %q should mention %q", submitOutcomeParamDocs["reason"][1], fragment)
+		}
+	}
+	if !strings.Contains(submitOutcomeParamDocs["reason"][1], "without outcome contracts") {
+		t.Errorf("reason doc %q should scope its requirement to steps without outcome contracts", submitOutcomeParamDocs["reason"][1])
+	}
+	for _, fragment := range []string{"IS the output", "submission surface", "wrong-lane"} {
+		if !strings.Contains(submitOutcomeParamDocs["payload"][1], fragment) {
+			t.Errorf("payload doc %q should teach the payload-as-output doctrine %q", submitOutcomeParamDocs["payload"][1], fragment)
 		}
 	}
 	if !strings.Contains(submitOutcomeParamDocs["comment"][1], "require_comment") {
