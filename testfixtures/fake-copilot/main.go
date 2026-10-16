@@ -88,6 +88,17 @@
 //	result and resubmits payload-only (no reason) before idling, so the repair
 //	lands inside the same turn's finalize budget and the finalize happens once.
 //
+// "mixed-lane-contract" (KB-260):
+//
+//	One session, per-step lanes both live: turn 1 (Execute #1) finalizes the
+//	typed lane payload-only (FAKE_COPILOT_PAYLOAD, no reason — the payload is
+//	the output). Turn 2 (Execute #2 on the same session) finalizes the untyped
+//	lane with the legacy reason prose (FAKE_COPILOT_OUTCOME2 + a top-level
+//	reason, no payload) — carrying reason on a schemaless contract is a
+//	correct submission there, never a wrong-lane rejection. The pair proves a
+//	mixed step's per-step binding: each submit lands in its own outcome's
+//	lane.
+//
 // The contract-* scenarios submit NO top-level reason on their own submits:
 // conformance contracts declare payload schemas (typed outcomes, KB-263), so
 // the payload is the output and a schema-declaring contract never consumes the
@@ -96,6 +107,9 @@
 // FAKE_COPILOT_OUTCOME overrides the outcome value submitted on success
 // paths (default "success") — used by review-step conformance tests, whose
 // steps declare outcomes like "approved".
+//
+// FAKE_COPILOT_OUTCOME2 / FAKE_COPILOT_REASON2 are the second-stage outcome
+// and reason for the mixed-lane-contract scenario's untyped-lane submit.
 //
 // FAKE_COPILOT_PAYLOAD / FAKE_COPILOT_COMMENT (and the *2 repair-stage
 // variants) are JSON-object strings decoded into the submit_outcome tool-call
@@ -227,6 +241,16 @@ func currentToolMetadata() []fakeToolMeta {
 // FAKE_COPILOT_OUTCOME when set (non-empty), else the given default.
 func submitOutcomeOverride(def string) string {
 	if v := strings.TrimSpace(os.Getenv("FAKE_COPILOT_OUTCOME")); v != "" {
+		return v
+	}
+	return def
+}
+
+// outcomeEnvOverride returns the named FAKE_COPILOT_* env value (trimmed,
+// non-empty) or the given default — the second-stage lane inputs of the
+// mixed-lane-contract scenario (FAKE_COPILOT_OUTCOME2 / REASON2, KB-260).
+func outcomeEnvOverride(envKey, def string) string {
+	if v := strings.TrimSpace(os.Getenv(envKey)); v != "" {
 		return v
 	}
 	return def
@@ -463,6 +487,18 @@ func handleSessionSend(msg *rpcMsg) {
 				fmt.Fprintf(os.Stderr, "fake-copilot: wrong-lane submit was NOT rejected: %q\n", toolCallResults[reqID])
 			}
 			sendEvent(p.SessionID, "session.idle", map[string]any{})
+
+		case "mixed-lane-contract":
+			// KB-260: per-step binding on one mixed-shape step. Turn 1
+			// (Execute #1) finalizes the typed lane payload-only — the
+			// payload is the output, no reason. Turn 2 (Execute #2) finalizes
+			// the untyped lane with the legacy reason prose and no payload —
+			// carrying reason is correct on a schemaless contract.
+			if turn == 1 {
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+			} else {
+				sendArgsAndIdle(p.SessionID, submitArgs(outcomeEnvOverride("FAKE_COPILOT_OUTCOME2", "failure"), outcomeEnvOverride("FAKE_COPILOT_REASON2", "legacy lane prose for the untyped contract outcome"), nil))
+			}
 
 		case "success-after-reprompt-1":
 			if turn == 1 {

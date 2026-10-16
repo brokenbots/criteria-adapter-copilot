@@ -692,3 +692,70 @@ func TestConformanceTypedFinalizedRendersPayloadSchemaReason(t *testing.T) {
 		t.Errorf("outcome.finalized reason = %q, want the payload's schema-reason prose", reason)
 	}
 }
+
+// ── KB-260 conformance tests ────────────────────────────────────────────────
+
+// Acceptance (KB-260): a mixed-shape step uses its per-step binding. The
+// Execute handshake carries BOTH lanes — a typed (schema-declaring) contract
+// and an untyped one — and one session finalizes each outcome in its own
+// lane: the typed lane payload-only (the payload is the output, forwarded
+// verbatim, no top-level reason), and the untyped lane with the legacy
+// reason prose and no payload (carrying reason is correct on a schemaless
+// contract; the reason lane is unconsumed wire-side there — it belongs to
+// the legacy lane's display surface only).
+func TestConformanceMixedLanePerStepBinding(t *testing.T) {
+	const payload = `{"note":"typed lane","verdict":"approved"}`
+	p := newConformanceAdapter(t, map[string]string{
+		"FAKE_COPILOT_SCENARIO": "mixed-lane-contract",
+		"FAKE_COPILOT_OUTCOME":  "approved",
+		"FAKE_COPILOT_PAYLOAD":  payload,
+		"FAKE_COPILOT_OUTCOME2": "failure",
+		"FAKE_COPILOT_REASON2":  "legacy lane prose for the untyped contract outcome",
+	})
+	mustOpenConformanceSession(t, p, "kb260-mixed")
+	// Mixed step: the typed approved contract next to a schemaless failure
+	// contract.
+	contracts := []*v2.OutcomeContract{
+		conformanceContract("approved", conformanceApprovedSchema, false, false),
+		conformanceContract("failure", "", false, false),
+	}
+	opts := conformanceExecuteOpts{
+		allowed:   []string{"approved", "failure"},
+		contracts: contracts,
+	}
+
+	// Execute #1: the typed lane — payload-only finalization accepted.
+	sender1 := runConformanceExecuteWith(t, p, "kb260-mixed", opts)
+	r1 := resultFromSender(sender1)
+	if r1.GetOutcome() != "approved" {
+		t.Fatalf("execute #1 outcome = %q, want approved (typed lane)", r1.GetOutcome())
+	}
+	if got := string(r1.GetOutputsJson()); got != payload {
+		t.Errorf("execute #1 outputs_json = %s, want the payload verbatim %s", got, payload)
+	}
+	if adapterEventPayload(sender1, "turn.finalize_exhausted") != nil {
+		t.Error("unexpected finalize_exhausted on the typed lane")
+	}
+	// The typed lane carries no comment either (the contract sets no
+	// require_comment), and the finalize is payload-as-output.
+	if r1.GetComment() != "" {
+		t.Errorf("execute #1 comment = %q, want empty", r1.GetComment())
+	}
+
+	// Execute #2: the untyped lane — the legacy reason prose finalization is
+	// accepted (per-step binding), with no payload and no comment.
+	sender2 := runConformanceExecuteWith(t, p, "kb260-mixed", opts)
+	r2 := resultFromSender(sender2)
+	if r2.GetOutcome() != "failure" {
+		t.Fatalf("execute #2 outcome = %q, want failure (untyped lane)", r2.GetOutcome())
+	}
+	if got := string(r2.GetOutputsJson()); got != `{}` {
+		t.Errorf("execute #2 outputs_json = %s, want the normalized empty payload {}", got)
+	}
+	if r2.GetComment() != "" {
+		t.Errorf("execute #2 comment = %q, want empty (reason is the untyped submission's findings lane)", r2.GetComment())
+	}
+	if adapterEventPayload(sender2, "turn.finalize_exhausted") != nil {
+		t.Error("a schemaless contract finalize carrying reason must not be rejected as a wrong-lane submission")
+	}
+}

@@ -248,6 +248,20 @@ func TestSubmitOutcomeOverride(t *testing.T) {
 	}
 }
 
+// TestOutcomeEnvOverride verifies the KB-260 second-stage lane inputs
+// (FAKE_COPILOT_OUTCOME2 / FAKE_COPILOT_REASON2): named env keys with
+// trimmed non-empty values override the default lane text.
+func TestOutcomeEnvOverride(t *testing.T) {
+	t.Setenv("FAKE_COPILOT_OUTCOME2", "")
+	if got := outcomeEnvOverride("FAKE_COPILOT_OUTCOME2", "failure"); got != "failure" {
+		t.Fatalf("default = %q, want failure", got)
+	}
+	t.Setenv("FAKE_COPILOT_OUTCOME2", "  changes_requested  ")
+	if got := outcomeEnvOverride("FAKE_COPILOT_OUTCOME2", "failure"); got != "changes_requested" {
+		t.Fatalf("override = %q, want trimmed changes_requested", got)
+	}
+}
+
 // TestNewPermIDUniqueness verifies that newPermID returns distinct values on
 // successive calls, preventing the map-key collision that would cause a
 // deadlock when multiple permission requests are in-flight.
