@@ -218,6 +218,14 @@ type executePrompt struct {
 	allowed    []string
 	contracts  []*v2.OutcomeContract
 	rejection  *v2.ExecutionRejection
+	// descriptions carries the per-outcome presentation description from the
+	// Execute handshake (KB-260): splitAllowedOutcomeProse unwraps the
+	// host-supplied "name — description" prompt-prose carrier that rides the
+	// AllowedOutcomes entries (the additive criteria-adapter-proto
+	// ExecuteRequest field remains the preferred future carrier), and
+	// composeExecutePrompt renders the "name — description" menu when it is
+	// populated instead of the flat name list.
+	descriptions map[string]string
 }
 
 // messageOptions composes the prompt for the current session state. Called
@@ -225,7 +233,7 @@ type executePrompt struct {
 // under s.mu itself.
 func (ep executePrompt) messageOptions(s *sessionState) *copilot.MessageOptions {
 	return &copilot.MessageOptions{
-		Prompt: composeExecutePrompt(ep.stepPrompt, ep.allowed, ep.contracts, ep.rejection, s, s.heldSecrets),
+		Prompt: composeExecutePrompt(ep.stepPrompt, ep.allowed, ep.contracts, ep.rejection, s, s.heldSecrets, ep.descriptions),
 	}
 }
 
@@ -818,7 +826,13 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	// Populate allowed set before the prompt is sent so the tool handler can
 	// validate on the very first turn. Contract mode (v0.7.0 OutcomeContracts)
 	// and repair-mode state ride the same lock.
-	allowed := req.GetAllowedOutcomes()
+	// KB-260: the allowed-outcome prose carrier. A host supplies an
+	// outcome's presentation description inside its AllowedOutcomes entry as
+	// "name — description" prompt-prose until the additive
+	// criteria-adapter-proto ExecuteRequest field lands; the bare name
+	// remains the submission/validation surface, so the split feeds both the
+	// allowed set and the prompt's verdict menu.
+	allowed, outcomeDescriptions := splitAllowedOutcomeProse(req.GetAllowedOutcomes())
 	contracts := req.GetOutcomeContracts()
 	rejection := req.GetRejection()
 	s.mu.Lock()
@@ -848,10 +862,11 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 
 	state := newTurnState(maxTurns)
 	state.execPrompt = executePrompt{
-		stepPrompt: prompt,
-		allowed:    allowed,
-		contracts:  contracts,
-		rejection:  rejection,
+		stepPrompt:   prompt,
+		allowed:      allowed,
+		contracts:    contracts,
+		rejection:    rejection,
+		descriptions: outcomeDescriptions,
 	}
 	// Route the handler through the session's event fanout (CRI-272): if the
 	// CLI child dies mid-turn and the session is re-opened, the swapped-in SDK
@@ -920,14 +935,25 @@ func (s *sessionState) repairInSession() bool {
 // in-session decision is made HERE, at composition time (under s.mu), so a
 // lazy reopen that re-created the SDK session before the send is reflected.
 // s must not be nil; bare (&sessionState{}) works for stateless tests.
-func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.OutcomeContract, rejection *v2.ExecutionRejection, s *sessionState, secrets []string) string {
+func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.OutcomeContract, rejection *v2.ExecutionRejection, s *sessionState, secrets []string, descriptions map[string]string) string {
 	// Prepend the allowed-outcomes preamble so the model knows what to call.
+	// KB-260: when per-outcome descriptions travel (the proto carrier), the
+	// menu renders one "name — description" line per outcome; with no
+	// descriptions the flat name list stays byte-for-byte the legacy
+	// preamble.
 	if len(allowed) > 0 {
-		outcomeList := strings.Join(allowed, ", ") // already sorted ascending by W14 loader
-		stepPrompt = fmt.Sprintf(
-			"You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are: %s. If you do not call the tool with a valid outcome, the step will fail.\n\n%s",
-			outcomeList, stepPrompt,
-		)
+		if menu := outcomeMenu(allowed, descriptions); menu != "" {
+			stepPrompt = fmt.Sprintf(
+				"You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are:\n%s\n\nIf you do not call the tool with a valid outcome, the step will fail.\n\n%s",
+				menu, stepPrompt,
+			)
+		} else {
+			outcomeList := strings.Join(allowed, ", ") // already sorted ascending by W14 loader
+			stepPrompt = fmt.Sprintf(
+				"You must finalize the outcome for this step by calling the `submit_outcome` tool exactly once before ending the turn. The allowed outcomes are: %s. If you do not call the tool with a valid outcome, the step will fail.\n\n%s",
+				outcomeList, stepPrompt,
+			)
+		}
 	}
 
 	if contracts := contractConveyance(contracts); contracts != "" {
@@ -971,9 +997,83 @@ func composeExecutePrompt(stepPrompt string, allowed []string, contracts []*v2.O
 	return stepPrompt
 }
 
+// outcomeProseSeparator separates an allowed-outcome entry's name from the
+// description prose riding its AllowedOutcomes entry (KB-260: the
+// host-supplied prompt-prose carrier; the additive proto field on
+// ExecuteRequest remains the preferred future carrier). Outcome names are
+// identifier-like, so a space-em-dash-space separator never appears in a
+// bare name.
+const outcomeProseSeparator = " — "
+
+// splitAllowedOutcomeProse splits each AllowedOutcomes entry into its bare
+// outcome name and optional description prose (KB-260). When NO entry carries
+// describable prose, the input slice is returned as-is with a nil map, so
+// hosts that travel no descriptions keep every legacy path byte-for-byte
+// (allowed set, error lists, prompt preamble). Otherwise the returned names
+// are TrimSpace'd split results (an entry whose name part is empty keeps its
+// whole trimmed text as the name) and the map carries a non-empty description
+// per named outcome; the map is the only render input, so a description for
+// an outcome that is not in the allowed set cannot surface.
+func splitAllowedOutcomeProse(entries []string) ([]string, map[string]string) {
+	descriptions := map[string]string{}
+	sawProse := false
+	names := make([]string, len(entries))
+	for i, entry := range entries {
+		name, description := strings.TrimSpace(entry), ""
+		if before, after, ok := strings.Cut(entry, outcomeProseSeparator); ok {
+			trimmedName := strings.TrimSpace(before)
+			if trimmedName != "" {
+				name, description, sawProse = trimmedName, strings.TrimSpace(after), true
+			}
+		}
+		names[i] = name
+		if description != "" {
+			descriptions[name] = description
+		}
+	}
+	if !sawProse {
+		return entries, nil
+	}
+	return names, descriptions
+}
+
+// outcomeMenu renders the allowed-outcomes menu for the Execute preamble
+// (KB-260). When at least one allowed outcome carries a description, the menu
+// is one line per outcome — "- name — description" (bare "- name" when an
+// individual description is empty) — so the verdict menu is prompt-prose
+// visible at the step where the model finalizes ("stop Remain swallowing it"
+// — KB-259 acceptance: names compiled with descriptions must render both).
+// When no description travels, the flat legacy name list renders instead
+// (composeExecutePrompt keeps the legacy preamble byte-for-byte). Callers
+// keep the loader's sorted order; the menu must not re-sort.
+func outcomeMenu(allowed []string, descriptions map[string]string) string {
+	hasDescriptions := false
+	for _, name := range allowed {
+		if strings.TrimSpace(descriptions[name]) != "" {
+			hasDescriptions = true
+			break
+		}
+	}
+	if !hasDescriptions {
+		return ""
+	}
+	lines := make([]string, 0, len(allowed))
+	for _, name := range allowed {
+		if d := strings.TrimSpace(descriptions[name]); d != "" {
+			lines = append(lines, fmt.Sprintf("- %s — %s", name, d))
+		} else {
+			lines = append(lines, fmt.Sprintf("- %s", name))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // contractConveyance renders the per-step contract block the model sees: what
 // each contracted outcome requires of the payload and comment, and which
-// outcome is the fallback. Empty when there are no contracts.
+// outcome is the fallback. Empty when there are no contracts. Typed
+// (schema-declaring) contracts also convey the payload-as-output doctrine:
+// the payload is the output and a top-level reason is a wrong-lane
+// submission (KB-263; the static schema's docs teach the same lane split).
 func contractConveyance(contracts []*v2.OutcomeContract) string {
 	if len(contracts) == 0 {
 		return ""
@@ -986,6 +1086,7 @@ func contractConveyance(contracts []*v2.OutcomeContract) string {
 		if schema := string(contract.GetSchemaJson()); strings.TrimSpace(schema) != "" {
 			reqs = append(reqs, fmt.Sprintf(
 				"when finalizing with this outcome, the submit_outcome call must include a `payload` argument — a JSON object matching this JSON Schema: %s", schema))
+			reqs = append(reqs, "the payload is the output — findings belong under the payload's declared fields and the finalization must not carry a top-level `reason`")
 		}
 		if contract.GetRequireComment() {
 			reqs = append(reqs, "when finalizing with this outcome, the submit_outcome call must include a non-empty `comment` argument (require_comment)")

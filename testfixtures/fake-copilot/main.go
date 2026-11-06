@@ -88,6 +88,17 @@
 //	result and resubmits payload-only (no reason) before idling, so the repair
 //	lands inside the same turn's finalize budget and the finalize happens once.
 //
+// "mixed-lane-contract" (KB-260):
+//
+//	One session, per-step lanes both live: turn 1 (Execute #1) finalizes the
+//	typed lane payload-only (FAKE_COPILOT_PAYLOAD, no reason — the payload is
+//	the output). Turn 2 (Execute #2 on the same session) finalizes the untyped
+//	lane with the legacy reason prose (FAKE_COPILOT_OUTCOME2 + a top-level
+//	reason, no payload) — carrying reason on a schemaless contract is a
+//	correct submission there, never a wrong-lane rejection. The pair proves a
+//	mixed step's per-step binding: each submit lands in its own outcome's
+//	lane.
+//
 // The contract-* scenarios submit NO top-level reason on their own submits:
 // conformance contracts declare payload schemas (typed outcomes, KB-263), so
 // the payload is the output and a schema-declaring contract never consumes the
@@ -96,6 +107,9 @@
 // FAKE_COPILOT_OUTCOME overrides the outcome value submitted on success
 // paths (default "success") — used by review-step conformance tests, whose
 // steps declare outcomes like "approved".
+//
+// FAKE_COPILOT_OUTCOME2 / FAKE_COPILOT_REASON2 are the second-stage outcome
+// and reason for the mixed-lane-contract scenario's untyped-lane submit.
 //
 // FAKE_COPILOT_PAYLOAD / FAKE_COPILOT_COMMENT (and the *2 repair-stage
 // variants) are JSON-object strings decoded into the submit_outcome tool-call
@@ -230,6 +244,30 @@ func submitOutcomeOverride(def string) string {
 		return v
 	}
 	return def
+}
+
+// outcomeEnvOverride returns the named FAKE_COPILOT_* env value (trimmed,
+// non-empty) or the given default — the second-stage lane inputs of the
+// mixed-lane-contract scenario (FAKE_COPILOT_OUTCOME2 / REASON2, KB-260).
+func outcomeEnvOverride(envKey, def string) string {
+	if v := strings.TrimSpace(os.Getenv(envKey)); v != "" {
+		return v
+	}
+	return def
+}
+
+// echoMenuLine returns the rendered allowed-outcomes menu line for the given
+// outcome in a copilot prompt ("- <name> — <description>", KB-260): the
+// description carrier the adapter renders into the prompt prose. Returns ""
+// when the prompt carries no such menu line.
+func echoMenuLine(prompt, outcome string) string {
+	prefix := "- " + outcome + " — "
+	for _, line := range strings.Split(prompt, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	return ""
 }
 
 func main() {
@@ -464,6 +502,18 @@ func handleSessionSend(msg *rpcMsg) {
 			}
 			sendEvent(p.SessionID, "session.idle", map[string]any{})
 
+		case "mixed-lane-contract":
+			// KB-260: per-step binding on one mixed-shape step. Turn 1
+			// (Execute #1) finalizes the typed lane payload-only — the
+			// payload is the output, no reason. Turn 2 (Execute #2) finalizes
+			// the untyped lane with the legacy reason prose and no payload —
+			// carrying reason is correct on a schemaless contract.
+			if turn == 1 {
+				sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", scenarioContractFields(p.Prompt, scenarioPayload1Env)))
+			} else {
+				sendArgsAndIdle(p.SessionID, submitArgs(outcomeEnvOverride("FAKE_COPILOT_OUTCOME2", "failure"), outcomeEnvOverride("FAKE_COPILOT_REASON2", "legacy lane prose for the untyped contract outcome"), nil))
+			}
+
 		case "success-after-reprompt-1":
 			if turn == 1 {
 				sendEvent(p.SessionID, "session.idle", map[string]any{})
@@ -509,6 +559,42 @@ func handleSessionSend(msg *rpcMsg) {
 
 		case "missing":
 			sendEvent(p.SessionID, "session.idle", map[string]any{})
+
+		case "legacy-reason-repair":
+			// KB-260 review B1: the model finalizes the contract-less step
+			// with an empty reason — rejected in-turn because the legacy
+			// lane's reason is enforced — then resubmits with the reason
+			// prose on the same Execute's repair reprompt.
+			if turn == 1 {
+				sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "")
+			} else {
+				sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), "repaired: the findings prose the step required")
+			}
+
+		case "menu-render-echo":
+			// KB-260: echo the rendered allowed-outcomes menu line for the
+			// described outcome into the submitted payload, so a conformance
+			// test can prove the "name — description" menu traveled the real
+			// Execute handshake into the prompt.
+			fields := scenarioContractFields(p.Prompt, scenarioPayload1Env)
+			if menuLine := echoMenuLine(p.Prompt, submitOutcomeOverride("approved")); menuLine != "" {
+				if obj, _ := fields["payload"].(map[string]any); obj != nil {
+					obj["menu_line"] = menuLine
+				}
+			}
+			sendArgsAndIdle(p.SessionID, submitArgs(submitOutcomeOverride("success"), "", fields))
+
+		case "legacy-reason-echo":
+			// KB-260: submit the bare outcome name with the rendered menu
+			// line as the legacy-lane reason prose. If the described
+			// carrier had flipped contract mode, the reason would be
+			// unconsumed on a contract-less-turned-typed step and the
+			// finalize would fail — the flip is observable in the test.
+			menuLine := echoMenuLine(p.Prompt, submitOutcomeOverride("approved"))
+			if menuLine == "" {
+				menuLine = "menu missing: the prompt carried no described outcome line"
+			}
+			sendToolCallAndIdle(p.SessionID, submitOutcomeOverride("success"), menuLine)
 
 		default:
 			// Unknown scenario: treat as success.
