@@ -80,7 +80,7 @@ var declaredSubmitOutcomeParams = []string{"comment", "outcome", "payload", "rea
 // undeclared or that text belongs somewhere else).
 var submitOutcomeParamDocs = map[string][2]string{
 	"outcome": {"string", "Required. The step's final outcome; must be one of the allowed outcomes conveyed in the step prompt."},
-	"reason":  {"string", "Required. The finalize reason: ALL of the step's findings, review feedback, and prose justification belong here as the value of reason; the workflow renders the step's findings from reason. Never submit findings text under comment or any other parameter."},
+	"reason":  {"string", "Required. The finalize reason: ALL of the step's findings, review feedback, and prose justification belong here as the value of reason; the workflow renders the step's findings from reason. On steps with a typed outcome contract requiring reason, the adapter folds this top-level value into the contract payload automatically. Never submit findings text under comment or any other parameter."},
 	"comment": {"string", "Optional finalize comment; consumed only when the step carries outcome contracts. Mandatory when the step's contract for the chosen outcome sets require_comment (the prompt says when). Findings text still belongs in reason — do not submit feedback as the comment."},
 	"payload": {"object", "Optional JSON object payload; consumed only when the step carries outcome contracts. When contracts are present, the payload must satisfy the contract's schema for the chosen outcome and is forwarded to the workflow verbatim."},
 }
@@ -272,6 +272,21 @@ func (r *contractRejection) message(outcome string) string {
 // outcome_uncontracted; the adapter only enforces the matched contract's
 // schema and require_comment per the v0.7.0 split) or when the submission
 // satisfies it; otherwise a contractRejection with the issue list.
+// checkContractFinalize enforces the matched outcome contract on a finalize
+// call in contract mode. The caller holds s.mu. Returns nil when the outcome
+// carries no contract entry (the host's post-finalize validation owns
+// outcome_uncontracted; the adapter only enforces the matched contract's
+// schema and require_comment per the v0.7.0 split) or when the submission
+// satisfies it; otherwise a contractRejection with the issue list.
+//
+// Typed-lane parameter reconciliation: the submit_outcome tool schema
+// documents "reason" as a required TOP-LEVEL parameter, while typed contracts
+// can require a member of the same name INSIDE the payload. When the
+// submitted payload fails the schema only on members the model supplied as
+// documented top-level parameters, those members are folded into the payload
+// during validation — the same reconcile the host performs at the verdict
+// funnel — instead of an in-turn rejection that contradicts the tool schema
+// the model must follow (the live KB-171 loop shape).
 func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMessage, comment string) *contractRejection {
 	contract := s.activeContracts[outcome]
 	if contract == nil {
@@ -299,6 +314,78 @@ func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMes
 		kind = "comment_missing"
 	}
 	return &contractRejection{kind: kind, issues: issues}
+}
+
+// foldDeclaredPayloadParams folds documented top-level submit parameters into
+// the payload when the contract schema requires those names and the payload
+// itself lacks them. Returns the (possibly rewritten) payload and whether a
+// fold happened. Parameters without schema-required names are not folded, so
+// containment of the typed lane is unchanged.
+func foldDeclaredPayloadParams(reason, comment string, payload json.RawMessage, schemaJSON []byte) (json.RawMessage, bool) {
+	required := schemaRequiredMembers(schemaJSON)
+	if len(required) == 0 {
+		return payload, false
+	}
+	obj := map[string]json.RawMessage{}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &obj); err != nil {
+			return payload, false
+		}
+	}
+	folded := false
+	for _, name := range required {
+		if _, present := obj[name]; present {
+			continue
+		}
+		switch name {
+		case "reason":
+			if strings.TrimSpace(reason) != "" {
+				obj[name] = json.RawMessage(mustJSONString(reason))
+				folded = true
+			}
+		case "comment":
+			if strings.TrimSpace(comment) != "" {
+				obj[name] = json.RawMessage(mustJSONString(comment))
+				folded = true
+			}
+		}
+	}
+	if !folded {
+		return payload, false
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload, false
+	}
+	return out, true
+}
+
+// schemaRequiredMembers extracts the "required" array from a schema document.
+func schemaRequiredMembers(schemaJSON []byte) []string {
+	var doc struct {
+		Required []string `json:"required"`
+	}
+	if len(schemaJSON) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(schemaJSON, &doc); err != nil {
+		return nil
+	}
+	return doc.Required
+}
+
+func mustJSONString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// activeContractSchemaFor returns the declared schema for the outcome, empty
+// when no contract is active (the fold helper treats that as no-op).
+func (s *sessionState) activeContractSchemaFor(outcome string) []byte {
+	if contract := s.activeContracts[outcome]; contract != nil {
+		return contract.GetSchemaJson()
+	}
+	return nil
 }
 
 // validateContractPayload validates the model-submitted payload against one
@@ -433,7 +520,8 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 
 	trimmedReason := strings.TrimSpace(args.Reason)
 	trimmedComment := strings.TrimSpace(args.Comment)
-	canonicalPayload := normalizedFinalizePayload(args.Payload)
+	foldedPayload, _ := foldDeclaredPayloadParams(trimmedReason, trimmedComment, args.Payload, s.activeContractSchemaFor(outcome))
+	canonicalPayload := normalizedFinalizePayload(foldedPayload)
 
 	// KB-216 wire-call strictness: comment and payload are contract-mode
 	// members, and on a step without outcome contracts both would be silently
@@ -482,7 +570,7 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 			s.mu.Unlock()
 			return submitOutcomeError(typedReasonNotConsumedMessage()), nil
 		}
-		if rejection := s.checkContractFinalize(outcome, args.Payload, trimmedComment); rejection != nil {
+		if rejection := s.checkContractFinalize(outcome, canonicalPayload, trimmedComment); rejection != nil {
 			s.finalizeFailureKind = rejection.kind
 			s.finalizeFailureIssues = append([]string(nil), rejection.issues...)
 			s.mu.Unlock()

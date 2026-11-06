@@ -1742,3 +1742,54 @@ func TestUntypedFinalizedEventKeepsLegacyReasonRender(t *testing.T) {
 		t.Errorf("uncontracted render = %v, want the legacy reason prose", d["reason"])
 	}
 }
+
+// ── KB-370 roll-card vectors: the fold reconciles the tool-schema lane (reason
+// top-level, per the model-visible parameter contract) with the typed-contract
+// lane (reason inside the payload). Every judging site must accept the
+// documented shape on a typed step. ─────────────────────────────────────
+
+func TestContractFinalize_FoldsTopLevelReasonIntoRequiredPayload(t *testing.T) {
+	// branch_manager shape: every outcome schema requires {reason: string}. The
+	// model submits the DOCUMENTED shape (reason top-level, payload {}) and the
+	// fold must reconcile it to the payload lane.
+	folded, ok := foldDeclaredPayloadParams("Branch KB-171 restored to the happy path", "",
+		json.RawMessage(`{}`),
+		[]byte(`{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`))
+	if !ok {
+		t.Fatal("documented top-level reason must fold into the required payload")
+	}
+	if got := string(folded); got != `{"reason":"Branch KB-171 restored to the happy path"}` {
+		t.Fatalf("folded payload wrong: %q", got)
+	}
+}
+
+func TestContractFinalize_NoFoldWhenPayloadComplete(t *testing.T) {
+	folded, ok := foldDeclaredPayloadParams("", "",
+		json.RawMessage(`{"reason":"completed cleanly"}`),
+		[]byte(`{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`))
+	if ok {
+		t.Fatal("payload-complete submission must not fold")
+	}
+	if got := string(folded); got != `{"reason":"completed cleanly"}` {
+		t.Fatalf("unfolded payload must pass through verbatim: %q", got)
+	}
+}
+
+func TestContractFinalize_EmptyTopLevelReasonDoesNotFakeSuccess(t *testing.T) {
+	// The original 282-loop shape: reason EMPTY top-level + empty payload MUST
+	// still reject -- the fold never synthesizes a fake reason.
+	folded, ok := foldDeclaredPayloadParams("", "",
+		json.RawMessage(`{}`),
+		[]byte(`{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`))
+	if ok {
+		t.Fatal("empty reason + empty payload must never fold")
+	}
+	if issues := validateContractPayload(folded,
+		[]byte(`{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`)); len(issues) == 0 {
+		t.Fatal("empty reason + empty payload must stay invalid via the contract check")
+	}
+}
+
+func containsFieldReason(payload string) bool {
+	return payload != "" && payload != "null" && payload != "{}"
+}
