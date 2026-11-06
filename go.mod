@@ -1,6 +1,6 @@
 module github.com/brokenbots/criteria-adapter-copilot
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/brokenbots/criteria-adapter-proto v0.7.0
