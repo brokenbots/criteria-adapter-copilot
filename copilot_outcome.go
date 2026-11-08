@@ -49,12 +49,16 @@ const maxContractIssueLen = 2000
 // 2026-10-08): reason is the only findings surface of the legacy lane, and
 // the schema says so.
 //
-// KB-263 ruling (dave, 10-14): reason is the findings surface for UNTYPED
-// outcomes only. On a typed step (the chosen outcome's contract declares a
-// payload schema) the payload IS the output and there is no top-level reason
-// lane — the handler rejects a finalize carrying reason (wrong-lane
-// submission) with the same typed not-consumed shape, and the
-// outcome.finalized event renders the operative prose from the payload.
+// KB-263 ruling (dave, 10-14) with the KB-388 refinement: reason is the
+// findings surface for UNTYPED outcomes only. On a typed step (the chosen
+// outcome's contract declares a payload schema) the payload IS the output —
+// a top-level reason the fold consumes (the schema requires a "reason"
+// member the payload lacks) lands in the payload and finalizes accepted,
+// while one the fold refuses (no such required member, or the payload
+// supplies its own) is a wrong-lane submission rejected with the same typed
+// not-consumed shape. The outcome.finalized event renders the operative
+// prose from the payload — for a fold-consumed reason that is the exact
+// top-level prose.
 //
 // KB-260 re-bind (dave, 10-14): the static schema previously advertised
 // top-level reason as uniformly required, mis-teaching typed steps (the
@@ -68,7 +72,7 @@ const maxContractIssueLen = 2000
 // rejected — KB-260 review B1).
 type SubmitOutcomeArgs struct {
 	Outcome string `json:"outcome"`          // required; must be a member of the active allowed set
-	Reason  string `json:"reason,omitempty"` // required-and-enforced on contract-less steps; typed steps must not send it (KB-263 wrong-lane)
+	Reason  string `json:"reason,omitempty"` // required-and-enforced on contract-less steps; on typed steps folded into the payload when the contract requires it, wrong-lane-rejected when the fold refuses it (KB-263/KB-388)
 
 	// Comment and Payload are the optional contract-mode members: consumed only
 	// when the step carries outcome contracts (comment is mandatory when the
@@ -286,12 +290,6 @@ func (r *contractRejection) message(outcome string) string {
 // outcome_uncontracted; the adapter only enforces the matched contract's
 // schema and require_comment per the v0.7.0 split) or when the submission
 // satisfies it; otherwise a contractRejection with the issue list.
-// checkContractFinalize enforces the matched outcome contract on a finalize
-// call in contract mode. The caller holds s.mu. Returns nil when the outcome
-// carries no contract entry (the host's post-finalize validation owns
-// outcome_uncontracted; the adapter only enforces the matched contract's
-// schema and require_comment per the v0.7.0 split) or when the submission
-// satisfies it; otherwise a contractRejection with the issue list.
 //
 // Typed-lane parameter reconciliation: the submit_outcome tool schema
 // documents "reason" as a required TOP-LEVEL parameter, while typed contracts
@@ -300,7 +298,10 @@ func (r *contractRejection) message(outcome string) string {
 // documented top-level parameters, those members are folded into the payload
 // during validation — the same reconcile the host performs at the verdict
 // funnel — instead of an in-turn rejection that contradicts the tool schema
-// the model must follow (the live KB-171 loop shape).
+// the model must follow (the live KB-171 loop shape). Since KB-388 the fold's
+// consumption is also honored at the wrong-lane gate in handleSubmitOutcome,
+// so a fold-consumed reason finalizes instead of being discarded by the
+// rejection one call after the fold computed it.
 func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMessage, comment string) *contractRejection {
 	contract := s.activeContracts[outcome]
 	if contract == nil {
@@ -332,21 +333,26 @@ func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMes
 
 // foldDeclaredPayloadParams folds documented top-level submit parameters into
 // the payload when the contract schema requires those names and the payload
-// itself lacks them. Returns the (possibly rewritten) payload and whether a
-// fold happened. Parameters without schema-required names are not folded, so
-// containment of the typed lane is unchanged.
-func foldDeclaredPayloadParams(reason, comment string, payload json.RawMessage, schemaJSON []byte) (json.RawMessage, bool) {
+// itself lacks them. Returns the (possibly rewritten) payload, whether a fold
+// happened, and whether that fold consumed the top-level reason — true only
+// when the schema requires a "reason" member, the payload itself did not
+// already carry one, and the submitted top-level reason is non-empty prose.
+// The reason-specific signal (not the any-fold flag) is what gates the KB-263
+// wrong-lane rejection: a fold that consumed only the comment still leaves
+// the top-level reason unconsumed (KB-388).
+func foldDeclaredPayloadParams(reason, comment string, payload json.RawMessage, schemaJSON []byte) (json.RawMessage, bool, bool) {
 	required := schemaRequiredMembers(schemaJSON)
 	if len(required) == 0 {
-		return payload, false
+		return payload, false, false
 	}
 	obj := map[string]json.RawMessage{}
 	if len(payload) > 0 {
 		if err := json.Unmarshal(payload, &obj); err != nil {
-			return payload, false
+			return payload, false, false
 		}
 	}
 	folded := false
+	reasonFolded := false
 	for _, name := range required {
 		if _, present := obj[name]; present {
 			continue
@@ -356,6 +362,7 @@ func foldDeclaredPayloadParams(reason, comment string, payload json.RawMessage, 
 			if strings.TrimSpace(reason) != "" {
 				obj[name] = json.RawMessage(mustJSONString(reason))
 				folded = true
+				reasonFolded = true
 			}
 		case "comment":
 			if strings.TrimSpace(comment) != "" {
@@ -365,13 +372,13 @@ func foldDeclaredPayloadParams(reason, comment string, payload json.RawMessage, 
 		}
 	}
 	if !folded {
-		return payload, false
+		return payload, false, false
 	}
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return payload, false
+		return payload, false, false
 	}
-	return out, true
+	return out, true, reasonFolded
 }
 
 // schemaRequiredMembers extracts the "required" array from a schema document.
@@ -534,7 +541,7 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 
 	trimmedReason := strings.TrimSpace(args.Reason)
 	trimmedComment := strings.TrimSpace(args.Comment)
-	foldedPayload, _ := foldDeclaredPayloadParams(trimmedReason, trimmedComment, args.Payload, s.activeContractSchemaFor(outcome))
+	foldedPayload, _, reasonFolded := foldDeclaredPayloadParams(trimmedReason, trimmedComment, args.Payload, s.activeContractSchemaFor(outcome))
 	canonicalPayload := normalizedFinalizePayload(foldedPayload)
 
 	// KB-216 wire-call strictness: comment and payload are contract-mode
@@ -593,7 +600,20 @@ func (p *copilotAdapter) handleSubmitOutcome(adapterSessionID string, args Submi
 		// rejection applied to untyped steps above. The rejection consumes
 		// one finalize attempt and is repairable: a payload-only resubmit
 		// within the budget finalizes once.
-		if trimmedReason != "" && len(s.typedContractSchema(outcome)) > 0 {
+		//
+		// KB-388: when the fold consumed the top-level reason (the contract
+		// schema requires a "reason" member and the submitted payload lacked
+		// one), the reason IS the payload lane — canonicalPayload carries the
+		// prose and the rejection below would discard the fold's work one
+		// line after computing it, the observed in-turn burn (castle
+		// 361b3d39: 29 rejected submissions, zero payload_invalid events,
+		// blind shape-probing against a contradictory instruction pair).
+		// Keep the rejection for the true wrong-lane shape: non-empty
+		// top-level prose the fold refused — a reason member the schema does
+		// not require, or a payload that already supplies its own — which
+		// cannot land in the payload and must be rejected per the KB-263
+		// ruling.
+		if trimmedReason != "" && !reasonFolded && len(s.typedContractSchema(outcome)) > 0 {
 			s.finalizeFailureKind = "invalid_params"
 			s.mu.Unlock()
 			return submitOutcomeError(typedReasonNotConsumedMessage()), nil
