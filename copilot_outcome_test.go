@@ -1706,6 +1706,57 @@ func TestTypedSubmitAcceptsFoldConsumedTopLevelReason(t *testing.T) {
 	}
 }
 
+// Regression (KB-388 review): encoding/json unmarshals the literal `null`
+// document into a NIL map with no error, and SubmitOutcomeArgs.Payload
+// carries the submitted bytes verbatim — so on a typed outcome whose schema
+// requires reason, payload: null + top-level findings prose reached the fold,
+// left the map nil, and the fold's reason assignment panicked with
+// "assignment to entry in nil map", killing the adapter process mid-session
+// exactly during the junk shape-probing this workstream targets. The fold
+// must treat a null payload as an absent one, finalize, and let the fold
+// consume the prose into the required reason member.
+func TestTypedSubmitAcceptsFoldConsumedReasonOnNullPayload(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", reasonRequiredSchema, false, false))
+	sink := &recordingSender{}
+	s.mu.Lock()
+	s.sink = sink
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	const prose = "payload null plus top-level prose folds into the required reason lane"
+	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  prose,
+		Payload: json.RawMessage(`null`),
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q (%s), want success — a null payload is an absent one for the fold",
+			res.ResultType, res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "approved" || s.finalizeAttempts != 1 {
+		t.Errorf("finalized = outcome %q attempts %d, want approved/1", s.finalizedOutcome, s.finalizeAttempts)
+	}
+	if string(s.finalizedPayload) != `{"reason":"`+prose+`"}` {
+		t.Errorf("finalizedPayload = %s, want the folded reason payload on the normalized null", s.finalizedPayload)
+	}
+	if s.finalizedReason != prose {
+		t.Errorf("finalizedReason = %q, want the folded prose", s.finalizedReason)
+	}
+	events := finalAdapterEvents(sink, "outcome.finalized")
+	if len(events) != 1 {
+		t.Fatalf("outcome.finalized events = %d, want 1", len(events))
+	}
+	if d := events[0].GetAdapter().GetPayload().AsMap(); d["reason"] != prose {
+		t.Errorf("outcome.finalized reason = %v, want the folded prose rendered from the payload lane", d["reason"])
+	}
+}
+
 // The KB-263 wrong-lane rejection must stay armed when the fold refused: the
 // schema requires no reason member, so the payload lane has nothing to fold
 // the prose into and the submission rejects in-turn with the typed
@@ -2050,6 +2101,27 @@ func TestContractFinalize_FoldsTopLevelReasonIntoRequiredPayload(t *testing.T) {
 		t.Fatal("the fold must report the top-level reason as consumed (the KB-388 wrong-lane gate reads this)")
 	}
 	if got := string(folded); got != `{"reason":"Branch KB-171 restored to the happy path"}` {
+		t.Fatalf("folded payload wrong: %q", got)
+	}
+}
+
+// Review regression (KB-388): encoding/json unmarshals the literal `null`
+// document into a NIL map with no error, so a submitted payload: null (which
+// reaches the fold verbatim as RawMessage bytes) left the fold's map nil and
+// the reason assignment panicked with "assignment to entry in nil map",
+// killing the adapter process mid-session. A null payload is an absent one
+// for the fold: re-armed, the prose folds into the required reason member.
+func TestContractFinalize_NullPayloadFoldsLikeAbsent(t *testing.T) {
+	folded, ok, reasonFolded := foldDeclaredPayloadParams("Branch KB-388 null-payload prose", "",
+		json.RawMessage(`null`),
+		[]byte(reasonRequiredSchema))
+	if !ok {
+		t.Fatal("a null payload with top-level prose must fold into the required reason member")
+	}
+	if !reasonFolded {
+		t.Fatal("the fold must report the fold-consumed reason (the wrong-lane gate reads this)")
+	}
+	if got := string(folded); got != `{"reason":"Branch KB-388 null-payload prose"}` {
 		t.Fatalf("folded payload wrong: %q", got)
 	}
 }

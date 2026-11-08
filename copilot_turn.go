@@ -1072,8 +1072,10 @@ func outcomeMenu(allowed []string, descriptions map[string]string) string {
 // each contracted outcome requires of the payload and comment, and which
 // outcome is the fallback. Empty when there are no contracts. Typed
 // (schema-declaring) contracts also convey the payload-as-output doctrine:
-// the payload is the output and a top-level reason is a wrong-lane
-// submission (KB-263; the static schema's docs teach the same lane split).
+// the payload is the output, and a top-level reason is folded into the
+// payload when the contract's schema requires a reason member the payload
+// lacks and is wrong-lane-rejected only otherwise (KB-263/KB-388; the
+// static schema's docs teach the same lane split).
 func contractConveyance(contracts []*v2.OutcomeContract) string {
 	if len(contracts) == 0 {
 		return ""
@@ -1086,7 +1088,7 @@ func contractConveyance(contracts []*v2.OutcomeContract) string {
 		if schema := string(contract.GetSchemaJson()); strings.TrimSpace(schema) != "" {
 			reqs = append(reqs, fmt.Sprintf(
 				"when finalizing with this outcome, the submit_outcome call must include a `payload` argument — a JSON object matching this JSON Schema: %s", schema))
-			reqs = append(reqs, "the payload is the output — findings belong under the payload's declared fields and the finalization must not carry a top-level `reason`")
+			reqs = append(reqs, "the payload is the output — findings belong under the payload's declared fields; a top-level `reason` is folded into the payload when the contract's schema requires a `reason` member that the submitted payload does not supply, and is wrong-lane-rejected only when there is no such lane (the schema declares no required `reason` member, or the payload supplies its own reason)")
 		}
 		if contract.GetRequireComment() {
 			reqs = append(reqs, "when finalizing with this outcome, the submit_outcome call must include a non-empty `comment` argument (require_comment)")

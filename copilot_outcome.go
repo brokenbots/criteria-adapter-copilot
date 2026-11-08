@@ -98,7 +98,7 @@ var submitOutcomeParamDocs = map[string][2]string{
 	"outcome": {"string", "Required. The step's final outcome; must be one of the allowed outcomes conveyed in the step prompt."},
 	"reason":  {"string", "Required on steps without outcome contracts (an empty reason is rejected in-turn on such steps): ALL of the step's findings, review feedback, and prose justification belong here as the value of reason, and the workflow renders the step's findings from reason. On steps with a typed outcome contract requiring reason, the adapter folds this top-level value into the contract payload automatically. Never submit findings text under comment or any other parameter."},
 	"comment": {"string", "Optional finalize comment; consumed only when the step carries outcome contracts. Mandatory when the step's contract for the chosen outcome sets require_comment (the prompt says when). Findings text still belongs in reason — do not submit feedback as the comment."},
-	"payload": {"object", "Optional JSON object payload; consumed only when the step carries outcome contracts. When the contract for the chosen outcome declares a payload schema, the payload IS the output — the declared schema's fields are the submission surface; the payload must satisfy that schema and is forwarded to the workflow verbatim, and no top-level reason is consumed (submitting one is a wrong-lane rejection)."},
+	"payload": {"object", "Optional JSON object payload; consumed only when the step carries outcome contracts. When the contract for the chosen outcome declares a payload schema, the payload IS the output — the declared schema's fields are the submission surface; the payload must satisfy that schema and is forwarded to the workflow verbatim. A top-level reason is folded into the payload when the contract's schema requires a `reason` member that the submitted payload does not supply; a top-level reason is wrong-lane-rejected only when there is no such lane (the schema declares no required `reason` member, or the payload supplies its own reason)."},
 }
 
 // submitOutcomeToolParameters is the static parameter JSON Schema the
@@ -349,6 +349,16 @@ func foldDeclaredPayloadParams(reason, comment string, payload json.RawMessage, 
 	if len(payload) > 0 {
 		if err := json.Unmarshal(payload, &obj); err != nil {
 			return payload, false, false
+		}
+		// encoding/json unmarshals the literal `null` document into a NIL
+		// map with no error — Payload carries the submitted bytes verbatim,
+		// so a wire shape like payload: null reaches the fold unchanged —
+		// and the required-member loop below would panic on assignment to
+		// a nil map. A null payload folds exactly like an absent one: re-arm
+		// the map; when the fold does not fire, the original bytes still
+		// flow on to normalizedFinalizePayload's null→{} normalization.
+		if obj == nil {
+			obj = map[string]json.RawMessage{}
 		}
 	}
 	folded := false
