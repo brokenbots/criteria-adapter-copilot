@@ -998,6 +998,11 @@ func contractTestState(allowed []string, contracts ...*v2.OutcomeContract) *sess
 // verbatimSchema: object with a required string verdict property.
 const verbatimSchema = `{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string"}}}`
 
+// reasonRequiredSchema: the branch_manager/typed-outcome shape the field
+// evidence burns on (KB-370/KB-388) — every outcome schema requires
+// {reason: string}.
+const reasonRequiredSchema = `{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`
+
 // Contract-mode finalize accepted: outcome, verbatim payload, and trimmed
 // comment all land on sessionState, and the finalize session epoch is set.
 // The contract declares a schema (typed step, KB-263), so the finalize
@@ -1646,6 +1651,247 @@ func TestTypedSubmitWrongLaneRepairFinalizesOnce(t *testing.T) {
 	}
 }
 
+// ── KB-388: a fold-consumed top-level reason IS the payload lane ─────────────
+
+// The field-evidence burn shape (castle 361b3d39: payload {} + findings prose
+// under the top-level reason, 29 in-turn rejections with zero payload_invalid
+// events followed by blind junk-probing): on a typed outcome whose schema
+// requires reason, the fold reconciles the documented shape to the payload
+// lane and the submission must FINALIZE accepted — the wrong-lane rejection
+// must not discard the fold's work one line after computing it. The folded
+// prose stays intact on the accepted payload (the run-state projection) and
+// renders on the outcome.finalized display lane.
+func TestTypedSubmitAcceptsFoldConsumedTopLevelReason(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", reasonRequiredSchema, false, false))
+	sink := &recordingSender{}
+	s.mu.Lock()
+	s.sink = sink
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  "Branch KB-388: the wrong-lane gate now honors the fold",
+		Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q (%s), want success — a fold-consumed reason is the payload lane",
+			res.ResultType, res.TextResultForLLM)
+	}
+	const prose = "Branch KB-388: the wrong-lane gate now honors the fold"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "approved" || s.finalizeAttempts != 1 {
+		t.Errorf("finalized = outcome %q attempts %d, want approved/1", s.finalizedOutcome, s.finalizeAttempts)
+	}
+	// The folded reason is intact in the accepted payload — exactly the bytes
+	// contractResultEvent projects to the workflow as outputs_json.
+	if string(s.finalizedPayload) != `{"reason":"`+prose+`"}` {
+		t.Errorf("finalizedPayload = %s, want the folded payload with the reason prose intact", s.finalizedPayload)
+	}
+	// The legacy reason state keeps the same prose the fold consumed.
+	if s.finalizedReason != prose {
+		t.Errorf("finalizedReason = %q, want the folded prose", s.finalizedReason)
+	}
+	events := finalAdapterEvents(sink, "outcome.finalized")
+	if len(events) != 1 {
+		t.Fatalf("outcome.finalized events = %d, want 1", len(events))
+	}
+	if d := events[0].GetAdapter().GetPayload().AsMap(); d["reason"] != prose {
+		t.Errorf("outcome.finalized reason = %v, want the folded prose rendered from the payload lane", d["reason"])
+	}
+}
+
+// Regression (KB-388 review): encoding/json unmarshals the literal `null`
+// document into a NIL map with no error, and SubmitOutcomeArgs.Payload
+// carries the submitted bytes verbatim — so on a typed outcome whose schema
+// requires reason, payload: null + top-level findings prose reached the fold,
+// left the map nil, and the fold's reason assignment panicked with
+// "assignment to entry in nil map", killing the adapter process mid-session
+// exactly during the junk shape-probing this workstream targets. The fold
+// must treat a null payload as an absent one, finalize, and let the fold
+// consume the prose into the required reason member.
+func TestTypedSubmitAcceptsFoldConsumedReasonOnNullPayload(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", reasonRequiredSchema, false, false))
+	sink := &recordingSender{}
+	s.mu.Lock()
+	s.sink = sink
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	const prose = "payload null plus top-level prose folds into the required reason lane"
+	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  prose,
+		Payload: json.RawMessage(`null`),
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q (%s), want success — a null payload is an absent one for the fold",
+			res.ResultType, res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "approved" || s.finalizeAttempts != 1 {
+		t.Errorf("finalized = outcome %q attempts %d, want approved/1", s.finalizedOutcome, s.finalizeAttempts)
+	}
+	if string(s.finalizedPayload) != `{"reason":"`+prose+`"}` {
+		t.Errorf("finalizedPayload = %s, want the folded reason payload on the normalized null", s.finalizedPayload)
+	}
+	if s.finalizedReason != prose {
+		t.Errorf("finalizedReason = %q, want the folded prose", s.finalizedReason)
+	}
+	events := finalAdapterEvents(sink, "outcome.finalized")
+	if len(events) != 1 {
+		t.Fatalf("outcome.finalized events = %d, want 1", len(events))
+	}
+	if d := events[0].GetAdapter().GetPayload().AsMap(); d["reason"] != prose {
+		t.Errorf("outcome.finalized reason = %v, want the folded prose rendered from the payload lane", d["reason"])
+	}
+}
+
+// The KB-263 wrong-lane rejection must stay armed when the fold refused: the
+// schema requires no reason member, so the payload lane has nothing to fold
+// the prose into and the submission rejects in-turn with the typed
+// not-consumed text (repairable within the finalize budget, no adapter
+// event). The payload here carries a field the schema does not require too —
+// the rejection must isolate to the unconsumed reason lane, not the payload.
+func TestTypedSubmitRejectsUnfoldableTopLevelReason(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", verbatimSchema, false, false))
+	sink := &recordingSender{}
+	s.mu.Lock()
+	s.sink = sink
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	res, err := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  "findings prose the contract has no required lane for",
+		Payload: json.RawMessage(`{"verdict":"ok","surprise":"unrequired field"}`),
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if res.ResultType != "failure" {
+		t.Fatalf("ResultType = %q, want failure — unfoldable top-level prose stays wrong-lane", res.ResultType)
+	}
+	if res.TextResultForLLM != typedReasonNotConsumedMessage() {
+		t.Errorf("rejection text =\n%q\nwant the typed not-consumed repair guidance", res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "" || s.finalizeFailureKind != "invalid_params" || s.finalizeAttempts != 1 {
+		t.Errorf("post-rejection state = outcome %q kind %q attempts %d, want \"\"/invalid_params/1",
+			s.finalizedOutcome, s.finalizeFailureKind, s.finalizeAttempts)
+	}
+	for _, ev := range sink.snapshot() {
+		if a := ev.GetAdapter(); a != nil {
+			t.Errorf("rejection must emit no adapter event, got %s", a.GetEventKind())
+		}
+	}
+}
+
+// Same refusal via the payload lane: when the payload already carries its own
+// reason, the fold never overwrites it — the duplicate top-level prose stays
+// unconsumed and must still reject in-turn per the KB-263 ruling.
+func TestTypedSubmitRejectsTopLevelReasonWhenPayloadCarriesReason(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", reasonRequiredSchema, false, false))
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  "duplicate top-level prose",
+		Payload: json.RawMessage(`{"reason":"payload prose"}`),
+	})
+	if res.ResultType != "failure" || res.TextResultForLLM != typedReasonNotConsumedMessage() {
+		t.Errorf("res = %q (%s), want the typed not-consumed rejection — the payload's own reason wins",
+			res.ResultType, res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "" || s.finalizeFailureKind != "invalid_params" || s.finalizeAttempts != 1 {
+		t.Errorf("post-rejection state = outcome %q kind %q attempts %d, want \"\"/invalid_params/1",
+			s.finalizedOutcome, s.finalizeFailureKind, s.finalizeAttempts)
+	}
+}
+
+// A fold-consumed reason does not bypass the contract check: a payload with
+// an unknown member (additionalProperties false) still rejects in-turn with
+// the structured issue list and repair guidance — an outcome.payload_invalid
+// event fires (the signal the burn never produced), no silent fake success.
+func TestTypedSubmitUnknownPayloadFieldStillRejectsInTurn(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved",
+			`{"type":"object","required":["reason"],"additionalProperties":false,"properties":{"reason":{"type":"string"}}}`,
+			false, false))
+	sink := &recordingSender{}
+	s.mu.Lock()
+	s.sink = sink
+	s.mu.Unlock()
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Reason:  "valid fold-consumed prose",
+		Payload: json.RawMessage(`{"bogus":"field"}`),
+	})
+	if res.ResultType != "failure" {
+		t.Fatalf("ResultType = %q (%s), want failure", res.ResultType, res.TextResultForLLM)
+	}
+	if !strings.Contains(res.TextResultForLLM, "the submitted payload does not satisfy the step contract") {
+		t.Errorf("rejection text should be the contract rejection with the issue list, got %q", res.TextResultForLLM)
+	}
+	if !strings.Contains(res.TextResultForLLM, "bogus") {
+		t.Errorf("rejection text should name the unknown member \"bogus\", got %q", res.TextResultForLLM)
+	}
+	if s.finalizedOutcome != "" || s.finalizeFailureKind != "invalid_payload" || s.finalizeAttempts != 1 {
+		t.Errorf("post-rejection state = outcome %q kind %q attempts %d, want \"\"/invalid_payload/1",
+			s.finalizedOutcome, s.finalizeFailureKind, s.finalizeAttempts)
+	}
+	invalidate := adapterEventPayload(sink, "outcome.payload_invalid")
+	if invalidate == nil {
+		t.Error("the in-turn contract rejection must emit outcome.payload_invalid with the issue list")
+	} else if issues, _ := invalidate["issues"].([]any); len(issues) == 0 {
+		t.Errorf("outcome.payload_invalid issues = %v, want at least one", invalidate["issues"])
+	}
+}
+
+// The fold never synthesizes a reason: a payload-only finalize (no top-level
+// reason) on a schema that requires one still rejects in-turn on the
+// missing required member — no silent fake success.
+func TestTypedSubmitPayloadOnlyStillRequiresSchemaReason(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", reasonRequiredSchema, false, false))
+	p := outcomeAdapter(s)
+
+	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{
+		Outcome: "approved",
+		Payload: json.RawMessage(`{}`),
+	})
+	if res.ResultType != "failure" {
+		t.Fatalf("ResultType = %q (%s), want failure — a required reason missing from the payload is not satisfied silently",
+			res.ResultType, res.TextResultForLLM)
+	}
+	if !strings.Contains(res.TextResultForLLM, `missing properties: ["reason"]`) {
+		t.Errorf("rejection text should point at the missing reason member, got %q", res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "" || s.finalizeFailureKind != "invalid_payload" || s.finalizeAttempts != 1 {
+		t.Errorf("post-rejection state = outcome %q kind %q attempts %d, want \"\"/invalid_payload/1",
+			s.finalizedOutcome, s.finalizeFailureKind, s.finalizeAttempts)
+	}
+}
+
 // outcome.finalized on a typed step renders the payload's schema-reason prose
 // — the operative findings, not the absent legacy parameter.
 func TestTypedFinalizedEventRendersPayloadSchemaReason(t *testing.T) {
@@ -1845,37 +2091,106 @@ func TestContractFinalize_FoldsTopLevelReasonIntoRequiredPayload(t *testing.T) {
 	// branch_manager shape: every outcome schema requires {reason: string}. The
 	// model submits the DOCUMENTED shape (reason top-level, payload {}) and the
 	// fold must reconcile it to the payload lane.
-	folded, ok := foldDeclaredPayloadParams("Branch KB-171 restored to the happy path", "",
+	folded, ok, reasonFolded := foldDeclaredPayloadParams("Branch KB-171 restored to the happy path", "",
 		json.RawMessage(`{}`),
 		[]byte(`{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`))
 	if !ok {
 		t.Fatal("documented top-level reason must fold into the required payload")
+	}
+	if !reasonFolded {
+		t.Fatal("the fold must report the top-level reason as consumed (the KB-388 wrong-lane gate reads this)")
 	}
 	if got := string(folded); got != `{"reason":"Branch KB-171 restored to the happy path"}` {
 		t.Fatalf("folded payload wrong: %q", got)
 	}
 }
 
+// Review regression (KB-388): encoding/json unmarshals the literal `null`
+// document into a NIL map with no error, so a submitted payload: null (which
+// reaches the fold verbatim as RawMessage bytes) left the fold's map nil and
+// the reason assignment panicked with "assignment to entry in nil map",
+// killing the adapter process mid-session. A null payload is an absent one
+// for the fold: re-armed, the prose folds into the required reason member.
+func TestContractFinalize_NullPayloadFoldsLikeAbsent(t *testing.T) {
+	folded, ok, reasonFolded := foldDeclaredPayloadParams("Branch KB-388 null-payload prose", "",
+		json.RawMessage(`null`),
+		[]byte(reasonRequiredSchema))
+	if !ok {
+		t.Fatal("a null payload with top-level prose must fold into the required reason member")
+	}
+	if !reasonFolded {
+		t.Fatal("the fold must report the fold-consumed reason (the wrong-lane gate reads this)")
+	}
+	if got := string(folded); got != `{"reason":"Branch KB-388 null-payload prose"}` {
+		t.Fatalf("folded payload wrong: %q", got)
+	}
+}
+
 func TestContractFinalize_NoFoldWhenPayloadComplete(t *testing.T) {
-	folded, ok := foldDeclaredPayloadParams("", "",
+	folded, ok, reasonFolded := foldDeclaredPayloadParams("", "",
 		json.RawMessage(`{"reason":"completed cleanly"}`),
 		[]byte(`{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`))
 	if ok {
 		t.Fatal("payload-complete submission must not fold")
+	}
+	if reasonFolded {
+		t.Fatal("payload-complete submission must not report the reason as fold-consumed")
 	}
 	if got := string(folded); got != `{"reason":"completed cleanly"}` {
 		t.Fatalf("unfolded payload must pass through verbatim: %q", got)
 	}
 }
 
+// KB-388: the fold only reports the reason as consumed when IT wrote the
+// reason member. A payload that already carries its own reason is the payload
+// lane — the top-level prose must not overwrite it, and the fold must refuse
+// the top-level lane entirely (which keeps the wrong-lane rejection armed).
+func TestContractFinalize_FoldNeverOverwritesPayloadReason(t *testing.T) {
+	folded, ok, reasonFolded := foldDeclaredPayloadParams("top-level prose",
+		"",
+		json.RawMessage(`{"reason":"payload prose"}`),
+		[]byte(reasonRequiredSchema))
+	if ok {
+		t.Fatalf("payload-complete submission must not fold: %q", string(folded))
+	}
+	if reasonFolded {
+		t.Fatal("a payload that carries its own reason must not report the top-level reason as fold-consumed")
+	}
+	if got := string(folded); got != `{"reason":"payload prose"}` {
+		t.Fatalf("payload must pass through verbatim: %q", got)
+	}
+}
+
+// KB-388 gate nuance: a fold that consumed only the COMMENT did not consume
+// the top-level reason — the wrong-lane rejection must stay armed for prose
+// the schema has no required lane for.
+func TestContractFinalize_CommentOnlyFoldDoesNotConsumeReason(t *testing.T) {
+	folded, ok, reasonFolded := foldDeclaredPayloadParams("top-level prose",
+		"note",
+		json.RawMessage(`{}`),
+		[]byte(`{"type":"object","required":["comment"],"properties":{"comment":{"type":"string"}}}`))
+	if !ok {
+		t.Fatal("the comment must fold into the required payload")
+	}
+	if reasonFolded {
+		t.Fatal("a comment-only fold must not report the top-level reason as fold-consumed")
+	}
+	if got := string(folded); got != `{"comment":"note"}` {
+		t.Fatalf("folded payload wrong: %q", got)
+	}
+}
+
 func TestContractFinalize_EmptyTopLevelReasonDoesNotFakeSuccess(t *testing.T) {
 	// The original 282-loop shape: reason EMPTY top-level + empty payload MUST
 	// still reject -- the fold never synthesizes a fake reason.
-	folded, ok := foldDeclaredPayloadParams("", "",
+	folded, ok, reasonFolded := foldDeclaredPayloadParams("", "",
 		json.RawMessage(`{}`),
 		[]byte(`{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`))
 	if ok {
 		t.Fatal("empty reason + empty payload must never fold")
+	}
+	if reasonFolded {
+		t.Fatal("empty reason + empty payload must never report the reason as fold-consumed")
 	}
 	if issues := validateContractPayload(folded,
 		[]byte(`{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`)); len(issues) == 0 {

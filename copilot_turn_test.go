@@ -934,14 +934,21 @@ func TestContractConveyanceRendering(t *testing.T) {
 
 // KB-260: typed (schema-declaring) contracts convey the payload-as-output
 // doctrine alongside the schema — findings belong under the payload's
-// declared fields and a top-level reason is a wrong-lane submission; the
-// schemaless and fallback contracts gain no such clause (their lanes are not
-// payload-schema lanes).
+// declared fields, a top-level reason is folded into the payload when the
+// contract's schema requires a reason member the payload lacks, and it is
+// wrong-lane-rejected only otherwise (KB-388); the schemaless and fallback
+// contracts gain no such clause (their lanes are not payload-schema lanes).
 func TestContractConveyancePayloadAsOutputOnTypedContracts(t *testing.T) {
 	typedOnly := contractConveyance([]*v2.OutcomeContract{
 		{Name: "approved", SchemaJson: []byte(`{"type":"object"}`)},
 	})
-	for _, want := range []string{"the payload is the output", "findings belong under the payload's declared fields", "must not carry a top-level `reason`"} {
+	for _, want := range []string{
+		"the payload is the output",
+		"findings belong under the payload's declared fields",
+		"a top-level `reason` is folded into the payload",
+		"requires a `reason` member that the submitted payload does not supply",
+		"wrong-lane-rejected only when there is no such lane",
+	} {
 		if !strings.Contains(typedOnly, want) {
 			t.Errorf("typed contract conveyance missing %q:\n%s", want, typedOnly)
 		}
