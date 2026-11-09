@@ -197,6 +197,22 @@ type sessionState struct {
 	finalizedPayload json.RawMessage
 	finalizedComment string
 
+	// KB-391 step tool surface. stepSurface is the submit_outcome surface the
+	// SDK session is currently bound to, derived from the executing step's
+	// outcome contracts (nil = the session-lifetime static surface: the
+	// contract-less lane, byte-identical to the pre-KB-391 tool). A typed
+	// step re-binds the session's submit_outcome tool from the step's
+	// contracts when the surface digest differs from the bound one
+	// (ensureStepSurface, copilot_surface.go); nil stays the static lane.
+	// stepSessionConfig/stepResumeConfig are the session/resume configs that
+	// carry the step-bound tool — reopenSession reuses them while the surface
+	// is bound so transport recovery preserves the re-declaration. All three
+	// are guarded by mu; reads on the hot path are pointer loads of values
+	// fixed at bind time.
+	stepSurface       *stepToolSurface
+	stepSessionConfig *copilot.SessionConfig
+	stepResumeConfig  *copilot.ResumeSessionConfig
+
 	// KB-47 repair state. inRepairMode marks a step being re-finalized after a
 	// host ExecutionRejection; inRepairAttempt is the host-provided attempt
 	// number echoed in repair events. createdEpoch counts adapter-side SDK
@@ -377,6 +393,20 @@ func (s *sessionState) swapSession(sess copilotSession) {
 	if old != nil {
 		_ = old.Disconnect()
 	}
+}
+
+// boundSubmitSurface returns the submit_outcome surface the SDK session is
+// currently bound to (nil = the static lane, KB-391). It is the strict
+// decode's allowlist source of truth: a step surface declares exactly its
+// rendered properties, so top-level reason on a typed step is an
+// unknown-parameter rejection at the decode layer.
+func (s *sessionState) boundSubmitSurface() *stepToolSurface {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stepSurface
 }
 
 // currentSession returns the SDK session currently backing this adapter
@@ -688,27 +718,22 @@ func (p *copilotAdapter) openSDKSession(ctx context.Context, client copilotClien
 
 // buildSessionConfig constructs the SDK SessionConfig from agent-level config fields.
 func (p *copilotAdapter) buildSessionConfig(cfg map[string]string, adapterSessionID string) *copilot.SessionConfig {
-	// Register submit_outcome once per session as a hand-built Tool (KB-47):
-	// a static structural parameter schema — outcome: string, reason: string
-	// (both required), comment: string, payload: {type: object}, and
-	// additionalProperties: false (KB-216) — with no per-step enum. Tools
-	// bind only at
-	// session create/resume (the SDK has no Session-level tool mutation), so
-	// the enforceable per-step specifics (allowed outcome set, payload schema,
-	// require_comment) stay prompt-conveyed and handler-validated. Validation
-	// against the active step's allowed set and contracts happens in
-	// handleSubmitOutcome at call time so per-step scoping works without
-	// recreating the session. The handler decodes the already-decoded `any`
-	// arguments envelope itself (decodeSubmitOutcomeArgs).
-	submitTool := copilot.Tool{
-		Name:           submitOutcomeToolName,
-		Description:    submitOutcomeToolDescription,
-		Parameters:     submitOutcomeToolParameters(),
-		SkipPermission: true,
-		Handler: func(invocation copilot.ToolInvocation) (copilot.ToolResult, error) {
-			return p.handleSubmitOutcomeRaw(adapterSessionID, invocation)
-		},
-	}
+	// Register submit_outcome with the static session-lifetime surface
+	// (submitToolFor with a nil surface, KB-47): a structural parameter schema
+	// — outcome: string, reason: string (both required), comment: string,
+	// payload: {type: object}, and additionalProperties: false (KB-216). This
+	// static lane is the contract-less step's tool, byte-identical to the
+	// pre-KB-391 declaration. Tools bind only at session create/resume (the
+	// SDK has no session-level tool mutation), so a typed step whose derived
+	// surface differs from the bound one re-opens the SDK session — resume
+	// preferred, conversation preserved — with submit_outcome re-declared
+	// from the step's outcome contracts (ensureStepSurface,
+	// copilot_surface.go); unchanged-shape steps cost no re-open (digest-keyed).
+	// Validation against the active step runs in handleSubmitOutcome at call
+	// time, and the handler decodes the already-decoded `any` arguments
+	// envelope itself (decodeSubmitOutcomeArgs) keyed on the bound surface's
+	// declared argument set.
+	submitTool := p.submitToolFor(adapterSessionID, nil)
 
 	// Register adapter_tool (CRI-178): the agent-invocable channel for calls
 	// to other adapters' tools. SkipPermission stays false — the call the

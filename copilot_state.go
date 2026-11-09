@@ -154,7 +154,21 @@ func (p *copilotAdapter) Restore(ctx context.Context, req *v2.RestoreRequest) (*
 			"adapterSession", sessionID, "sdkSession", token, "err", err)
 		return nil, fmt.Errorf("copilot: reattach session %q to %q: %w", sessionID, token, err)
 	}
-	sess, err := client.ResumeSessionWithOptions(ctx, token, s.resumeConfig)
+	// Surface-aware reattach, like every other re-open path: while a step
+	// surface is bound, the resumed conversation must present the step's
+	// submit_outcome schema, not the static reason-carrying one — otherwise
+	// the model is taught the static schema while the adapter's strict decode
+	// enforces the bound step surface, and the digest-keyed ensureStepSurface
+	// would never re-open to repair the desync (review 5821523125). The
+	// recorded binding stays untouched: surfaceSessionConfigs returns the
+	// step-bound pair while a step surface is in force, so the binding keeps
+	// describing what was actually resumed and the next same-shape execute
+	// costs zero re-opens. Exact-address semantics are unchanged: resumed
+	// directly from the token (deliberately NOT p.openSDKSession, whose
+	// fresh-create fallback Restore must never take), loud terminal failure
+	// on error.
+	_, resumeCfg := s.surfaceSessionConfigs()
+	sess, err := client.ResumeSessionWithOptions(ctx, token, resumeCfg)
 	if err != nil {
 		slog.Error(
 			"copilot: state reattach failed; failing the restore loudly — no fresh-session fallback "+

@@ -3,10 +3,9 @@ module github.com/brokenbots/criteria-adapter-copilot
 go 1.26.10
 
 require (
-	github.com/brokenbots/criteria-adapter-proto v0.7.0
-	github.com/brokenbots/criteria-go-adapter-sdk v0.5.4
+	github.com/brokenbots/criteria-adapter-proto v0.7.1-0.20261019051615-3a3aa0c1cb85
+	github.com/brokenbots/criteria-go-adapter-sdk v0.7.0
 	github.com/github/copilot-sdk/go v1.0.0
-	github.com/google/jsonschema-go v0.4.2
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-plugin v1.8.0
 	google.golang.org/grpc v1.83.2
@@ -19,6 +18,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/hashicorp/go-hclog v1.6.3 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
@@ -28,8 +28,8 @@ require (
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
-	golang.org/x/net v0.60.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 )

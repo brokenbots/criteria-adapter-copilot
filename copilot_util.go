@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	v2 "github.com/brokenbots/criteria-adapter-proto/criteria/v2"
+	adapterhost "github.com/brokenbots/criteria-go-adapter-sdk/adapterhost"
 )
 
 const redactedPlaceholder = "[REDACTED]"
@@ -125,6 +126,35 @@ func contractResultEvent(outcome string, payload json.RawMessage, comment string
 			Comment:     redactSecrets(comment, secrets),
 		}},
 	}
+}
+
+// sendPushPreflightDiagnostic emits the KB-391 defensive pre-flight
+// diagnostic for a recorded finalize whose candidate result no longer matches
+// the step's active contracts at the terminal push boundary. The diagnostic
+// is drift evidence only: the result still forwards unchanged (the engine's
+// attempt loop remains the authoritative backstop), and the event's issues
+// ride the same truncation and secret-redaction as the in-turn rejection
+// channel.
+func sendPushPreflightDiagnostic(sink adapterhost.ExecuteEventSender, outcome string, issues []string, secrets []string) {
+	if sink == nil || len(issues) == 0 {
+		return
+	}
+	issueList := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		issueList = append(issueList, truncateText(issue, maxContractIssueLen))
+	}
+	issueJSON, err := json.Marshal(issueList)
+	if err != nil {
+		issueJSON = []byte("[]")
+	}
+	var redactedIssues []any
+	if err := json.Unmarshal([]byte(redactSecrets(string(issueJSON), secrets)), &redactedIssues); err != nil {
+		redactedIssues = []any{}
+	}
+	_ = sink.Send(adapterEvent("outcome.preflight_failed", map[string]any{
+		"outcome": outcome,
+		"issues":  redactedIssues,
+	}))
 }
 
 // fallbackResultEvent builds the terminal ExecuteEvent for a fallback-contract

@@ -10,13 +10,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
-	copilot "github.com/github/copilot-sdk/go"
+	v2 "github.com/brokenbots/criteria-adapter-proto/criteria/v2"
+	adapterhost "github.com/brokenbots/criteria-go-adapter-sdk/adapterhost"
 
-	"github.com/google/jsonschema-go/jsonschema"
+	copilot "github.com/github/copilot-sdk/go"
 )
 
 // maxContractIssueLen bounds each issue echoed back to the model in in-turn
@@ -25,17 +27,23 @@ import (
 // secret-redacted before it reaches any prompt.
 const maxContractIssueLen = 2000
 
-// SubmitOutcomeArgs is the typed parameter struct for the `submit_outcome` tool.
-// The tool is registered as a hand-built SDK Tool (static parameter schema via
-// Tool.Parameters), not via DefineTool reflection, so the shape is
-// adapter-controlled. The schema deliberately does NOT encode an enum for
-// Outcome — the Copilot Go SDK (v1.0.0) binds tools only at
-// CreateSession/ResumeSessionWithOptions with no Session-level tool-mutation
-// API, so a per-step enum would require resuming the session once per step,
-// which the design explicitly rejects. Validation runs in the tool handler
-// against the active step's allowed_outcomes set and, when the step carries
-// outcome contracts (v0.7.0 contract mode), the matched contract's schema —
-// both carried on sessionState.
+// SubmitOutcomeArgs is the typed parameter struct for the `submit_outcome`
+// tool. The tool's NAME stays `submit_outcome` for every step: the
+// served-tools probe (verifySubmitOutcomePresented) and the compat machinery
+// key on that exact string, while wording and schema phrasing are this
+// adapter's prerogative (KB-391).
+//
+// KB-391 (dave ruling 2026-11-08): how the adapter presents this tool, what
+// the model is taught to call, and how model shape translates back to wire
+// shape is ADAPTER-INTERNAL. The step's declared outcome contracts already
+// ride every Execute request (req.GetOutcomeContracts()), and
+// copilot_surface.go re-opens the SDK session's submit_outcome binding FROM
+// those contracts whenever the arriving surface's shape differs from the
+// bound one (digest-keyed: unchanged steps cost zero re-opens). A schema
+// step's truth is therefore schema-declared — outcome enum, payload
+// properties, required comment — instead of prompt-conveyed. This struct is
+// the decode-layer truth for the static legacy lane (contract-less steps,
+// byte-identical) and the fallback decode of a freshly-bound surface.
 //
 // KB-216: the parameter contract is DECLARED, not implicit. outcome is the
 // required member of the schema the model sees (the only per-lane
@@ -56,20 +64,13 @@ const maxContractIssueLen = 2000
 // member the payload lacks) lands in the payload and finalizes accepted,
 // while one the fold refuses (no such required member, or the payload
 // supplies its own) is a wrong-lane submission rejected with the same typed
-// not-consumed shape. The outcome.finalized event renders the operative
-// prose from the payload — for a fold-consumed reason that is the exact
-// top-level prose.
-//
-// KB-260 re-bind (dave, 10-14): the static schema previously advertised
-// top-level reason as uniformly required, mis-teaching typed steps (the
-// model paid a reason onto a lane whose output is the payload). The schema's
-// docs now teach the per-step lanes — reason required on contract-less
-// steps, payload-as-output on schema-declaring contracts — while the
-// per-step truth stays prompt-conveyed and handler-enforced: SDK tools bind
-// per session, so no per-step required list is expressible on the static
-// schema itself, and the legacy lane's reason requirement is enforced in
-// turn (an empty/absent reason on a step without outcome contracts is
-// rejected — KB-260 review B1).
+// not-consumed shape. That fold machinery is compat surface: it stays
+// reachable only on legacy/untyped lanes (and mixed steps' untyped branch)
+// for old engines that never deliver contracts; the KB-391 schema-declared
+// surface teaches typed steps the payload lane directly, so the fold never
+// fires there. The outcome.finalized event renders the operative prose from
+// the payload — for a fold-consumed reason that is the exact top-level
+// prose.
 type SubmitOutcomeArgs struct {
 	Outcome string `json:"outcome"`          // required; must be a member of the active allowed set
 	Reason  string `json:"reason,omitempty"` // required-and-enforced on contract-less steps; on typed steps folded into the payload when the contract requires it, wrong-lane-rejected when the fold refuses it (KB-263/KB-388)
@@ -102,17 +103,19 @@ var submitOutcomeParamDocs = map[string][2]string{
 }
 
 // submitOutcomeToolParameters is the static parameter JSON Schema the
-// hand-built submit_outcome tool presents to the model. KB-216: it declares
-// the full parameter contract — additionalProperties false and per-parameter
+// hand-built submit_outcome tool presents to the model on contract-less
+// steps (and before a step surface binds). KB-216: it declares the full
+// parameter contract — additionalProperties false and per-parameter
 // descriptions that say what belongs where — so a call that does not match is
-// a loud rejection instead of a silently-accepted shape. KB-260 re-bind:
-// `outcome` is the only required member (the per-lane universal); reason's
-// requirement is lane-specific (required on contract-less steps — enforced
-// in-turn — and wrong-lane-rejected on typed steps). The enforceable
-// per-step specifics (allowed set, payload schema, require_comment) remain
-// prompt-conveyed and handler-validated, and there is no per-step enum or
-// required list on outcome (SDK tools bind per session), which is what makes
-// per-step contracts possible with a session-bound tool.
+// a loud rejection instead of a silently-accepted shape. `outcome` is the
+// only required member (the per-lane universal); reason's requirement is
+// lane-specific (required on contract-less steps — enforced in-turn — and an
+// unknown parameter at the decode layer on typed steps). KB-391
+// re-declaration: on a step that arrives with outcome contracts the session
+// tool is re-bound FROM those contracts (copilot_surface.go, digest-keyed),
+// so the outcome enum, the payload's schema members, and the required
+// comment member are schema-declared on the bound surface; this static
+// schema is the legacy lane, byte-identical for contract-less steps.
 func submitOutcomeToolParameters() map[string]any {
 	properties := make(map[string]any, len(declaredSubmitOutcomeParams))
 	for _, param := range declaredSubmitOutcomeParams {
@@ -157,7 +160,7 @@ func (e *submitArgsDecodeError) Error() string { return e.message }
 // lost the reviewer's findings text with no error and no retry signal — and
 // the rejection names the unexpected keys plus the declared set so the model
 // retries with the correct names inside the existing finalize budget.
-func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeArgs, error) {
+func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation, surface *stepToolSurface) (SubmitOutcomeArgs, error) {
 	if invocation.Arguments == nil {
 		return SubmitOutcomeArgs{}, nil
 	}
@@ -165,12 +168,22 @@ func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeAr
 	if err != nil {
 		return SubmitOutcomeArgs{}, fmt.Errorf("submit_outcome arguments could not be encoded: %w", err)
 	}
-	if unexpected := unexpectedSubmitArgsKeys(raw); len(unexpected) > 0 {
+	declared := declaredSubmitParamsFor(surface)
+	if unexpected := unexpectedSubmitArgsKeys(raw, declared); len(unexpected) > 0 {
+		// Retry guidance is surface-aware: on a lane whose surface still
+		// declares reason (static or untyped step) the findings text belongs
+		// in reason; on a typed step the payload schema's declared members
+		// are the submission surface, and there is no top-level reason at all
+		// (KB-391: the reason rejection is schema-level, at this decode).
+		guidance := "the step's findings text belongs in the required \"reason\" parameter."
+		if surface != nil && !slices.Contains(declared, "reason") {
+			guidance = "the payload is this step's output: findings and structured results belong under the declared payload schema members, and no top-level reason parameter exists."
+		}
 		return SubmitOutcomeArgs{}, &submitArgsDecodeError{
 			kind: "invalid_params",
 			message: fmt.Sprintf(
-				"submit_outcome received unknown parameter(s) %s; the declared parameters are %s. Retry with the declared names — the step's findings text belongs in the required \"reason\" parameter.",
-				quoteJoin(unexpected), quoteJoin(declaredSubmitOutcomeParams),
+				"submit_outcome rejected: unknown parameter(s) %s; the declared parameters are %s. Retry with the declared names — %s",
+				quoteJoin(unexpected), quoteJoin(declared), guidance,
 			),
 		}
 	}
@@ -187,16 +200,17 @@ func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeAr
 }
 
 // unexpectedSubmitArgsKeys returns the envelope keys outside the declared
-// parameter set, sorted for a deterministic rejection message. A non-object
-// envelope contributes no names — it is rejected by the struct decode with its
-// own guidance instead.
-func unexpectedSubmitArgsKeys(raw []byte) []string {
+// parameter set (caller-provided: the static declared set or the bound step
+// surface's rendered property names, KB-391), sorted for a deterministic
+// rejection message. A non-object envelope contributes no names — it is
+// rejected by the struct decode with its own guidance instead.
+func unexpectedSubmitArgsKeys(raw []byte, declaredParams []string) []string {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &envelope); err != nil || len(envelope) == 0 {
 		return nil
 	}
-	declared := make(map[string]struct{}, len(declaredSubmitOutcomeParams))
-	for _, key := range declaredSubmitOutcomeParams {
+	declared := make(map[string]struct{}, len(declaredParams))
+	for _, key := range declaredParams {
 		declared[key] = struct{}{}
 	}
 	var unexpected []string
@@ -226,7 +240,13 @@ func quoteJoin(items []string) string {
 // message; a ToolResult — not a Go error — is returned in every case so the
 // model can retry within the same turn.
 func (p *copilotAdapter) handleSubmitOutcomeRaw(adapterSessionID string, invocation copilot.ToolInvocation) (copilot.ToolResult, error) {
-	args, err := decodeSubmitOutcomeArgs(invocation)
+	// The strict decode allowlist is the surface the SDK session is currently
+	// bound to (KB-391): a typed step rejects a top-level reason key here —
+	// schema-level, decode-layer — rather than at the handler's wrong-lane
+	// fold, which remains authoritative only on lanes whose surface declares
+	// reason (static, untyped step).
+	surface := p.getSession(adapterSessionID).boundSubmitSurface()
+	args, err := decodeSubmitOutcomeArgs(invocation, surface)
 	if err != nil {
 		// A rejected call consumed one finalize attempt; the classification is
 		// the typed decode error's kind so operators can distinguish
@@ -272,9 +292,12 @@ type contractRejection struct {
 // (one truncated bullet per issue) after a one-line cause.
 func (r *contractRejection) message(outcome string) string {
 	var b strings.Builder
-	if r.kind == "comment_missing" {
+	switch r.kind {
+	case "comment_missing":
 		fmt.Fprintf(&b, "finalize rejected for outcome %q: a comment is required and none was supplied.\n", outcome)
-	} else {
+	case "invalid_outcome":
+		fmt.Fprintf(&b, "finalize rejected for outcome %q: no outcome contract governs that outcome on this step's contract set.\n", outcome)
+	default:
 		fmt.Fprintf(&b, "finalize rejected for outcome %q: the submitted payload does not satisfy the step contract.\n", outcome)
 	}
 	for _, issue := range r.issues {
@@ -284,51 +307,100 @@ func (r *contractRejection) message(outcome string) string {
 	return b.String()
 }
 
-// checkContractFinalize enforces the matched outcome contract on a finalize
-// call in contract mode. The caller holds s.mu. Returns nil when the outcome
-// carries no contract entry (the host's post-finalize validation owns
-// outcome_uncontracted; the adapter only enforces the matched contract's
-// schema and require_comment per the v0.7.0 split) or when the submission
-// satisfies it; otherwise a contractRejection with the issue list.
+// checkContractFinalize pre-flights a finalize call against the step's
+// outcome contracts with the SDK's pinned evaluator wrapper (KB-391: the
+// adapter validates with the SDK contract helpers BEFORE pushing the
+// ExecuteResult; the engine re-validates as the backstop through the existing
+// attempt loop). The caller holds s.mu. Returns nil when the submission
+// satisfies the contracts; otherwise a contractRejection carrying the pinned,
+// ordered issue list, classified into the rejection lane:
 //
-// Typed-lane parameter reconciliation: the submit_outcome tool schema
-// documents "reason" as a required TOP-LEVEL parameter, while typed contracts
-// can require a member of the same name INSIDE the payload. When the
-// submitted payload fails the schema only on members the model supplied as
-// documented top-level parameters, those members are folded into the payload
-// during validation — the same reconcile the host performs at the verdict
-// funnel — instead of an in-turn rejection that contradicts the tool schema
-// the model must follow (the live KB-171 loop shape). Since KB-388 the fold's
+//   - "comment_missing": every issue comments on the require_comment lane
+//     (the payload being otherwise clean);
+//   - "invalid_payload": payload-schema issues (a missing comment rides along
+//     when both lanes are wrong — the payload issues dominate);
+//   - "invalid_outcome": the finalized outcome has no contract entry. KB-391
+//     moves this host-owned post-finalize rejection into the in-turn
+//     pre-flight, so the model can repair within the finalize budget; the
+//     engine still re-validates.
+//
+// The candidate is the canonical finalize wire shape: the normalized payload
+// as outputs_json and the trimmed comment (whitespace-only comments are
+// missing, matching the trimmed comment the finalize stores). Typed-lane
+// parameter reconciliation: the submit_outcome tool schema documents "reason"
+// as a required TOP-LEVEL parameter, while typed contracts can require a
+// member of the same name INSIDE the payload — that reconcile happens in
+// handleSubmitOutcome before this check (foldDeclaredPayloadParams), the same
+// shape the host performs at the verdict funnel. Since KB-388 the fold's
 // consumption is also honored at the wrong-lane gate in handleSubmitOutcome,
 // so a fold-consumed reason finalizes instead of being discarded by the
 // rejection one call after the fold computed it.
 func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMessage, comment string) *contractRejection {
-	contract := s.activeContracts[outcome]
-	if contract == nil {
+	if len(s.activeContracts) == 0 {
 		return nil
 	}
-	schema := contract.GetSchemaJson()
-	requireComment := contract.GetRequireComment()
-	commentMissing := requireComment && strings.TrimSpace(comment) == ""
-	var issues []string
-	if commentMissing {
-		issues = append(issues, fmt.Sprintf(
-			"the outcome %q requires a finalize comment (require_comment); none was supplied", outcome))
-	}
-	if len(schema) > 0 {
-		issues = append(issues, validateContractPayload(payload, schema)...)
-	}
+	issues := evaluateFinalizeCandidate(sortedContractList(s.activeContracts), outcome, payload, comment)
 	if len(issues) == 0 {
 		return nil
 	}
-	// Comment-missing is its own in-turn class, but only when the payload is
-	// otherwise clean; when both are wrong the payload issues dominate the
-	// rejection message and the classification.
-	kind := "invalid_payload"
-	if commentMissing && len(issues) == 1 {
-		kind = "comment_missing"
+	return &contractRejection{kind: contractRejectionKind(issues), issues: issues}
+}
+
+// evaluateFinalizeCandidate pre-flights one finalize candidate over a contract
+// set with the SDK's pinned evaluator wrapper (KB-391): nil issues means the
+// result is safe to push across the Execute stream as-is. The payload is
+// normalized to the finalize wire shape (absent/empty/null = {}) and the
+// comment is the trimmed finalize comment the result will carry.
+func evaluateFinalizeCandidate(contracts []*v2.OutcomeContract, outcome string, payload json.RawMessage, comment string) []string {
+	candidate := &v2.ExecuteResult{
+		Outcome:     outcome,
+		Comment:     comment,
+		OutputsJson: normalizedFinalizePayload(payload),
 	}
-	return &contractRejection{kind: kind, issues: issues}
+	return adapterhost.ValidateOutcomeResult(contracts, candidate)
+}
+
+// pushBoundaryIssuesLocked re-runs the pinned evaluator over an already
+// recorded finalize at the terminal push boundary (KB-391 defensive
+// pre-flight): the finalize passed the in-turn checks at submit, this re-checks
+// that the contract set on file still accepts the candidate before the result
+// rides the Execute stream — catching contract drift between accept and push
+// (an Execute re-handshake on the session, a repair path recording outside the
+// handler). Caller holds s.mu. Legacy mode (no contracts) is always clean.
+func (s *sessionState) pushBoundaryIssuesLocked(outcome string, payload json.RawMessage, comment string) []string {
+	if !s.contractMode || len(s.activeContracts) == 0 {
+		return nil
+	}
+	return evaluateFinalizeCandidate(sortedContractList(s.activeContracts), outcome, payload, comment)
+}
+
+// contractRejectionKind classifies the pinned issue list into the rejection
+// lane: a require_comment issue keeps its dedicated class when the payload is
+// otherwise clean; payload-schema issues dominate a multi-lane rejection; the
+// remaining issues are the outcome-level contract-coverage lane. The
+// issue-string prefixes matched here ("missing_comment: ", "payload_schema: ")
+// are byte-for-byte pinned by the conformance spec alongside the SDK
+// evaluator — the string coupling is deliberate, not accidental.
+func contractRejectionKind(issues []string) string {
+	commentOnly := true
+	payloadIssue := false
+	for _, issue := range issues {
+		if strings.HasPrefix(issue, "missing_comment: ") {
+			continue
+		}
+		commentOnly = false
+		if strings.HasPrefix(issue, "payload_schema: ") {
+			payloadIssue = true
+		}
+	}
+	switch {
+	case commentOnly:
+		return "comment_missing"
+	case payloadIssue:
+		return "invalid_payload"
+	default:
+		return "invalid_outcome"
+	}
 }
 
 // foldDeclaredPayloadParams folds documented top-level submit parameters into
@@ -417,75 +489,6 @@ func (s *sessionState) activeContractSchemaFor(outcome string) []byte {
 		return contract.GetSchemaJson()
 	}
 	return nil
-}
-
-// validateContractPayload validates the model-submitted payload against one
-// contract's schema_json using github.com/google/jsonschema-go (already in the
-// module graph via the Copilot SDK). Per the proto's pinned semantics, a
-// missing, empty, or literal-null payload is treated as an empty object, so a
-// schema with required properties reports them as missing instead of waving
-// the empty payload through. Returns the validator's issue list (empty =
-// valid); issue text is the validator's structured messages, truncated and
-// never nil-safe-guessed.
-func validateContractPayload(payload json.RawMessage, schemaJSON []byte) []string {
-	if len(schemaJSON) == 0 {
-		// No payload contract: everything valid (proto: empty schema_json =
-		// outputs_json forwarded verbatim).
-		return nil
-	}
-	instance, instanceIssue := payloadInstance(payload)
-	if instanceIssue != "" {
-		return []string{instanceIssue}
-	}
-
-	var schema jsonschema.Schema
-	if err := schema.UnmarshalJSON(schemaJSON); err != nil {
-		return []string{fmt.Sprintf("the step contract's schema is not a valid JSON Schema: %s",
-			truncateText(err.Error(), maxContractIssueLen))}
-	}
-	resolved, err := schema.Resolve(nil)
-	if err != nil {
-		return []string{fmt.Sprintf("the step contract's schema could not be resolved: %s",
-			truncateText(err.Error(), maxContractIssueLen))}
-	}
-	if err := resolved.Validate(instance); err != nil {
-		return splitIssueLines(err.Error())
-	}
-	return nil
-}
-
-// payloadInstance decodes the submitted payload into the instance value the
-// validator sees, applying the proto's absent/empty/null = empty-object
-// semantics and normalizing those cases to `{}` for verbatim storage. The
-// second return is an issue string when the payload bytes do not decode to a
-// single JSON value.
-func payloadInstance(payload json.RawMessage) (any, string) {
-	trimmed := bytes.TrimSpace(payload)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return map[string]any{}, ""
-	}
-	var instance any
-	if err := json.Unmarshal(trimmed, &instance); err != nil {
-		return nil, fmt.Sprintf("the submitted payload does not decode to a JSON object: %s",
-			truncateText(err.Error(), maxContractIssueLen))
-	}
-	return instance, ""
-}
-
-// splitIssueLines splits a validator error into one structured issue per line,
-// truncating each. jsonschema-go reports the first failing rule per instance
-// as a single error string, so in practice this yields one entry.
-func splitIssueLines(errText string) []string {
-	var issues []string
-	for _, line := range strings.Split(errText, "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			issues = append(issues, line)
-		}
-	}
-	if len(issues) == 0 {
-		issues = []string{errText}
-	}
-	return issues
 }
 
 // normalizedFinalizePayload applies the proto's absent/empty/null = empty-object

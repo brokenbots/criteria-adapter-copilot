@@ -345,7 +345,8 @@ func (p *copilotAdapter) reopenSession(ctx context.Context, s *sessionState) {
 	if client == nil || s.boundClientEpoch == epoch {
 		return
 	}
-	sess, resumed, err := p.openSDKSession(ctx, client, s.adapterSessionID, s.sessionConfig, s.resumeConfig)
+	sessionCfg, resumeCfg := s.surfaceSessionConfigs()
+	sess, resumed, err := p.openSDKSession(ctx, client, s.adapterSessionID, sessionCfg, resumeCfg)
 	if err != nil {
 		slog.Warn("copilot: reopen sdk session failed", "adapterSession", s.adapterSessionID, "err", err)
 		return
