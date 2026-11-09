@@ -12,10 +12,12 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -376,4 +378,158 @@ func (p *copilotAdapter) submitToolFor(adapterSessionID string, surface *stepToo
 			return p.handleSubmitOutcomeRaw(adapterSessionID, invocation)
 		},
 	}
+}
+
+// surfaceDigestOf fingerprints the surface a session is bound to, with the
+// static lane digesting as "" so the digest comparison covers both
+// directions of a static-to-step or step-to-static transition.
+func surfaceDigestOf(surface *stepToolSurface) string {
+	if surface == nil {
+		return ""
+	}
+	return surface.digest
+}
+
+// withSubmitToolSurface clones the session config with submit_outcome
+// re-rendered for the given step surface; adapter_tool, the permission hook,
+// model, streaming and config-discovery posture carry over unchanged. Returns
+// nil when there is no static config to derive from or the base carries no
+// submit_outcome binding to replace (KB-43: never invent tool surface).
+func withSubmitToolSurface(base *copilot.SessionConfig, submitTool copilot.Tool) *copilot.SessionConfig {
+	if base == nil {
+		return nil
+	}
+	replaced := false
+	tools := make([]copilot.Tool, 0, len(base.Tools))
+	for _, t := range base.Tools {
+		if t.Name == submitOutcomeToolName {
+			t = submitTool
+			replaced = true
+		}
+		tools = append(tools, t)
+	}
+	if !replaced {
+		return nil
+	}
+	cfg := *base
+	cfg.Tools = tools
+	return &cfg
+}
+
+// surfaceSessionConfigs returns the session/resume configs to open the SDK
+// session with: the step-bound pair while a step surface is bound, the static
+// originals otherwise (KB-391). Caller must hold reopenMu (or otherwise be
+// serialized against surface re-binds) for the pair to stay consistent.
+func (s *sessionState) surfaceSessionConfigs() (*copilot.SessionConfig, *copilot.ResumeSessionConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stepSurface != nil && s.stepSessionConfig != nil {
+		return s.stepSessionConfig, s.stepResumeConfig
+	}
+	return s.sessionConfig, s.resumeConfig
+}
+
+// ensureStepSurface re-declares submit_outcome for the executing step (KB-391)
+// when the step's derived surface differs from the one the SDK session is
+// currently bound to. Contract-less steps (nil derived surface on an
+// unbound/static session) and consecutive same-shape steps cost zero re-opens:
+// the decision is keyed on the surface digest. Repair-mode executes never
+// re-open — the rejection loop re-executes the same step, so the bound surface
+// stays in force. When a re-open is needed, the session is resumed via the
+// persisted SDK session ID so the conversation history survives the surface
+// change, falling back to a fresh create (which bumps createdEpoch, mirroring
+// reopenSession, so repair logic cannot assume the prior finalize is still
+// in-conversation). Open failures degrade to the previously bound surface with
+// a loud warning: the decode allowlist and handler stay keyed on session
+// state, which still reflects the in-force surface.
+//
+// Returns the surface in force for this execute — the newly declared one on a
+// successful re-open, the previously bound one otherwise (nil = static).
+func (p *copilotAdapter) ensureStepSurface(ctx context.Context, s *sessionState, allowed []string, contracts []*v2.OutcomeContract) *stepToolSurface {
+	if s == nil {
+		return nil
+	}
+	want := submitSurfaceFromStep(allowed, contracts)
+
+	s.mu.Lock()
+	bound := s.stepSurface
+	inRepair := s.inRepairMode
+	s.mu.Unlock()
+	if inRepair || want != nil && bound != nil && want.digest == bound.digest {
+		return bound
+	}
+	if want == nil && bound == nil {
+		return nil
+	}
+
+	sessionCfg, resumeCfg := s.sessionConfig, s.resumeConfig
+	if want != nil {
+		sessionCfg = withSubmitToolSurface(s.sessionConfig, p.submitToolFor(s.adapterSessionID, want))
+		if sessionCfg == nil {
+			// No static config to derive from (bare unit-test state without a
+			// completed open): keep the previous binding rather than open a
+			// session that would not present the step's surface.
+			slog.Warn("copilot: step surface re-declaration skipped; no session config to derive from",
+				"adapterSession", s.adapterSessionID, "surfaceDigest", surfaceDigestOf(want))
+			return bound
+		}
+		resumeCfg = buildResumeConfig(sessionCfg)
+	}
+
+	s.reopenMu.Lock()
+	defer s.reopenMu.Unlock()
+
+	p.mu.Lock()
+	_, stillOpen := p.sessions[s.adapterSessionID]
+	p.mu.Unlock()
+	if !stillOpen {
+		return bound
+	}
+	// A peer execute may have re-bound the surface while we were between
+	// locks: re-check the digest before paying for a session open.
+	s.mu.Lock()
+	bound = s.stepSurface
+	s.mu.Unlock()
+	if inRepair || want != nil && bound != nil && want.digest == bound.digest {
+		return bound
+	}
+	if want == nil && bound == nil {
+		return nil
+	}
+
+	client, epoch := p.currentClientAndEpoch()
+	if client == nil {
+		slog.Warn("copilot: step surface re-declaration skipped; no connected cli client",
+			"adapterSession", s.adapterSessionID, "surfaceDigest", surfaceDigestOf(want))
+		return bound
+	}
+	sess, resumed, err := p.openSDKSession(ctx, client, s.adapterSessionID, sessionCfg, resumeCfg)
+	if err != nil {
+		slog.Warn("copilot: step surface re-open failed; keeping previously bound submit_outcome surface",
+			"adapterSession", s.adapterSessionID, "surfaceDigest", surfaceDigestOf(want), "err", err)
+		return bound
+	}
+	s.swapSession(sess)
+	s.boundClientEpoch = epoch
+	s.mu.Lock()
+	s.stepSurface = want
+	if want == nil {
+		// Back to the static lane: the step-derived configs are retired so
+		// surfaceSessionConfigs returns the static originals again.
+		s.stepSessionConfig, s.stepResumeConfig = nil, nil
+	} else {
+		s.stepSessionConfig, s.stepResumeConfig = sessionCfg, resumeCfg
+	}
+	// A fresh create starts a new, empty conversation: bump the creation epoch
+	// so a later repair degrades to a full re-execute instead of a minimal
+	// repair prompt into a conversation that no longer contains the finalize.
+	// A resume keeps the conversation and the epoch unchanged.
+	if !resumed {
+		s.createdEpoch++
+	}
+	s.mu.Unlock()
+	slog.Info("copilot: re-declared submit_outcome for step surface",
+		"adapterSession", s.adapterSessionID, "sdkSession", sess.SessionID(),
+		"surfaceDigest", surfaceDigestOf(want), "resumed", resumed)
+	return want
 }

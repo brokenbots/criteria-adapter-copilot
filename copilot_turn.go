@@ -860,6 +860,14 @@ func (p *copilotAdapter) Execute(ctx context.Context, req *v2.ExecuteRequest, si
 	}
 	s.mu.Unlock()
 
+	// KB-391: re-declare submit_outcome from the step's contracts whenever the
+	// step's derived surface differs from the one the SDK session is bound to.
+	// No-op for the static lane and same-shape steps (digest-keyed), skipped in
+	// repair mode; on success the session presents the step's surface and the
+	// binding is recorded on session state, which the strict decode reads for
+	// the rest of this execute.
+	p.ensureStepSurface(ctx, s, allowed, contracts)
+
 	state := newTurnState(maxTurns)
 	state.execPrompt = executePrompt{
 		stepPrompt:   prompt,

@@ -4,10 +4,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
+
+	adapterhost "github.com/brokenbots/criteria-go-adapter-sdk/adapterhost"
+	copilot "github.com/github/copilot-sdk/go"
 
 	v2 "github.com/brokenbots/criteria-adapter-proto/criteria/v2"
 )
@@ -222,4 +227,255 @@ func containsAll(s string, needles ...string) bool {
 		}
 	}
 	return true
+}
+
+// rebindFixture builds an adapter + session fixture wired to a fake client, as
+// the reopenSession tests do.
+func rebindFixture(t *testing.T) (*copilotAdapter, *fakeClient, *sessionState) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("CRITERIA_HOME", dir)
+	persistSDKSessionID("adapter-surface", "sdk-surface")
+
+	p := newCopilotAdapter()
+	fc := &fakeClient{}
+	p.client = fc
+	p.clientOptions = &copilot.ClientOptions{}
+	sc := p.buildSessionConfig(map[string]string{"model": "m"}, "adapter-surface")
+	live := &fakeSession{sessionID: "sdk-surface"}
+	s := newSessionState("adapter-surface", live, sc, buildResumeConfig(sc), adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil), p)
+	p.sessions["adapter-surface"] = s
+	return p, fc, s
+}
+
+func approvedStep(t *testing.T, allowed ...string) ([]string, []*v2.OutcomeContract) {
+	t.Helper()
+	if allowed == nil {
+		allowed = []string{"approved"}
+	}
+	return allowed, []*v2.OutcomeContract{contractTestContract(t, "approved", reasonRequiredSchema, false, false)}
+}
+
+// toolArgSet returns the flattened parameter properties of the submit_outcome
+// tool in the given tool list, or nil when absent.
+func toolArgSet(t *testing.T, tools []copilot.Tool) map[string]any {
+	t.Helper()
+	for _, tool := range tools {
+		if tool.Name != submitOutcomeToolName {
+			continue
+		}
+		props, ok := tool.Parameters["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("submit_outcome parameters lack a properties object: %v", tool.Parameters)
+		}
+		return props
+	}
+	t.Fatalf("no submit_outcome tool in %d tools", len(tools))
+	return nil
+}
+
+func TestEnsureStepSurfaceRebindsTypedStepViaResume(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+	origSession := s.currentSession()
+	allowed, contracts := approvedStep(t)
+
+	surf := p.ensureStepSurface(context.Background(), s, allowed, contracts)
+	if surf == nil {
+		t.Fatal("typed step must bind a step surface")
+	}
+	if s.stepSurface != surf {
+		t.Fatal("the bound surface must be recorded on session state")
+	}
+	if s.currentSession() == origSession {
+		t.Fatal("the SDK session must be swapped to the re-opened one")
+	}
+	if len(fc.resumeIDs) != 1 || fc.resumeIDs[0] != "sdk-surface" || fc.createCount != 0 {
+		t.Fatalf("open = resume %v / creates %d, want resume [sdk-surface] / 0 creates (history preserved)",
+			fc.resumeIDs, fc.createCount)
+	}
+	if s.createdEpoch != 0 {
+		t.Fatalf("createdEpoch = %d, want 0 (resume keeps the conversation epoch; fixture starts bare)",
+			s.createdEpoch)
+	}
+
+	// The resumed session's tool set carries the step surface instead of the
+	// static reason member.
+	props := toolArgSet(t, fc.resumeConfigs[0].Tools)
+	if _, has := props["reason"]; has {
+		t.Fatal("resumed tool set must not carry the static reason member on a typed step")
+	}
+	if _, has := props["payload"]; !has {
+		t.Fatal("resumed tool set must carry the step's payload schema")
+	}
+	if s.stepSessionConfig == nil || len(s.stepSessionConfig.Tools) != 2 {
+		t.Fatalf("step session config must record the step-bound tool pair, got %+v", s.stepSessionConfig)
+	}
+	stepProps := toolArgSet(t, s.stepSessionConfig.Tools)
+	if !reflect.DeepEqual(stepProps, surf.params["properties"]) {
+		t.Fatal("recorded step config must carry the bound surface's properties")
+	}
+}
+
+func TestEnsureStepSurfaceConsecutiveSameShapeCostsNothing(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+
+	allowed, contracts := approvedStep(t)
+	first := p.ensureStepSurface(context.Background(), s, allowed, contracts)
+	if first == nil {
+		t.Fatal("first typed step must bind")
+	}
+	opens, creates, resumes := 0, fc.createCount, len(fc.resumeIDs)
+
+	for i := 0; i < 3; i++ {
+		again := p.ensureStepSurface(context.Background(), s, allowed, contracts)
+		if again != first {
+			t.Fatalf("step %d: surface %v, want the unchanged binding", i+1, again)
+		}
+	}
+	if fc.createCount != creates || len(fc.resumeIDs) != resumes {
+		t.Fatalf("same-shape steps re-opened: creates %d→%d resumes %d→%d, want zero churn",
+			creates, fc.createCount, resumes, len(fc.resumeIDs))
+	}
+	if opens != 0 {
+		t.Fatal("opens must stay zero")
+	}
+}
+
+func TestEnsureStepSurfaceRepairModeDoesNotReopen(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+
+	allowed, contracts := approvedStep(t)
+	bound := p.ensureStepSurface(context.Background(), s, allowed, contracts)
+	if bound == nil {
+		t.Fatal("typed step must bind")
+	}
+	s.mu.Lock()
+	s.inRepairMode = true
+	s.mu.Unlock()
+
+	// A same-shaped (or any) repair re-execute must not touch the session.
+	got := p.ensureStepSurface(context.Background(), s, allowed, contracts)
+	if got != bound {
+		t.Fatal("repair execute must keep the bound surface")
+	}
+	if fc.createCount != 0 || len(fc.resumeIDs) != 1 {
+		t.Fatalf("repair re-open churned: creates %d resumes %d, want 0/1", fc.createCount, len(fc.resumeIDs))
+	}
+	// A different-shape contract during repair also degrades to the bound one.
+	other := []*v2.OutcomeContract{contractTestContract(t, "needs_look", reasonRequiredSchema, true, false)}
+	got = p.ensureStepSurface(context.Background(), s, []string{"needs_look"}, other)
+	if got != bound {
+		t.Fatal("repair execute must keep the bound surface even across shapes")
+	}
+	if fc.createCount != 0 || len(fc.resumeIDs) != 1 {
+		t.Fatalf("repair across shapes churned: creates %d resumes %d, want 0/1", fc.createCount, len(fc.resumeIDs))
+	}
+}
+
+func TestEnsureStepSurfaceStaticTransitionRebindsBack(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+
+	allowed, contracts := approvedStep(t)
+	if got := p.ensureStepSurface(context.Background(), s, allowed, contracts); got == nil {
+		t.Fatal("typed step must bind")
+	}
+	static := p.ensureStepSurface(context.Background(), s, []string{"approved"}, nil)
+	if static != nil {
+		t.Fatal("contract-less follow-up must rebind to the static lane")
+	}
+	if s.stepSurface != nil || s.stepSessionConfig != nil {
+		t.Fatal("session state must return to the static binding")
+	}
+	if len(fc.resumeIDs) != 2 || fc.createCount != 0 {
+		t.Fatalf("static transition = resume %v / creates %d, want 2 resumes / 0 creates", fc.resumeIDs, fc.createCount)
+	}
+	// The resumed tool set is the static surface again (includes reason).
+	props := toolArgSet(t, fc.resumeConfigs[1].Tools)
+	if _, has := props["reason"]; !has {
+		t.Fatal("static rebind must restore the reason member")
+	}
+}
+
+func TestEnsureStepSurfaceOpenFailureDegradesLoudly(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+
+	p.mu.Lock()
+	delete(p.sessions, "adapter-surface") // membership guard: not open
+	p.mu.Unlock()
+	allowed, contracts := approvedStep(t)
+	got := p.ensureStepSurface(context.Background(), s, allowed, contracts)
+	if got != nil {
+		t.Fatal("a removed session must degrade to the static surface")
+	}
+	p.sessions["adapter-surface"] = s
+	if got = p.ensureStepSurface(context.Background(), s, allowed, contracts); got == nil {
+		t.Fatalf("bound after re-open, err trace: creates=%d resumes=%v", fc.createCount, fc.resumeIDs)
+	}
+
+	// Next surface change: both resume and create fail — the binding stays.
+	fc.mu.Lock()
+	fc.resumeErr = context.DeadlineExceeded
+	fc.createErr = context.DeadlineExceeded
+	fc.mu.Unlock()
+	bound := s.stepSurface
+	got = p.ensureStepSurface(context.Background(), s, []string{"needs_look"},
+		[]*v2.OutcomeContract{contractTestContract(t, "needs_look", reasonRequiredSchema, true, false)})
+	if got != bound {
+		t.Fatal("failed re-open must degrade to the previously bound surface")
+	}
+	if s.stepSurface != bound {
+		t.Fatal("failed re-open must not touch the recorded binding")
+	}
+}
+
+func TestEnsureStepSurfaceFreshCreateBumpsEpoch(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+	// Resume is impossible: open falls through to a fresh create.
+	fc.mu.Lock()
+	fc.resumeErr = errors.New("resume unavailable")
+	fc.mu.Unlock()
+
+	allowed, contracts := approvedStep(t)
+	got := p.ensureStepSurface(context.Background(), s, allowed, contracts)
+	if got == nil {
+		t.Fatal("typed step must bind on the fresh-create path too")
+	}
+	if fc.createCount != 1 {
+		t.Fatalf("creates = %d, want 1", fc.createCount)
+	}
+	if s.createdEpoch != 1 {
+		t.Fatalf("createdEpoch = %d, want 1 (fresh create bumps the bare fixture's epoch, mirroring reopenSession)",
+			s.createdEpoch)
+	}
+}
+
+func TestReopenSessionKeepsStepSurfaceBinding(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+
+	allowed, contracts := approvedStep(t)
+	surf := p.ensureStepSurface(context.Background(), s, allowed, contracts)
+	if surf == nil {
+		t.Fatal("typed step must bind")
+	}
+	if err := fc.Ping(context.Background(), "liveness"); err != nil {
+		t.Fatal(err)
+	}
+	// Force a transport-recovery reopen: the session is stale by epoch.
+	s.boundClientEpoch = -1
+	p.reopenSession(context.Background(), s)
+
+	if len(fc.resumeIDs) != 2 || fc.createCount != 0 {
+		t.Fatalf("reopen = resume %v / creates %d, want the second resume / no create",
+			fc.resumeIDs, fc.createCount)
+	}
+	props := toolArgSet(t, fc.resumeConfigs[1].Tools)
+	if _, has := props["reason"]; has {
+		t.Fatal("transport reopen on a bound step must keep the step surface, not the static one")
+	}
+	if _, has := props["payload"]; !has {
+		t.Fatal("transport reopen must keep the step's payload schema")
+	}
+	if s.stepSurface != surf {
+		t.Fatal("reopen must preserve the bound surface record")
+	}
 }
