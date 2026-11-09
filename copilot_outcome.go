@@ -15,9 +15,10 @@ import (
 	"strconv"
 	"strings"
 
-	copilot "github.com/github/copilot-sdk/go"
+	v2 "github.com/brokenbots/criteria-adapter-proto/criteria/v2"
+	adapterhost "github.com/brokenbots/criteria-go-adapter-sdk/adapterhost"
 
-	"github.com/google/jsonschema-go/jsonschema"
+	copilot "github.com/github/copilot-sdk/go"
 )
 
 // maxContractIssueLen bounds each issue echoed back to the model in in-turn
@@ -290,9 +291,12 @@ type contractRejection struct {
 // (one truncated bullet per issue) after a one-line cause.
 func (r *contractRejection) message(outcome string) string {
 	var b strings.Builder
-	if r.kind == "comment_missing" {
+	switch r.kind {
+	case "comment_missing":
 		fmt.Fprintf(&b, "finalize rejected for outcome %q: a comment is required and none was supplied.\n", outcome)
-	} else {
+	case "invalid_outcome":
+		fmt.Fprintf(&b, "finalize rejected for outcome %q: no outcome contract governs that outcome on this step's contract set.\n", outcome)
+	default:
 		fmt.Fprintf(&b, "finalize rejected for outcome %q: the submitted payload does not satisfy the step contract.\n", outcome)
 	}
 	for _, issue := range r.issues {
@@ -302,51 +306,74 @@ func (r *contractRejection) message(outcome string) string {
 	return b.String()
 }
 
-// checkContractFinalize enforces the matched outcome contract on a finalize
-// call in contract mode. The caller holds s.mu. Returns nil when the outcome
-// carries no contract entry (the host's post-finalize validation owns
-// outcome_uncontracted; the adapter only enforces the matched contract's
-// schema and require_comment per the v0.7.0 split) or when the submission
-// satisfies it; otherwise a contractRejection with the issue list.
+// checkContractFinalize pre-flights a finalize call against the step's
+// outcome contracts with the SDK's pinned evaluator wrapper (KB-391: the
+// adapter validates with the SDK contract helpers BEFORE pushing the
+// ExecuteResult; the engine re-validates as the backstop through the existing
+// attempt loop). The caller holds s.mu. Returns nil when the submission
+// satisfies the contracts; otherwise a contractRejection carrying the pinned,
+// ordered issue list, classified into the rejection lane:
 //
-// Typed-lane parameter reconciliation: the submit_outcome tool schema
-// documents "reason" as a required TOP-LEVEL parameter, while typed contracts
-// can require a member of the same name INSIDE the payload. When the
-// submitted payload fails the schema only on members the model supplied as
-// documented top-level parameters, those members are folded into the payload
-// during validation — the same reconcile the host performs at the verdict
-// funnel — instead of an in-turn rejection that contradicts the tool schema
-// the model must follow (the live KB-171 loop shape). Since KB-388 the fold's
+//   - "comment_missing": every issue comments on the require_comment lane
+//     (the payload being otherwise clean);
+//   - "invalid_payload": payload-schema issues (a missing comment rides along
+//     when both lanes are wrong — the payload issues dominate);
+//   - "invalid_outcome": the finalized outcome has no contract entry. KB-391
+//     moves this host-owned post-finalize rejection into the in-turn
+//     pre-flight, so the model can repair within the finalize budget; the
+//     engine still re-validates.
+//
+// The candidate is the canonical finalize wire shape: the normalized payload
+// as outputs_json and the trimmed comment (whitespace-only comments are
+// missing, matching the trimmed comment the finalize stores). Typed-lane
+// parameter reconciliation: the submit_outcome tool schema documents "reason"
+// as a required TOP-LEVEL parameter, while typed contracts can require a
+// member of the same name INSIDE the payload — that reconcile happens in
+// handleSubmitOutcome before this check (foldDeclaredPayloadParams), the same
+// shape the host performs at the verdict funnel. Since KB-388 the fold's
 // consumption is also honored at the wrong-lane gate in handleSubmitOutcome,
 // so a fold-consumed reason finalizes instead of being discarded by the
 // rejection one call after the fold computed it.
 func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMessage, comment string) *contractRejection {
-	contract := s.activeContracts[outcome]
-	if contract == nil {
+	if len(s.activeContracts) == 0 {
 		return nil
 	}
-	schema := contract.GetSchemaJson()
-	requireComment := contract.GetRequireComment()
-	commentMissing := requireComment && strings.TrimSpace(comment) == ""
-	var issues []string
-	if commentMissing {
-		issues = append(issues, fmt.Sprintf(
-			"the outcome %q requires a finalize comment (require_comment); none was supplied", outcome))
+	candidate := &v2.ExecuteResult{
+		Outcome:     outcome,
+		Comment:     comment,
+		OutputsJson: normalizedFinalizePayload(payload),
 	}
-	if len(schema) > 0 {
-		issues = append(issues, validateContractPayload(payload, schema)...)
-	}
+	issues := adapterhost.ValidateOutcomeResult(sortedContractList(s.activeContracts), candidate)
 	if len(issues) == 0 {
 		return nil
 	}
-	// Comment-missing is its own in-turn class, but only when the payload is
-	// otherwise clean; when both are wrong the payload issues dominate the
-	// rejection message and the classification.
-	kind := "invalid_payload"
-	if commentMissing && len(issues) == 1 {
-		kind = "comment_missing"
+	return &contractRejection{kind: contractRejectionKind(issues), issues: issues}
+}
+
+// contractRejectionKind classifies the pinned issue list into the rejection
+// lane: a require_comment issue keeps its dedicated class when the payload is
+// otherwise clean; payload-schema issues dominate a multi-lane rejection; the
+// remaining issues are the outcome-level contract-coverage lane.
+func contractRejectionKind(issues []string) string {
+	commentOnly := true
+	payloadIssue := false
+	for _, issue := range issues {
+		if strings.HasPrefix(issue, "missing_comment: ") {
+			continue
+		}
+		commentOnly = false
+		if strings.HasPrefix(issue, "payload_schema: ") {
+			payloadIssue = true
+		}
 	}
-	return &contractRejection{kind: kind, issues: issues}
+	switch {
+	case commentOnly:
+		return "comment_missing"
+	case payloadIssue:
+		return "invalid_payload"
+	default:
+		return "invalid_outcome"
+	}
 }
 
 // foldDeclaredPayloadParams folds documented top-level submit parameters into
@@ -435,75 +462,6 @@ func (s *sessionState) activeContractSchemaFor(outcome string) []byte {
 		return contract.GetSchemaJson()
 	}
 	return nil
-}
-
-// validateContractPayload validates the model-submitted payload against one
-// contract's schema_json using github.com/google/jsonschema-go (already in the
-// module graph via the Copilot SDK). Per the proto's pinned semantics, a
-// missing, empty, or literal-null payload is treated as an empty object, so a
-// schema with required properties reports them as missing instead of waving
-// the empty payload through. Returns the validator's issue list (empty =
-// valid); issue text is the validator's structured messages, truncated and
-// never nil-safe-guessed.
-func validateContractPayload(payload json.RawMessage, schemaJSON []byte) []string {
-	if len(schemaJSON) == 0 {
-		// No payload contract: everything valid (proto: empty schema_json =
-		// outputs_json forwarded verbatim).
-		return nil
-	}
-	instance, instanceIssue := payloadInstance(payload)
-	if instanceIssue != "" {
-		return []string{instanceIssue}
-	}
-
-	var schema jsonschema.Schema
-	if err := schema.UnmarshalJSON(schemaJSON); err != nil {
-		return []string{fmt.Sprintf("the step contract's schema is not a valid JSON Schema: %s",
-			truncateText(err.Error(), maxContractIssueLen))}
-	}
-	resolved, err := schema.Resolve(nil)
-	if err != nil {
-		return []string{fmt.Sprintf("the step contract's schema could not be resolved: %s",
-			truncateText(err.Error(), maxContractIssueLen))}
-	}
-	if err := resolved.Validate(instance); err != nil {
-		return splitIssueLines(err.Error())
-	}
-	return nil
-}
-
-// payloadInstance decodes the submitted payload into the instance value the
-// validator sees, applying the proto's absent/empty/null = empty-object
-// semantics and normalizing those cases to `{}` for verbatim storage. The
-// second return is an issue string when the payload bytes do not decode to a
-// single JSON value.
-func payloadInstance(payload json.RawMessage) (any, string) {
-	trimmed := bytes.TrimSpace(payload)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return map[string]any{}, ""
-	}
-	var instance any
-	if err := json.Unmarshal(trimmed, &instance); err != nil {
-		return nil, fmt.Sprintf("the submitted payload does not decode to a JSON object: %s",
-			truncateText(err.Error(), maxContractIssueLen))
-	}
-	return instance, ""
-}
-
-// splitIssueLines splits a validator error into one structured issue per line,
-// truncating each. jsonschema-go reports the first failing rule per instance
-// as a single error string, so in practice this yields one entry.
-func splitIssueLines(errText string) []string {
-	var issues []string
-	for _, line := range strings.Split(errText, "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			issues = append(issues, line)
-		}
-	}
-	if len(issues) == 0 {
-		issues = []string{errText}
-	}
-	return issues
 }
 
 // normalizedFinalizePayload applies the proto's absent/empty/null = empty-object

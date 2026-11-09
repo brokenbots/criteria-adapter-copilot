@@ -1055,24 +1055,34 @@ func TestContractSubmitNoSchemaNoPayloadYieldsEmptyObject(t *testing.T) {
 	}
 }
 
-// Uncontracted allowed outcome in contract mode: the adapter does not reject
-// it (host owns outcome_uncontracted post-finalize); the submission finalizes.
-func TestContractSubmitUncontractedOutcomeIsForwarded(t *testing.T) {
+// Uncontracted allowed outcome in contract mode: KB-391 pre-flights the
+// candidate result against the full contract set, so an outcome with no
+// contract entry is rejected in-turn (invalid_outcome) with the pinned
+// issue — the engine re-validates as the backstop, but the model gets the
+// repair signal inside the finalize budget.
+func TestContractSubmitUncontractedOutcomeIsRejectedInTurn(t *testing.T) {
 	s := contractTestState([]string{"approved", "failure"},
 		contractTestContract(t, "approved", verbatimSchema, false, false))
 	p := outcomeAdapter(s)
 
 	res, _ := p.handleSubmitOutcome("s1", SubmitOutcomeArgs{Outcome: "failure"})
-	if res.ResultType != "success" {
-		t.Fatalf("ResultType = %q, want success (adapter must not reject uncontracted outcomes): %s", res.ResultType, res.TextResultForLLM)
+	if res.ResultType != "failure" {
+		t.Fatalf("ResultType = %q, want failure (adapter pre-flights uncontracted outcomes): %s", res.ResultType, res.TextResultForLLM)
+	}
+	if !strings.Contains(res.TextResultForLLM, `outcome "failure" has no outcome_contracts entry`) {
+		t.Errorf("message %q should carry the pinned outcome_uncontracted issue", res.TextResultForLLM)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.finalizedOutcome != "failure" {
-		t.Errorf("finalizedOutcome = %q, want failure", s.finalizedOutcome)
+	if s.finalizedOutcome != "" {
+		t.Errorf("finalizedOutcome = %q, want no finalize", s.finalizedOutcome)
 	}
-	if s.finalizeFailureIssues != nil {
-		t.Errorf("finalizeFailureIssues = %v, want none", s.finalizeFailureIssues)
+	if s.finalizeFailureKind != "invalid_outcome" {
+		t.Errorf("finalizeFailureKind = %q, want invalid_outcome", s.finalizeFailureKind)
+	}
+	issues := s.finalizeFailureIssues
+	if len(issues) != 1 || !strings.HasPrefix(issues[0], "outcome_uncontracted: ") {
+		t.Errorf("finalizeFailureIssues = %v, want the single pinned outcome_uncontracted issue", issues)
 	}
 }
 
@@ -1091,7 +1101,7 @@ func TestContractSubmitCommentMissing(t *testing.T) {
 		if res.ResultType != "failure" {
 			t.Fatalf("comment %q: ResultType = %q, want failure", comment, res.ResultType)
 		}
-		if !strings.Contains(res.TextResultForLLM, "requires a finalize comment") || !strings.Contains(res.TextResultForLLM, "Fix the listed issues") {
+		if !strings.Contains(res.TextResultForLLM, "requires a comment (require_comment)") || !strings.Contains(res.TextResultForLLM, "Fix the listed issues") {
 			t.Errorf("comment %q: message %q should state the requirement and invite repair", comment, res.TextResultForLLM)
 		}
 	}
@@ -1122,14 +1132,15 @@ func TestContractSubmitInvalidPayloadStructuredIssues(t *testing.T) {
 	if kind != "invalid_payload" {
 		t.Errorf("finalizeFailureKind = %q, want invalid_payload", kind)
 	}
-	if len(issues) == 0 || !strings.Contains(strings.Join(issues, "; "), "properties/verdict") {
-		t.Errorf("issues = %v, want a structured validator issue naming the failing path", issues)
+	if len(issues) == 0 || !strings.Contains(strings.Join(issues, "; "), `property "verdict"`) {
+		t.Errorf("issues = %v, want a structured pinned issue naming the failing property", issues)
 	}
 }
 
-// A payload that breaks a schema whose messages quote the submitted value: the
-// ToolResult keeps the raw issue (same session, model repairs from it) while
-// the emitted outcome.payload_invalid event is secret-redacted.
+// Pinned issues are value-independent: the ToolResult carries the pinned
+// schema-issue text verbatim and the emitted outcome.payload_invalid event
+// issues match it — no submitted value ever echoes into either lane, though
+// the event lane stays secret-redacted as hygiene.
 func TestContractSubmitInvalidPayloadRedactsEventIssuesButKeepsToolResultRaw(t *testing.T) {
 	s := contractTestState([]string{"approved"},
 		contractTestContract(t, "approved", `{"type":"object","required":["note"],"properties":{"note":{"type":"array"}}}`, false, false))
@@ -1149,15 +1160,22 @@ func TestContractSubmitInvalidPayloadRedactsEventIssuesButKeepsToolResultRaw(t *
 	}
 
 	s.mu.Lock()
-	kind := s.finalizeFailureKind
+	kind, issues := s.finalizeFailureKind, s.finalizeFailureIssues
 	s.mu.Unlock()
 	if kind != "invalid_payload" {
 		t.Fatalf("finalizeFailureKind = %q, want invalid_payload", kind)
 	}
+	if len(issues) == 0 || !strings.Contains(strings.Join(issues, "; "), `property "note": expected "array", got "string"`) {
+		t.Fatalf("issues = %v, want the pinned typed-property issue", issues)
+	}
 
-	// The ToolResult goes only to the model in the live session.
-	if !strings.Contains(res.TextResultForLLM, "swordfish") {
-		t.Errorf("ToolResult should carry the validator issue verbatim for in-session repair, got %q", res.TextResultForLLM)
+	// The ToolResult goes only to the model in the live session: the pinned
+	// issue text rides verbatim, and no submitted value is echoed by it.
+	if !strings.Contains(res.TextResultForLLM, `property "note": expected "array", got "string"`) {
+		t.Errorf("ToolResult should carry the pinned issue verbatim for in-session repair, got %q", res.TextResultForLLM)
+	}
+	if strings.Contains(res.TextResultForLLM, "swordfish") {
+		t.Errorf("pinned issues must stay value-independent, ToolResult echoed the submitted value: %q", res.TextResultForLLM)
 	}
 
 	found := false
@@ -1171,11 +1189,11 @@ func TestContractSubmitInvalidPayloadRedactsEventIssuesButKeepsToolResultRaw(t *
 		if d["outcome"] != "approved" || d["kind"] != "invalid_payload" {
 			t.Errorf("event = %v, want outcome approved kind invalid_payload", d)
 		}
-		issues, ok := d["issues"].([]any)
-		if !ok || len(issues) == 0 {
+		eventIssues, ok := d["issues"].([]any)
+		if !ok || len(eventIssues) == 0 {
 			t.Fatalf("event issues = %#v, want a non-empty list", d["issues"])
 		}
-		for _, i := range issues {
+		for _, i := range eventIssues {
 			if txt, ok := i.(string); ok && strings.Contains(txt, "swordfish") {
 				t.Errorf("event issue %q leaks the held secret", txt)
 			}
@@ -1225,32 +1243,42 @@ func TestSubmitOutcomeRawDecodeEnvelopeFailures(t *testing.T) {
 	}
 }
 
-// validateContractPayload table: proto absent/empty/null = empty-object
-// semantics, structured issue text, and invalid-instance classification.
-func TestValidateContractPayload(t *testing.T) {
+// checkContractFinalize (SDK pinned evaluator, KB-391): pinned-issue lanes —
+// null/absent payload = empty object (required properties reported missing),
+// payload-schema property issues, non-object payload, and the pinned
+// require_comment outcome. Empty-schema contracts validate anything.
+func TestCheckContractFinalizePinnedValidation(t *testing.T) {
 	schema := []byte(verbatimSchema)
+	newState := func(schemaJSON string) *sessionState {
+		return contractTestState([]string{"approved"},
+			contractTestContract(t, "approved", schemaJSON, false, false))
+	}
 	cases := []struct {
 		name    string
 		payload string
 		want    []string // nil = valid; substrings expected in issues otherwise
 	}{
 		{"valid object", `{"verdict":"approved"}`, nil},
-		{"null payload is empty object", "null", []string{"required"}},
-		{"missing required", `{}`, []string{"required"}},
-		{"wrong type", `{"verdict": 5}`, []string{"verdict"}},
-		{"instance not object", `[1,2]`, []string{"type"}},
-		{"undecodable bytes", `{"a":`, []string{"payload does not decode to a JSON object"}},
+		{"null payload is empty object", "null", []string{"required property is missing"}},
+		{"missing required", `{}`, []string{"required property is missing"}},
+		{"wrong type", `{"verdict": 5}`, []string{`property "verdict": expected "string", got "number"`}},
+		{"instance not object", `[1,2]`, []string{"outputs_json does not decode to a JSON object"}},
+		{"undecodable bytes", `{"a":`, []string{"outputs_json does not decode to a JSON object"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			issues := validateContractPayload(json.RawMessage(tc.payload), schema)
+			s := newState(string(schema))
+			rej := s.checkContractFinalize("approved", json.RawMessage(tc.payload), "note")
 			if tc.want == nil {
-				if len(issues) != 0 {
-					t.Fatalf("issues = %v, want none", issues)
+				if rej != nil {
+					t.Fatalf("issues = %v, want none", rej.issues)
 				}
 				return
 			}
-			joined := strings.Join(issues, "; ")
+			if rej == nil {
+				t.Fatalf("submission %s accepted, want issues %v", tc.payload, tc.want)
+			}
+			joined := strings.Join(rej.issues, "; ")
 			for _, fragment := range tc.want {
 				if !strings.Contains(joined, fragment) {
 					t.Errorf("issues %q missing fragment %q", joined, fragment)
@@ -1258,8 +1286,8 @@ func TestValidateContractPayload(t *testing.T) {
 			}
 		})
 	}
-	if issues := validateContractPayload(json.RawMessage(`{"x":1}`), nil); len(issues) != 0 {
-		t.Errorf("nil schema should validate anything, got %v", issues)
+	if rej := newState("").checkContractFinalize("approved", json.RawMessage(`{"x":1}`), ""); rej != nil {
+		t.Errorf("empty schema_json should validate anything, got issues %v", rej.issues)
 	}
 }
 
@@ -1824,11 +1852,13 @@ func TestTypedSubmitRejectsTopLevelReasonWhenPayloadCarriesReason(t *testing.T) 
 	}
 }
 
-// A fold-consumed reason does not bypass the contract check: a payload with
-// an unknown member (additionalProperties false) still rejects in-turn with
-// the structured issue list and repair guidance — an outcome.payload_invalid
-// event fires (the signal the burn never produced), no silent fake success.
-func TestTypedSubmitUnknownPayloadFieldStillRejectsInTurn(t *testing.T) {
+// A fold-consumed reason does not bypass the contract check: under the pinned
+// evaluator (KB-391) non-required payload members are never validated —
+// additionalProperties/patterns and the like are outside the pinned subset —
+// so an unknown member rides the payload forward verbatim (the host
+// re-validates with the same pinned evaluator, so no lane can diverge;
+// the fold-consumed reason still satisfies the schema's required member).
+func TestTypedSubmitUnknownPayloadFieldForwardsVerbatim(t *testing.T) {
 	s := contractTestState([]string{"approved"},
 		contractTestContract(t, "approved",
 			`{"type":"object","required":["reason"],"additionalProperties":false,"properties":{"reason":{"type":"string"}}}`,
@@ -1844,24 +1874,13 @@ func TestTypedSubmitUnknownPayloadFieldStillRejectsInTurn(t *testing.T) {
 		Reason:  "valid fold-consumed prose",
 		Payload: json.RawMessage(`{"bogus":"field"}`),
 	})
-	if res.ResultType != "failure" {
-		t.Fatalf("ResultType = %q (%s), want failure", res.ResultType, res.TextResultForLLM)
+	if res.ResultType != "success" {
+		t.Fatalf("ResultType = %q (%s), want success — the pinned evaluator never validates non-required members", res.ResultType, res.TextResultForLLM)
 	}
-	if !strings.Contains(res.TextResultForLLM, "the submitted payload does not satisfy the step contract") {
-		t.Errorf("rejection text should be the contract rejection with the issue list, got %q", res.TextResultForLLM)
-	}
-	if !strings.Contains(res.TextResultForLLM, "bogus") {
-		t.Errorf("rejection text should name the unknown member \"bogus\", got %q", res.TextResultForLLM)
-	}
-	if s.finalizedOutcome != "" || s.finalizeFailureKind != "invalid_payload" || s.finalizeAttempts != 1 {
-		t.Errorf("post-rejection state = outcome %q kind %q attempts %d, want \"\"/invalid_payload/1",
-			s.finalizedOutcome, s.finalizeFailureKind, s.finalizeAttempts)
-	}
-	invalidate := adapterEventPayload(sink, "outcome.payload_invalid")
-	if invalidate == nil {
-		t.Error("the in-turn contract rejection must emit outcome.payload_invalid with the issue list")
-	} else if issues, _ := invalidate["issues"].([]any); len(issues) == 0 {
-		t.Errorf("outcome.payload_invalid issues = %v, want at least one", invalidate["issues"])
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizedOutcome != "approved" {
+		t.Errorf("finalizedOutcome = %q, want approved", s.finalizedOutcome)
 	}
 }
 
@@ -1881,7 +1900,7 @@ func TestTypedSubmitPayloadOnlyStillRequiresSchemaReason(t *testing.T) {
 		t.Fatalf("ResultType = %q (%s), want failure — a required reason missing from the payload is not satisfied silently",
 			res.ResultType, res.TextResultForLLM)
 	}
-	if !strings.Contains(res.TextResultForLLM, `missing properties: ["reason"]`) {
+	if !strings.Contains(res.TextResultForLLM, `property "reason": required property is missing`) {
 		t.Errorf("rejection text should point at the missing reason member, got %q", res.TextResultForLLM)
 	}
 	s.mu.Lock()
@@ -2062,9 +2081,13 @@ func TestUntypedFinalizedEventKeepsLegacyReasonRender(t *testing.T) {
 		t.Errorf("schemaless render = %v, want the legacy reason prose", d["reason"])
 	}
 
-	// Uncontracted outcome in contract mode: untyped, reason lane intact.
+	// Mixed step under KB-391: the untyped-lane display render is exercised by
+	// a schemaless contract on the second outcome (uncontracted finalizations
+	// now pre-flight as invalid_outcome in-turn — that lane never reaches the
+	// display).
 	s2 := contractTestState([]string{"approved", "failure"},
 		contractTestContract(t, "approved", verbatimSchema, false, false))
+	s2.activeContracts["failure"] = contractTestContract(t, "failure", "", false, false)
 	s2.mu.Lock()
 	s2.sink = &recordingSender{}
 	s2.mu.Unlock()
@@ -2192,8 +2215,11 @@ func TestContractFinalize_EmptyTopLevelReasonDoesNotFakeSuccess(t *testing.T) {
 	if reasonFolded {
 		t.Fatal("empty reason + empty payload must never report the reason as fold-consumed")
 	}
-	if issues := validateContractPayload(folded,
-		[]byte(`{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}}}`)); len(issues) == 0 {
+	// The folded result must still fail the step's contract check (SDK pinned
+	// evaluator, KB-391): the required reason member is missing.
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", reasonRequiredSchema, false, false))
+	if r := s.checkContractFinalize("approved", folded, ""); r == nil {
 		t.Fatal("empty reason + empty payload must stay invalid via the contract check")
 	}
 }
