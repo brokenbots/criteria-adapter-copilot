@@ -109,6 +109,7 @@ func submitSurfaceFromStep(allowed []string, contracts []*v2.OutcomeContract) *s
 	sort.Strings(enum)
 
 	branches := distinctPayloadSchemas(kept)
+	hasUntypedLane := len(branches) < len(kept)
 	var requiresComment []string
 	allRequireComment := len(kept) > 0
 	for _, contract := range kept {
@@ -132,12 +133,16 @@ func submitSurfaceFromStep(allowed []string, contracts []*v2.OutcomeContract) *s
 		},
 		"payload": payloadParamDescription(branches),
 	}
-	if len(branches) == 0 {
-		// Untyped-contract step: reason stays a declared member (the handler
-		// accepts it as display prose) while the doc teaches the durable lanes.
+	if hasUntypedLane {
+		// At least one outcome is schemaless: the legacy reason lane stays a
+		// declared member — carrying reason prose on a schemaless contract's
+		// outcome is a correct submission (KB-260) and must never be taught
+		// away. On mixed steps the doc also names the typed lane: there the
+		// payload is the output and a top-level reason is folded in when the
+		// contract's schema requires one, wrong-lane-rejected otherwise.
 		properties["reason"] = map[string]any{
 			"type":        "string",
-			"description": reasonParamDescription(),
+			"description": reasonParamDescription(len(branches) > 0),
 		}
 	}
 
@@ -152,7 +157,7 @@ func submitSurfaceFromStep(allowed []string, contracts []*v2.OutcomeContract) *s
 	}
 	sort.Strings(declared)
 
-	description := stepSurfaceToolDescription(len(branches) > 0)
+	description := stepSurfaceToolDescription(len(branches) > 0, hasUntypedLane)
 	params := map[string]any{
 		"type":                 "object",
 		"properties":           properties,
@@ -244,11 +249,18 @@ func commentParamDescription(required bool, requiresComment []string) string {
 	return b.String()
 }
 
-// reasonParamDescription teaches the reason member on untyped-contract steps:
-// reason prose is display-only there; the durable surfaces are comment and
-// payload. This must never be taught as the workflow-rendered findings lane —
-// that is the contract-less lane's truth, not a contract-mode step's.
-func reasonParamDescription() string {
+// reasonParamDescription teaches the reason member on steps with at least one
+// schemaless outcome. On untyped-contract steps reason prose is display-only —
+// the durable surfaces are comment and payload. On mixed steps (some outcomes
+// schema-carrying) the doc must also name the typed lane there: the payload
+// is the output for the typed outcomes, and a top-level reason is folded in
+// when the contract's schema requires one, wrong-lane-rejected otherwise.
+// Neither form may be taught as the workflow-rendered findings lane — that is
+// the contract-less lane's truth, not a contract-mode step's.
+func reasonParamDescription(mixed bool) string {
+	if mixed {
+		return "Optional prose; only the step's schemaless outcomes consume it (display-only for operators, shown on the outcome.finalized event of those outcomes). Finalizing with one of this step's typed outcomes instead: the payload IS the output — put the findings under the payload's declared fields; a top-level reason is folded in only when the contract's schema declares a reason field, and is rejected otherwise."
+	}
 	return "Optional display prose: it is shown to operators on the outcome.finalized event but is NOT part of the step's forwarded output. Durable findings text belongs under comment — or, when the chosen outcome declares a payload schema, under the payload's declared fields."
 }
 
@@ -315,11 +327,15 @@ func cloneSchemaMap(schema map[string]any) map[string]any {
 // re-declared submit_outcome tool. It teaches the step-declared submission
 // lanes instead of the static description's four-parameter prose: the surface
 // schema (enum, payload shape, comment rule) is the contract for THIS step.
-func stepSurfaceToolDescription(typed bool) string {
+func stepSurfaceToolDescription(typed, reasonDeclared bool) string {
 	var b strings.Builder
 	b.WriteString("Finalize the outcome for the current step. Call this exactly once with one of the outcomes in the schema's `outcome` enum below: this step's submission schema is re-declared from the step's finalization contracts, so it declares the required shape — the outcome choice, the `payload` schema per outcome (when any contract declares one, the payload IS the step's output and the findings belong under its declared fields), and the `comment` requirement per outcome. Submit exactly the declared shape; parameters outside this step's declared set are rejected, and failure to call this tool with a valid finalize for the step will fail it.")
-	if !typed {
-		b.WriteString(" On this step the durable findings surface is `comment` (and the payload when an outcome declares a payload schema); `reason`, when declared, is display-only prose for operators.")
+	if reasonDeclared {
+		if typed {
+			b.WriteString(" On this step `reason` prose belongs only to the schemaless outcomes (shown on their outcome.finalized event); for the typed outcomes the payload is the output and the findings belong under the payload's declared fields.")
+		} else {
+			b.WriteString(" On this step the durable findings surface is `comment` (and the payload when an outcome declares a payload schema); `reason` is display-only prose for operators.")
+		}
 	}
 	return b.String()
 }

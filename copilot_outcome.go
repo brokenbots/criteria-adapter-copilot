@@ -180,7 +180,7 @@ func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation, surface *stepToo
 		return SubmitOutcomeArgs{}, &submitArgsDecodeError{
 			kind: "invalid_params",
 			message: fmt.Sprintf(
-				"submit_outcome received unknown parameter(s) %s; the declared parameters are %s. Retry with the declared names — %s",
+				"submit_outcome rejected: unknown parameter(s) %s; the declared parameters are %s. Retry with the declared names — %s",
 				quoteJoin(unexpected), quoteJoin(declared), guidance,
 			),
 		}
