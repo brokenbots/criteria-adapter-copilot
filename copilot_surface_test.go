@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	adapterhost "github.com/brokenbots/criteria-go-adapter-sdk/adapterhost"
 	copilot "github.com/github/copilot-sdk/go"
@@ -584,5 +585,179 @@ func TestDeclaredSubmitParamsFor(t *testing.T) {
 		[]*v2.OutcomeContract{contractTestContract(t, "approved", reasonRequiredSchema, true, false)})
 	if !reflect.DeepEqual(declaredSubmitParamsFor(surf), []string{"comment", "outcome", "payload"}) {
 		t.Fatalf("typed surface declared set = %v", declaredSubmitParamsFor(surf))
+	}
+}
+
+// ── Execute-driven re-bind coverage (KB-391 scope item 6) ────────────────────
+//
+// Every ensureStepSurface unit test above calls the helper directly, so they
+// prove nothing about where the card's wiring actually lives: the Execute call
+// site. This test drives full Executes and fails if Execute stops re-opening
+// the SDK session from the delivered contracts (or opens with the wrong
+// shape), because nothing else in the stack binds a step surface.
+func TestExecuteBindsStepSurfaceFromContracts(t *testing.T) {
+	// The live session is the pre-Execute binding (static surface); the
+	// re-open hands back a scripted resumed session. toolNames lets the
+	// serve-tool probe on the resume path genuinely check submit_outcome.
+	live := &fakeSession{sessionID: "sdk-live"}
+	finale := &fakeSession{sessionID: "sdk-resumed", toolNames: []string{submitOutcomeToolName}}
+	fc := &fakeClient{pingErr: nil, handOut: finale}
+	p := newCopilotAdapter()
+	p.client = fc
+	p.clientOptions = &copilot.ClientOptions{}
+	t.Setenv("CRITERIA_HOME", t.TempDir())
+	sc := p.buildSessionConfig(map[string]string{"model": "m"}, "adapter-surface")
+	s := newSessionState("adapter-surface", live, sc, buildResumeConfig(sc), adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil), p)
+	p.sessions["adapter-surface"] = s
+	persistSDKSessionID("adapter-surface", "sdk-live")
+	// If Execute ever stops re-declaring, the turn still runs against the
+	// static-bound live session: finalize via the static lane so the
+	// open-count assertions fail fast instead of wedging on the watchdog.
+	live.onSend = func(_ int, _ copilot.MessageOptions) {
+		s.mu.Lock()
+		s.finalizedOutcome = "approved"
+		s.mu.Unlock()
+	}
+	live.emitOnSend = []copilot.SessionEvent{
+		{Data: &copilot.AssistantMessageData{MessageID: "live", Content: "submitting"}},
+		{Data: &copilot.SessionIdleData{}},
+	}
+
+	allowed := []string{"approved", "needs_review"}
+	contracts := []*v2.OutcomeContract{contractTestContract(t, "approved", reasonRequiredSchema, false, false)}
+
+	var reasonRejection, validSubmission copilot.ToolResult
+	// The model side of the turn, driven through the tool object the resumed
+	// session ACTUALLY registered: first a wrong-lane top-level reason
+	// submission (must be decode-rejected — the bound surface declares no
+	// reason member), then a payload-shaped submission (must finalize).
+	finale.onSend = func(_ int, _ copilot.MessageOptions) {
+		fc.mu.Lock()
+		var surfaced *copilot.Tool
+		for i := range fc.resumeConfigs {
+			for j := range fc.resumeConfigs[i].Tools {
+				tool := &fc.resumeConfigs[i].Tools[j]
+				if tool.Name == submitOutcomeToolName {
+					surfaced = tool
+				}
+			}
+		}
+		fc.mu.Unlock()
+		if surfaced == nil {
+			t.Errorf("resumed session registered no submit_outcome tool")
+			return
+		}
+		reasonRejection, _ = surfaced.Handler(copilot.ToolInvocation{
+			ToolName:  submitOutcomeToolName,
+			Arguments: map[string]any{"outcome": "approved", "reason": "all findings here"},
+		})
+		validSubmission, _ = surfaced.Handler(copilot.ToolInvocation{
+			ToolName:  submitOutcomeToolName,
+			Arguments: map[string]any{"outcome": "approved", "payload": map[string]any{"reason": "clean"}},
+		})
+	}
+	finale.emitOnSend = []copilot.SessionEvent{
+		{Data: &copilot.AssistantMessageData{MessageID: "m1", Content: "submitting"}},
+		{Data: &copilot.SessionIdleData{}},
+	}
+	openCounts := func() (resumes int, creates int) {
+		fc.mu.Lock()
+		defer fc.mu.Unlock()
+		return len(fc.resumeIDs), fc.createCount
+	}
+	sender := &recordingSender{}
+	executeReq := func() *v2.ExecuteRequest {
+		return &v2.ExecuteRequest{
+			SessionId:        "adapter-surface",
+			Input:            map[string]string{"prompt": "review the diff and submit"},
+			AllowedOutcomes:  allowed,
+			OutcomeContracts: contracts,
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// (a) One step with schema-carrying contracts: Execute must re-open the
+	// SDK session by RESUME and resume it with the step surface bound.
+	if err := p.Execute(ctx, executeReq(), sender); err != nil {
+		t.Fatalf("Execute #1 returned error: %v", err)
+	}
+	resumes, creates := openCounts()
+	if resumes != 1 || creates != 0 {
+		t.Fatalf("Execute #1 opens = resumes %d / creates %d, want exactly one resume / no create", resumes, creates)
+	}
+	if got := s.currentSession().SessionID(); got != "sdk-resumed" {
+		t.Fatalf("post-Execute session = %q, want the re-opened conversation %q", got, "sdk-resumed")
+	}
+	if s.stepSurface == nil {
+		t.Fatal("Execute must record the bound step surface on session state")
+	}
+	props := toolArgSet(t, fc.resumeConfigs[0].Tools)
+	if _, has := props["reason"]; has {
+		t.Fatal("resumed submit_outcome must not carry the static reason member on a typed step")
+	}
+	payloadParams, hasPayload := props["payload"].(map[string]any)
+	if !hasPayload {
+		t.Fatal("resumed submit_outcome must carry the step's payload schema")
+	}
+	if req, ok := payloadParams["required"].([]any); !ok || len(req) != 1 || req[0] != "reason" {
+		t.Errorf("payload schema required = %v, want [reason]", payloadParams["required"])
+	}
+
+	// (d) The wrong-lane reason submission went through the real registered
+	// tool path and was rejected at the decode layer, not the handler fold.
+	if reasonRejection.ResultType != "failure" {
+		t.Fatalf("tool-path reason submission = %q, want failure", reasonRejection.ResultType)
+	}
+	if msg := reasonRejection.TextResultForLLM; !strings.Contains(msg, `"reason"`) || !strings.Contains(msg, `"payload"`) {
+		t.Errorf("tool-path rejection must be the decode-layer unknown-parameter text, got %q", msg)
+	}
+	if reasonRejection.TextResultForLLM != reasonRejection.Error {
+		t.Errorf("tool-path rejection must carry the message as the result error too: %q / %q",
+			reasonRejection.TextResultForLLM, reasonRejection.Error)
+	}
+	s.mu.Lock()
+	kind, attempts := s.finalizeFailureKind, s.finalizeAttempts
+	s.mu.Unlock()
+	if kind != "invalid_params" || attempts == 0 {
+		t.Fatalf("post-rejection kind/attempts = %q/%d, want invalid_params/>0", kind, attempts)
+	}
+	// And the payload-shaped call through the same surfaced tool finalized.
+	if validSubmission.ResultType != "success" {
+		t.Fatalf("tool-path payload submission = %q (%s), want success", validSubmission.ResultType, validSubmission.TextResultForLLM)
+	}
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "approved" {
+		t.Fatalf("step outcome = %q, want approved", r.GetOutcome())
+	}
+	if got := string(r.GetOutputsJson()); got != `{"reason":"clean"}` {
+		t.Errorf("outputs_json = %s, want the surfaced tool's payload verbatim", got)
+	}
+
+	// (b) An identical-contract-shape step must cost zero additional opens.
+	if err := p.Execute(ctx, executeReq(), sender); err != nil {
+		t.Fatalf("Execute #2 returned error: %v", err)
+	}
+	if res, cr := openCounts(); res != resumes || cr != creates {
+		t.Fatalf("Execute #2 churned opens: resumes %d→%d creates %d→%d, want zero", resumes, res, creates, cr)
+	}
+
+	// (c) A repair-mode Execute with a DIFFERENT contract shape must not
+	// re-open either (the bound surface is authoritative across a repair).
+	drift := []*v2.OutcomeContract{contractTestContract(t, "needs_review", `{"type":"object"}`, true, false)}
+	repair := executeReq()
+	repair.OutcomeContracts = drift
+	repair.Rejection = &v2.ExecutionRejection{Outcome: "approved", Attempt: 2}
+	if err := p.Execute(ctx, repair, sender); err != nil {
+		t.Fatalf("repair Execute returned error: %v", err)
+	}
+	if res, cr := openCounts(); res != resumes || cr != creates {
+		t.Fatalf("repair Execute churned opens: resumes %d→%d creates %d→%d, want zero", resumes, res, creates, cr)
+	}
+	if s.stepSurface == nil {
+		t.Fatal("repair Execute must keep the bound step surface")
+	}
+	if last := resultFromSender(sender); last.GetOutcome() != "approved" {
+		t.Errorf("repair Execute outcome = %q, want approved", last.GetOutcome())
 	}
 }
