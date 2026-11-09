@@ -200,3 +200,21 @@ func TestInfo_CapabilitiesIncludeAdapterTools(t *testing.T) {
 	}
 	t.Fatalf("capabilities %v do not include %q", info.GetCapabilities(), adapterhost.CapabilityAdapterTools)
 }
+
+// TestInfo_CapabilitiesIncludeOutcomeContracts asserts the KB-391 matrix
+// entry: the adapter advertises outcome_contracts so the host knows the
+// adapter consumes req.GetOutcomeContracts() per Execute (SDK v0.7.0
+// contract mode) rather than only the static legacy lane.
+func TestInfo_CapabilitiesIncludeOutcomeContracts(t *testing.T) {
+	var a copilotAdapter
+	info, err := a.Info(context.Background(), &v2.InfoRequest{})
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	for _, cap := range info.GetCapabilities() {
+		if cap == adapterhost.CapabilityOutcomeContracts {
+			return
+		}
+	}
+	t.Fatalf("capabilities %v do not include %q", info.GetCapabilities(), adapterhost.CapabilityOutcomeContracts)
+}

@@ -147,6 +147,7 @@ func (p *copilotAdapter) Info(_ context.Context, _ *v2.InfoRequest) (*v2.InfoRes
 			"structured_events",
 			"permission_gating",
 			adapterhost.CapabilityAdapterTools,
+			adapterhost.CapabilityOutcomeContracts,
 		},
 		ConfigSchema: &v2.AdapterSchemaProto{Fields: map[string]*v2.ConfigFieldProto{
 			"model":             {Type: "string", Description: "Copilot model to use for this session."},

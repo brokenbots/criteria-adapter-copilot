@@ -27,17 +27,23 @@ import (
 // secret-redacted before it reaches any prompt.
 const maxContractIssueLen = 2000
 
-// SubmitOutcomeArgs is the typed parameter struct for the `submit_outcome` tool.
-// The tool is registered as a hand-built SDK Tool (static parameter schema via
-// Tool.Parameters), not via DefineTool reflection, so the shape is
-// adapter-controlled. The schema deliberately does NOT encode an enum for
-// Outcome — the Copilot Go SDK (v1.0.0) binds tools only at
-// CreateSession/ResumeSessionWithOptions with no Session-level tool-mutation
-// API, so a per-step enum would require resuming the session once per step,
-// which the design explicitly rejects. Validation runs in the tool handler
-// against the active step's allowed_outcomes set and, when the step carries
-// outcome contracts (v0.7.0 contract mode), the matched contract's schema —
-// both carried on sessionState.
+// SubmitOutcomeArgs is the typed parameter struct for the `submit_outcome`
+// tool. The tool's NAME stays `submit_outcome` for every step: the
+// served-tools probe (verifySubmitOutcomePresented) and the compat machinery
+// key on that exact string, while wording and schema phrasing are this
+// adapter's prerogative (KB-391).
+//
+// KB-391 (dave ruling 2026-11-08): how the adapter presents this tool, what
+// the model is taught to call, and how model shape translates back to wire
+// shape is ADAPTER-INTERNAL. The step's declared outcome contracts already
+// ride every Execute request (req.GetOutcomeContracts()), and
+// copilot_surface.go re-opens the SDK session's submit_outcome binding FROM
+// those contracts whenever the arriving surface's shape differs from the
+// bound one (digest-keyed: unchanged steps cost zero re-opens). A schema
+// step's truth is therefore schema-declared — outcome enum, payload
+// properties, required comment — instead of prompt-conveyed. This struct is
+// the decode-layer truth for the static legacy lane (contract-less steps,
+// byte-identical) and the fallback decode of a freshly-bound surface.
 //
 // KB-216: the parameter contract is DECLARED, not implicit. outcome is the
 // required member of the schema the model sees (the only per-lane
@@ -58,20 +64,13 @@ const maxContractIssueLen = 2000
 // member the payload lacks) lands in the payload and finalizes accepted,
 // while one the fold refuses (no such required member, or the payload
 // supplies its own) is a wrong-lane submission rejected with the same typed
-// not-consumed shape. The outcome.finalized event renders the operative
-// prose from the payload — for a fold-consumed reason that is the exact
-// top-level prose.
-//
-// KB-260 re-bind (dave, 10-14): the static schema previously advertised
-// top-level reason as uniformly required, mis-teaching typed steps (the
-// model paid a reason onto a lane whose output is the payload). The schema's
-// docs now teach the per-step lanes — reason required on contract-less
-// steps, payload-as-output on schema-declaring contracts — while the
-// per-step truth stays prompt-conveyed and handler-enforced: SDK tools bind
-// per session, so no per-step required list is expressible on the static
-// schema itself, and the legacy lane's reason requirement is enforced in
-// turn (an empty/absent reason on a step without outcome contracts is
-// rejected — KB-260 review B1).
+// not-consumed shape. That fold machinery is compat surface: it stays
+// reachable only on legacy/untyped lanes (and mixed steps' untyped branch)
+// for old engines that never deliver contracts; the KB-391 schema-declared
+// surface teaches typed steps the payload lane directly, so the fold never
+// fires there. The outcome.finalized event renders the operative prose from
+// the payload — for a fold-consumed reason that is the exact top-level
+// prose.
 type SubmitOutcomeArgs struct {
 	Outcome string `json:"outcome"`          // required; must be a member of the active allowed set
 	Reason  string `json:"reason,omitempty"` // required-and-enforced on contract-less steps; on typed steps folded into the payload when the contract requires it, wrong-lane-rejected when the fold refuses it (KB-263/KB-388)
