@@ -338,16 +338,39 @@ func (s *sessionState) checkContractFinalize(outcome string, payload json.RawMes
 	if len(s.activeContracts) == 0 {
 		return nil
 	}
+	issues := evaluateFinalizeCandidate(sortedContractList(s.activeContracts), outcome, payload, comment)
+	if len(issues) == 0 {
+		return nil
+	}
+	return &contractRejection{kind: contractRejectionKind(issues), issues: issues}
+}
+
+// evaluateFinalizeCandidate pre-flights one finalize candidate over a contract
+// set with the SDK's pinned evaluator wrapper (KB-391): nil issues means the
+// result is safe to push across the Execute stream as-is. The payload is
+// normalized to the finalize wire shape (absent/empty/null = {}) and the
+// comment is the trimmed finalize comment the result will carry.
+func evaluateFinalizeCandidate(contracts []*v2.OutcomeContract, outcome string, payload json.RawMessage, comment string) []string {
 	candidate := &v2.ExecuteResult{
 		Outcome:     outcome,
 		Comment:     comment,
 		OutputsJson: normalizedFinalizePayload(payload),
 	}
-	issues := adapterhost.ValidateOutcomeResult(sortedContractList(s.activeContracts), candidate)
-	if len(issues) == 0 {
+	return adapterhost.ValidateOutcomeResult(contracts, candidate)
+}
+
+// pushBoundaryIssuesLocked re-runs the pinned evaluator over an already
+// recorded finalize at the terminal push boundary (KB-391 defensive
+// pre-flight): the finalize passed the in-turn checks at submit, this re-checks
+// that the contract set on file still accepts the candidate before the result
+// rides the Execute stream — catching contract drift between accept and push
+// (an Execute re-handshake on the session, a repair path recording outside the
+// handler). Caller holds s.mu. Legacy mode (no contracts) is always clean.
+func (s *sessionState) pushBoundaryIssuesLocked(outcome string, payload json.RawMessage, comment string) []string {
+	if !s.contractMode || len(s.activeContracts) == 0 {
 		return nil
 	}
-	return &contractRejection{kind: contractRejectionKind(issues), issues: issues}
+	return evaluateFinalizeCandidate(sortedContractList(s.activeContracts), outcome, payload, comment)
 }
 
 // contractRejectionKind classifies the pinned issue list into the rejection

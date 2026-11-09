@@ -58,6 +58,11 @@ type recordedFinalize struct {
 	payload       json.RawMessage
 	comment       string
 	secrets       []string
+	// preflightIssues carries the KB-391 push-boundary pre-flight result
+	// (captured in snapshotRecordedFinalize under the same lock): a non-empty
+	// list means the recorded finalize no longer matches the step's active
+	// contracts at the terminal push.
+	preflightIssues []string
 }
 
 // snapshotRecordedFinalize captures the recorded finalize state under s.mu.
@@ -70,19 +75,22 @@ func (s *sessionState) snapshotRecordedFinalize() (recordedFinalize, bool) {
 		return recordedFinalize{}, false
 	}
 	return recordedFinalize{
-		outcome:       s.finalizedOutcome,
-		reason:        s.finalizedReason,
-		contractMode:  s.contractMode,
-		inRepair:      s.inRepairMode,
-		repairAttempt: s.inRepairAttempt,
-		payload:       append(json.RawMessage(nil), s.finalizedPayload...),
-		comment:       s.finalizedComment,
-		secrets:       s.heldSecrets,
+		outcome:         s.finalizedOutcome,
+		reason:          s.finalizedReason,
+		contractMode:    s.contractMode,
+		inRepair:        s.inRepairMode,
+		repairAttempt:   s.inRepairAttempt,
+		payload:         append(json.RawMessage(nil), s.finalizedPayload...),
+		comment:         s.finalizedComment,
+		secrets:         s.heldSecrets,
+		preflightIssues: s.pushBoundaryIssuesLocked(s.finalizedOutcome, s.finalizedPayload, s.finalizedComment),
 	}, true
 }
 
 // send emits the captured terminal result (and the outcome.recovered event
-// ahead of it for a repair finalize).
+// ahead of it for a repair finalize). A failed push-boundary pre-flight emits
+// the KB-391 diagnostic event first and still forwards — the engine's attempt
+// loop remains the authoritative backstop.
 func (f recordedFinalize) send(sink adapterhost.ExecuteEventSender) error {
 	if f.inRepair {
 		// KB-47: a rejected finalize that the model repaired and resubmitted
@@ -93,6 +101,7 @@ func (f recordedFinalize) send(sink adapterhost.ExecuteEventSender) error {
 		}))
 	}
 	if f.contractMode {
+		sendPushPreflightDiagnostic(sink, f.outcome, f.preflightIssues, f.secrets)
 		// Contract mode: outputs_json is exactly the model-submitted,
 		// schema-validated payload — never a session-state assembly — and the
 		// finalize comment rides ExecuteResult.comment. Both pass through the
@@ -582,6 +591,10 @@ func (ts *turnState) handleIdleTurn(ctx context.Context, s *sessionState, sink a
 		repairAttempt := s.inRepairAttempt
 		payload := append([]byte(nil), s.finalizedPayload...)
 		comment := s.finalizedComment
+		// KB-391 push-boundary pre-flight: re-run the pinned evaluator over the
+		// recorded finalize so a candidate that drifted out of contract between
+		// accept and push is diagnosed before the terminal result goes out.
+		preflightIssues := s.pushBoundaryIssuesLocked(outcome, payload, comment)
 		s.mu.Unlock()
 		if inRepair {
 			// KB-47: a rejected finalize that the model repaired and
@@ -593,6 +606,7 @@ func (ts *turnState) handleIdleTurn(ctx context.Context, s *sessionState, sink a
 			}))
 		}
 		if contractMode {
+			sendPushPreflightDiagnostic(sink, outcome, preflightIssues, s.heldSecrets)
 			// Contract mode: outputs_json is exactly the model-submitted,
 			// schema-validated payload — never a session-state assembly — and
 			// the finalize comment rides ExecuteResult.comment. Both pass

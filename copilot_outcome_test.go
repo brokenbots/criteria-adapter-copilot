@@ -2227,3 +2227,129 @@ func TestContractFinalize_EmptyTopLevelReasonDoesNotFakeSuccess(t *testing.T) {
 func containsFieldReason(payload string) bool {
 	return payload != "" && payload != "null" && payload != "{}"
 }
+
+// ── KB-391 push-boundary pre-flight (defensive re-check at the terminal push) ──
+
+func TestPushBoundaryIssuesLocked(t *testing.T) {
+	s := contractTestState([]string{"approved"},
+		contractTestContract(t, "approved", `{"type":"object"}`, false, false))
+
+	if issues := s.pushBoundaryIssuesLocked("approved", json.RawMessage(`{}`), ""); issues != nil {
+		t.Errorf("clean candidate must preflight clean, got %v", issues)
+	}
+
+	// Drift: the contract on file now requires a member the accepted finalize
+	// lacks — pinned payload_schema issues come back for review.
+	s.mu.Lock()
+	s.activeContracts["approved"] = contractTestContract(t, "approved",
+		`{"type":"object","required":["approved_by"],"properties":{"approved_by":{"type":"string"}}}`, false, false)
+	s.mu.Unlock()
+	issues := s.pushBoundaryIssuesLocked("approved", json.RawMessage(`{}`), "")
+	if len(issues) == 0 {
+		t.Fatal("drifted candidate must come back with pinned issues")
+	}
+	if !strings.Contains(fmt.Sprint(issues), `property "approved_by"`) {
+		t.Errorf("issues = %v, want the pinned required-property text", issues)
+	}
+	if contractRejectionKind(issues) != "invalid_payload" {
+		t.Errorf("kind = %q, want invalid_payload", contractRejectionKind(issues))
+	}
+
+	// Legacy mode stays clean regardless of contracts on file.
+	s.contractMode = false
+	if issues := s.pushBoundaryIssuesLocked("approved", json.RawMessage(`not even json`), ""); issues != nil {
+		t.Errorf("legacy lane must not preflight, got %v", issues)
+	}
+}
+
+func TestSnapshotRecordedFinalizeSendPreflight(t *testing.T) {
+	newFinalized := func(t *testing.T) (*sessionState, *recordingSender) {
+		t.Helper()
+		s := contractTestState([]string{"approved"},
+			contractTestContract(t, "approved", `{"type":"object"}`, true, false))
+		sink := &recordingSender{}
+		s.active, s.sink = true, sink
+		s.heldSecrets = []string{"swordfish"}
+		s.finalizedOutcome = "approved"
+		s.finalizedComment = "note swordfish"
+		s.finalizedPayload = json.RawMessage(`{"verdict":"swordfish","score":2}`)
+		return s, sink
+	}
+
+	t.Run("clean push emits result only", func(t *testing.T) {
+		s, sink := newFinalized(t)
+		snap, ok := s.snapshotRecordedFinalize()
+		if !ok {
+			t.Fatal("finalize must snapshot")
+		}
+		if len(snap.preflightIssues) != 0 {
+			t.Fatalf("clean preflight issues = %v, want none", snap.preflightIssues)
+		}
+		if err := snap.send(sink); err != nil {
+			t.Fatalf("send error: %v", err)
+		}
+		if ev := adapterEventPayload(sink, "outcome.preflight_failed"); ev != nil {
+			t.Errorf("unexpected preflight event: %v", ev)
+		}
+		r := resultFromSender(sink)
+		if r.GetOutcome() != "approved" {
+			t.Errorf("result outcome = %q, want approved", r.GetOutcome())
+		}
+	})
+
+	t.Run("drifted push emits diagnostic and still forwards", func(t *testing.T) {
+		s, sink := newFinalized(t)
+		s.mu.Lock()
+		s.activeContracts["approved"] = contractTestContract(t, "approved",
+			`{"type":"object","required":["approved_by"],"properties":{"approved_by":{"type":"string"}}}`, false, false)
+		s.mu.Unlock()
+		snap, ok := s.snapshotRecordedFinalize()
+		if !ok || len(snap.preflightIssues) == 0 {
+			t.Fatalf("snapshot preflight issues = %v (ok=%v), want non-empty", snap.preflightIssues, ok)
+		}
+		if err := snap.send(sink); err != nil {
+			t.Fatalf("send error: %v", err)
+		}
+		pre := adapterEventPayload(sink, "outcome.preflight_failed")
+		if pre == nil {
+			t.Fatal("expected outcome.preflight_failed on drifted push")
+		}
+		if pre["outcome"] != "approved" {
+			t.Errorf("preflight outcome = %v, want approved", pre["outcome"])
+		}
+		issues, okI := pre["issues"].([]any)
+		if !okI || len(issues) == 0 {
+			t.Fatalf("preflight issues = %v, want non-empty", pre["issues"])
+		}
+		// Secrets still ride the hygiene path on the diagnostic's issue list.
+		if strings.Contains(fmt.Sprint(issues), "swordfish") {
+			t.Errorf("diagnostic issues leak secrets: %v", issues)
+		}
+		r := resultFromSender(sink)
+		if r.GetOutcome() != "approved" || r.GetComment() != "note [REDACTED]" {
+			t.Errorf("result = outcome %q comment %q, want approved + redacted comment", r.GetOutcome(), r.GetComment())
+		}
+	})
+
+	t.Run("legacy lane never preflights", func(t *testing.T) {
+		s, sink := newFinalized(t)
+		s.mu.Lock()
+		s.contractMode = false
+		s.finalizedReason = "looks good"
+		s.mu.Unlock()
+		snap, ok := s.snapshotRecordedFinalize()
+		if !ok || snap.preflightIssues != nil {
+			t.Fatalf("legacy snapshot preflight = %v (ok=%v), want nil/true", snap.preflightIssues, ok)
+		}
+		if err := snap.send(sink); err != nil {
+			t.Fatalf("send error: %v", err)
+		}
+		if ev := adapterEventPayload(sink, "outcome.preflight_failed"); ev != nil {
+			t.Errorf("legacy lane must not emit preflight event, got %v", ev)
+		}
+		out := outputsOf(t, resultFromSender(sink))
+		if len(out) != 2 || out["reason"] != "looks good" {
+			t.Errorf("legacy outputs = %v, want exactly outcome+reason", out)
+		}
+	})
+}

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -1206,6 +1207,59 @@ func TestHandleIdleTurnContractEmission(t *testing.T) {
 		}
 		if r.GetComment() != "" {
 			t.Errorf("legacy result must not carry comment, got %q", r.GetComment())
+		}
+	})
+
+	// KB-391 push-boundary pre-flight: a finalize accepted against the old
+	// contract set, pushed after the contracts drifted (Execute re-handshake),
+	// emits the diagnostic event and still forwards the terminal result — the
+	// engine's attempt loop remains the authoritative backstop.
+	t.Run("preflight diagnostic on contract drift", func(t *testing.T) {
+		s, sink := newContractSession(t)
+		s.mu.Lock()
+		s.activeContracts["approved"] = contractTestContract(t, "approved",
+			`{"type":"object","required":["approved_by"],"properties":{"approved_by":{"type":"string"}}}`, false, false)
+		s.mu.Unlock()
+		ts := newTurnState(3)
+		if done, err := ts.handleIdleTurn(ctx, s, sink, 1); err != nil || !done {
+			t.Fatalf("done/err = %v/%v, want true/nil", done, err)
+		}
+		pre := adapterEventPayload(sink, "outcome.preflight_failed")
+		if pre == nil {
+			t.Fatal("expected an outcome.preflight_failed event for a drifted finalize")
+		}
+		if pre["outcome"] != "approved" {
+			t.Errorf("preflight outcome = %v, want approved", pre["outcome"])
+		}
+		issues, ok := pre["issues"].([]any)
+		if !ok || len(issues) == 0 {
+			t.Fatalf("preflight issues = %v, want non-empty list", pre["issues"])
+		}
+		if !strings.Contains(fmt.Sprint(issues), "approved_by") {
+			t.Errorf("issues = %v, want the pinned missing-property text", issues)
+		}
+		// Forwarding is unchanged: the terminal contract result still rides
+		// the stream, payload verbatim and secret-redacted.
+		r := resultFromSender(sink)
+		if r.GetOutcome() != "approved" || r.GetComment() == "" {
+			t.Errorf("result = outcome %q comment %q, want approved + comment", r.GetOutcome(), r.GetComment())
+		}
+		if got := string(r.GetOutputsJson()); strings.Contains(got, "swordfish") || !strings.Contains(got, "[REDACTED]") {
+			t.Errorf("outputs_json not redacted on drifted push: %s", got)
+		}
+	})
+
+	t.Run("no preflight event when contracts match", func(t *testing.T) {
+		s, sink := newContractSession(t)
+		ts := newTurnState(3)
+		if done, err := ts.handleIdleTurn(ctx, s, sink, 1); err != nil || !done {
+			t.Fatalf("done/err = %v/%v, want true/nil", done, err)
+		}
+		if ev := adapterEventPayload(sink, "outcome.preflight_failed"); ev != nil {
+			t.Errorf("unexpected preflight event on clean push: %v", ev)
+		}
+		if r := resultFromSender(sink); r.GetOutcome() != "approved" {
+			t.Errorf("result outcome = %q, want approved", r.GetOutcome())
 		}
 	})
 }
