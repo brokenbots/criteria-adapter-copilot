@@ -3,8 +3,8 @@ module github.com/brokenbots/criteria-adapter-copilot
 go 1.26.10
 
 require (
-	github.com/brokenbots/criteria-adapter-proto v0.7.0
-	github.com/brokenbots/criteria-go-adapter-sdk v0.5.4
+	github.com/brokenbots/criteria-adapter-proto v0.7.1-0.20261019051615-3a3aa0c1cb85
+	github.com/brokenbots/criteria-go-adapter-sdk v0.7.0
 	github.com/github/copilot-sdk/go v1.0.0
 	github.com/google/jsonschema-go v0.4.2
 	github.com/google/uuid v1.6.0
@@ -28,8 +28,8 @@ require (
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
-	golang.org/x/net v0.60.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 )
