@@ -142,6 +142,102 @@ func TestRestore_ReattachesToExactAddress(t *testing.T) {
 	}
 }
 
+// TestRestore_ResumesOnTheStepBoundSurface pins review 5821523125's Restore
+// defect: every other re-open path is surface-aware, so Restore must resume
+// on the step-bound resume config while a step surface is in force — not on
+// the static reason-carrying one, which would teach the restored conversation
+// the static schema while the adapter's strict decode enforces the bound
+// surface (a desync the digest-keyed ensureStepSurface would never repair).
+func TestRestore_ResumesOnTheStepBoundSurface(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+	allowed, contracts := approvedStep(t)
+	bound := p.ensureStepSurface(context.Background(), s, allowed, contracts)
+	if bound == nil || s.stepSurface == nil {
+		t.Fatal("step surface must bind before Restore")
+	}
+
+	fc.handOut = &fakeSession{sessionID: "sdk-restored"}
+	if _, err := p.Restore(context.Background(), &v2.RestoreRequest{
+		SessionId:     "adapter-surface",
+		State:         []byte("sdk-checkpoint-2"),
+		SchemaVersion: copilotStateSchemaVersion,
+	}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	// (a) The resumed config carried the STEP surface's submit_outcome tool —
+	// the bound surface's properties, no top-level reason member — not the
+	// static reason-carrying set.
+	fc.mu.Lock()
+	lastResume := len(fc.resumeConfigs) - 1
+	tools := fc.resumeConfigs[lastResume].Tools
+	fc.mu.Unlock()
+	if len(tools) == 0 {
+		t.Fatal("Restore recorded no tools on the resumed config")
+	}
+	props := toolArgSet(t, tools)
+	if _, has := props["reason"]; has {
+		t.Fatal("Restore resumed with the static reason-carrying submit_outcome; want the step surface")
+	}
+	if _, has := props["payload"]; !has {
+		t.Fatal("step-bound submit_outcome must present the payload schema after Restore")
+	}
+
+	// (b) The recorded binding stays consistent with what was resumed, and the
+	// next same-shape execute costs zero additional opens.
+	s.mu.Lock()
+	boundAfter, stepCfg, stepResumeCfg := s.stepSurface, s.stepSessionConfig, s.stepResumeConfig
+	s.mu.Unlock()
+	if boundAfter != bound {
+		t.Fatal("Restore must not clear the bound step surface")
+	}
+	if stepCfg == nil || stepResumeCfg == nil {
+		t.Fatal("Restore must keep the step-bound config pair recorded")
+	}
+	fc.mu.Lock()
+	resumesBefore, createsBefore := len(fc.resumeIDs), fc.createCount
+	fc.mu.Unlock()
+	if again := p.ensureStepSurface(context.Background(), s, allowed, contracts); again != bound {
+		t.Fatal("same-shape execute after Restore must keep the bound surface")
+	}
+	fc.mu.Lock()
+	churn := len(fc.resumeIDs) != resumesBefore || fc.createCount != createsBefore
+	fc.mu.Unlock()
+	if churn {
+		t.Fatalf("post-Restore same-shape step re-opened: resumes %d→%d creates %d→%d, want zero churn",
+			resumesBefore, len(fc.resumeIDs), createsBefore, fc.createCount)
+	}
+}
+
+// TestRestore_NoStepSurfaceKeepsStaticResumeConfig keeps the static lane
+// covered: with no step surface bound, Restore resumes with the static resume
+// config — the unchanged, reason-carrying submit_outcome set.
+func TestRestore_NoStepSurfaceKeepsStaticResumeConfig(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+	fc.handOut = &fakeSession{sessionID: "sdk-restored"}
+	if _, err := p.Restore(context.Background(), &v2.RestoreRequest{
+		SessionId:     "adapter-surface",
+		State:         []byte("sdk-checkpoint-1"),
+		SchemaVersion: copilotStateSchemaVersion,
+	}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	fc.mu.Lock()
+	lastResume := len(fc.resumeConfigs) - 1
+	tools := fc.resumeConfigs[lastResume].Tools
+	fc.mu.Unlock()
+	props := toolArgSet(t, tools)
+	if _, has := props["reason"]; !has {
+		t.Fatal("static-lane Restore must keep the reason-carrying static submit_outcome")
+	}
+	s.mu.Lock()
+	boundAfter := s.stepSurface
+	s.mu.Unlock()
+	if boundAfter != nil {
+		t.Fatal("nothing bound a step surface on the static lane")
+	}
+}
+
 // TestRestore_AlreadyAttachedSkipsSecondResume: the open path (CRI-272) may
 // already have reattached to the checkpointed address; a byte-equal token is
 // the same address and does not re-resume.

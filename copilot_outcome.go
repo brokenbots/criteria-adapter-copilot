@@ -377,7 +377,10 @@ func (s *sessionState) pushBoundaryIssuesLocked(outcome string, payload json.Raw
 // contractRejectionKind classifies the pinned issue list into the rejection
 // lane: a require_comment issue keeps its dedicated class when the payload is
 // otherwise clean; payload-schema issues dominate a multi-lane rejection; the
-// remaining issues are the outcome-level contract-coverage lane.
+// remaining issues are the outcome-level contract-coverage lane. The
+// issue-string prefixes matched here ("missing_comment: ", "payload_schema: ")
+// are byte-for-byte pinned by the conformance spec alongside the SDK
+// evaluator — the string coupling is deliberate, not accidental.
 func contractRejectionKind(issues []string) string {
 	commentOnly := true
 	payloadIssue := false

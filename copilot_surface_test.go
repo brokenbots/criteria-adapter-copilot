@@ -98,6 +98,132 @@ func TestSubmitSurfaceDivergingBranches(t *testing.T) {
 	if !containsAll(desc, "approved") {
 		t.Errorf("branch description must name its outcomes, got %q", desc)
 	}
+	// Review 5821523125: kept=3 contracts over 2 distinct schemas still means
+	// every outcome is schema-carrying — the branch count is the payload
+	// member's shape, not the reason lane, so no top-level `reason` member.
+	props := surf.params["properties"].(map[string]any)
+	if _, has := props["reason"]; has {
+		t.Fatal("diverging-schema step with all schema-carrying contracts must not declare top-level reason")
+	}
+	if want := []string{"comment", "outcome", "payload"}; !slices.Equal(surf.declared, want) {
+		t.Fatalf("declared set = %v, want %v", surf.declared, want)
+	}
+}
+
+// Review 5821523125: two contracts carrying the IDENTICAL schema_json are two
+// typed contracts — one distinct payload branch (collapsed, not anyOf, with
+// both outcomes named) and NO top-level reason member. The previous branch-
+// count derivation wrongly treated fewer branches than contracts as an
+// untyped lane and declared reason on this fully typed step.
+func TestSubmitSurfaceIdenticalSchemaNoReason(t *testing.T) {
+	surf := submitSurfaceFromStep(
+		[]string{"approved", "failed"},
+		[]*v2.OutcomeContract{
+			contractTestContract(t, "approved", reasonRequiredSchema, false, false),
+			contractTestContract(t, "failed", reasonRequiredSchema, false, false),
+		},
+	)
+	if surf == nil {
+		t.Fatal("expected a step surface")
+	}
+	props := surf.params["properties"].(map[string]any)
+	if _, has := props["reason"]; has {
+		t.Fatal("identical-schema step (all contracts schema-carrying) declared top-level reason")
+	}
+	if want := []string{"comment", "outcome", "payload"}; !slices.Equal(surf.declared, want) {
+		t.Fatalf("declared set = %v, want %v", surf.declared, want)
+	}
+	payload, ok := props["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload member = %v, want the collapsed schema shape", props["payload"])
+	}
+	if _, branches := payload["anyOf"]; branches {
+		t.Fatal("two identical schemas must collapse to one shape, not an anyOf")
+	}
+	if want := []any{"reason"}; !slices.Equal(payload["required"].([]any), want) {
+		t.Fatalf("collapsed payload required = %v, want [reason]", payload["required"])
+	}
+	if desc, _ := payload["description"].(string); !containsAll(desc, "approved", "failed") {
+		t.Errorf("collapsed payload description must name both outcomes, got %q", desc)
+	}
+}
+
+// Mixed step (one typed + one schemaless contract): the KB-260 reason lane
+// stays declared with the mixed-lane doc, exercised by the fake-copilot
+// "mixed-lane-contract" scenario.
+func TestSubmitSurfaceMixedTypedAndSchemaless(t *testing.T) {
+	surf := submitSurfaceFromStep(
+		[]string{"approved", "needs_review"},
+		[]*v2.OutcomeContract{
+			contractTestContract(t, "approved", reasonRequiredSchema, false, false),
+			contractTestContract(t, "needs_review", "", false, false),
+		},
+	)
+	if surf == nil {
+		t.Fatal("expected a step surface")
+	}
+	props := surf.params["properties"].(map[string]any)
+	reason, has := props["reason"].(map[string]any)
+	if !has {
+		t.Fatal("mixed typed+schemaless step keeps the reason member declared")
+	}
+	if desc, _ := reason["description"].(string); !strings.Contains(desc, "schemaless outcomes consume it") {
+		t.Errorf("reason doc must use the mixed-lane wording, got %q", desc)
+	}
+	payload, ok := props["payload"].(map[string]any)
+	if !ok || payload["required"] == nil {
+		t.Fatalf("payload member must present the typed contract's schema, got %v", props["payload"])
+	}
+}
+
+// Review 5821523125, decided semantics: a non-empty but unparseable
+// schema_json counts as SCHEMA-CARRYING (no top-level reason member) and
+// contributes no payload branch — the surface cannot present what it cannot
+// parse — and the pinned contract gate flags the malformed schema at finalize
+// time.
+func TestSubmitSurfaceUnparseableSchema(t *testing.T) {
+	typedOnly := submitSurfaceFromStep(
+		[]string{"approved"},
+		[]*v2.OutcomeContract{contractTestContract(t, "approved", `{"type":`, false, false)},
+	)
+	if typedOnly == nil {
+		t.Fatal("expected a step surface")
+	}
+	props := typedOnly.params["properties"].(map[string]any)
+	if _, has := props["reason"]; has {
+		t.Fatal("unparseable schema_json counts as schema-carrying: no top-level reason member")
+	}
+	if want := []string{"comment", "outcome", "payload"}; !slices.Equal(typedOnly.declared, want) {
+		t.Fatalf("declared set = %v, want %v", typedOnly.declared, want)
+	}
+	payload, ok := props["payload"].(map[string]any)
+	if !ok || payload["properties"] != nil {
+		t.Fatalf("unpresentable schema must degrade to the generic payload lane, got %v", props["payload"])
+	}
+	if desc, _ := payload["description"].(string); !strings.Contains(desc, "verbatim") {
+		t.Errorf("generic payload lane description expected, got %q", desc)
+	}
+
+	// A schemaless contract beside the unparseable one keeps the reason lane,
+	// with the mixed wording (a typed lane coexists, even when unbranchable).
+	mixed := submitSurfaceFromStep(
+		[]string{"approved", "needs_review"},
+		[]*v2.OutcomeContract{
+			contractTestContract(t, "approved", "", false, false),
+			contractTestContract(t, "needs_review", `{"type":`, false, false),
+		},
+	)
+	if mixed == nil {
+		t.Fatal("expected a step surface")
+	}
+	mixedProps := mixed.params["properties"].(map[string]any)
+	reason, has := mixedProps["reason"].(map[string]any)
+	if !has {
+		t.Fatal("schemaless+unparseable step keeps the reason member declared")
+	}
+	if desc, _ := reason["description"].(string); !strings.Contains(desc, "schemaless outcomes consume it") {
+		t.Errorf("reason doc must use the mixed-lane wording, got %q", desc)
+	}
 }
 
 // Untyped-contract step: reason stays declared with display-truth docs,
@@ -326,7 +452,7 @@ func TestEnsureStepSurfaceConsecutiveSameShapeCostsNothing(t *testing.T) {
 	if first == nil {
 		t.Fatal("first typed step must bind")
 	}
-	opens, creates, resumes := 0, fc.createCount, len(fc.resumeIDs)
+	creates, resumes := fc.createCount, len(fc.resumeIDs)
 
 	for i := 0; i < 3; i++ {
 		again := p.ensureStepSurface(context.Background(), s, allowed, contracts)
@@ -337,9 +463,6 @@ func TestEnsureStepSurfaceConsecutiveSameShapeCostsNothing(t *testing.T) {
 	if fc.createCount != creates || len(fc.resumeIDs) != resumes {
 		t.Fatalf("same-shape steps re-opened: creates %d→%d resumes %d→%d, want zero churn",
 			creates, fc.createCount, resumes, len(fc.resumeIDs))
-	}
-	if opens != 0 {
-		t.Fatal("opens must stay zero")
 	}
 }
 
@@ -590,29 +713,36 @@ func TestDeclaredSubmitParamsFor(t *testing.T) {
 
 // ── Execute-driven re-bind coverage (KB-391 scope item 6) ────────────────────
 //
-// Every ensureStepSurface unit test above calls the helper directly, so they
+// Every ensureStepSurface unit test below calls the helper directly, so they
 // prove nothing about where the card's wiring actually lives: the Execute call
-// site. This test drives full Executes and fails if Execute stops re-opening
-// the SDK session from the delivered contracts (or opens with the wrong
-// shape), because nothing else in the stack binds a step surface.
-func TestExecuteBindsStepSurfaceFromContracts(t *testing.T) {
+// site. The tests in this section drive full Executes and fail if Execute
+// stops re-opening the SDK session from the delivered contracts (or opens
+// with the wrong shape), because nothing else in the stack binds a step
+// surface.
+
+// executeSurfaceFixture wires the full-Execute re-bind fixture: a
+// static-bound live SDK session ("sdk-live") that finalizes on the static
+// lane, a fake client whose ResumeSessionWithOptions hands back the scripted
+// "sdk-resumed" session, and the adapter session registered on the adapter.
+// If Execute ever stops re-declaring, the turn still runs against the
+// static-bound live session, so open-count assertions fail fast instead of
+// wedging on the watchdog.
+func executeSurfaceFixture(t *testing.T) (p *copilotAdapter, fc *fakeClient, s *sessionState, finale *fakeSession) {
+	t.Helper()
 	// The live session is the pre-Execute binding (static surface); the
 	// re-open hands back a scripted resumed session. toolNames lets the
 	// serve-tool probe on the resume path genuinely check submit_outcome.
 	live := &fakeSession{sessionID: "sdk-live"}
-	finale := &fakeSession{sessionID: "sdk-resumed", toolNames: []string{submitOutcomeToolName}}
-	fc := &fakeClient{pingErr: nil, handOut: finale}
-	p := newCopilotAdapter()
+	finale = &fakeSession{sessionID: "sdk-resumed", toolNames: []string{submitOutcomeToolName}}
+	fc = &fakeClient{pingErr: nil, handOut: finale}
+	p = newCopilotAdapter()
 	p.client = fc
 	p.clientOptions = &copilot.ClientOptions{}
 	t.Setenv("CRITERIA_HOME", t.TempDir())
 	sc := p.buildSessionConfig(map[string]string{"model": "m"}, "adapter-surface")
-	s := newSessionState("adapter-surface", live, sc, buildResumeConfig(sc), adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil), p)
+	s = newSessionState("adapter-surface", live, sc, buildResumeConfig(sc), adapterhost.NewSecrets(declaredGitHubTokenSecrets(), nil), p)
 	p.sessions["adapter-surface"] = s
 	persistSDKSessionID("adapter-surface", "sdk-live")
-	// If Execute ever stops re-declaring, the turn still runs against the
-	// static-bound live session: finalize via the static lane so the
-	// open-count assertions fail fast instead of wedging on the watchdog.
 	live.onSend = func(_ int, _ copilot.MessageOptions) {
 		s.mu.Lock()
 		s.finalizedOutcome = "approved"
@@ -622,6 +752,30 @@ func TestExecuteBindsStepSurfaceFromContracts(t *testing.T) {
 		{Data: &copilot.AssistantMessageData{MessageID: "live", Content: "submitting"}},
 		{Data: &copilot.SessionIdleData{}},
 	}
+	return p, fc, s, finale
+}
+
+// surfacedSubmitTool returns the submit_outcome tool object that the most
+// recent resumed session's config registered — the object a model invocation
+// through the resumed session actually hits.
+func surfacedSubmitTool(t *testing.T, fc *fakeClient) *copilot.Tool {
+	t.Helper()
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	for i := len(fc.resumeConfigs) - 1; i >= 0; i-- {
+		for j := range fc.resumeConfigs[i].Tools {
+			tool := &fc.resumeConfigs[i].Tools[j]
+			if tool.Name == submitOutcomeToolName {
+				return tool
+			}
+		}
+	}
+	t.Fatal("no resumed session registered a submit_outcome tool")
+	return nil
+}
+
+func TestExecuteBindsStepSurfaceFromContracts(t *testing.T) {
+	p, fc, s, finale := executeSurfaceFixture(t)
 
 	allowed := []string{"approved", "needs_review"}
 	contracts := []*v2.OutcomeContract{contractTestContract(t, "approved", reasonRequiredSchema, false, false)}
@@ -632,21 +786,7 @@ func TestExecuteBindsStepSurfaceFromContracts(t *testing.T) {
 	// submission (must be decode-rejected — the bound surface declares no
 	// reason member), then a payload-shaped submission (must finalize).
 	finale.onSend = func(_ int, _ copilot.MessageOptions) {
-		fc.mu.Lock()
-		var surfaced *copilot.Tool
-		for i := range fc.resumeConfigs {
-			for j := range fc.resumeConfigs[i].Tools {
-				tool := &fc.resumeConfigs[i].Tools[j]
-				if tool.Name == submitOutcomeToolName {
-					surfaced = tool
-				}
-			}
-		}
-		fc.mu.Unlock()
-		if surfaced == nil {
-			t.Errorf("resumed session registered no submit_outcome tool")
-			return
-		}
+		surfaced := surfacedSubmitTool(t, fc)
 		reasonRejection, _ = surfaced.Handler(copilot.ToolInvocation{
 			ToolName:  submitOutcomeToolName,
 			Arguments: map[string]any{"outcome": "approved", "reason": "all findings here"},
@@ -759,5 +899,98 @@ func TestExecuteBindsStepSurfaceFromContracts(t *testing.T) {
 	}
 	if last := resultFromSender(sender); last.GetOutcome() != "approved" {
 		t.Errorf("repair Execute outcome = %q, want approved", last.GetOutcome())
+	}
+}
+
+// TestExecuteDecodeRejectsReasonOnIdenticalSchemaStep pins the review
+// (5821523125) reason-lane rule through the real Execute path: two contracts
+// carrying the IDENTICAL schema produce one distinct payload branch, and the
+// resulting step surface must declare NO top-level reason member — a
+// top-level reason submission is then rejected at the DECODE layer (unknown
+// parameter) through the actually registered tool, not later by the
+// handler's KB-263 typed-reason fold message. Drives the same Execute call
+// site as TestExecuteBindsStepSurfaceFromContracts.
+func TestExecuteDecodeRejectsReasonOnIdenticalSchemaStep(t *testing.T) {
+	p, fc, s, finale := executeSurfaceFixture(t)
+
+	contracts := []*v2.OutcomeContract{
+		contractTestContract(t, "approved", reasonRequiredSchema, false, false),
+		contractTestContract(t, "failed", reasonRequiredSchema, false, false),
+	}
+	var reasonRejection, validSubmission copilot.ToolResult
+	var kindAtReject string
+	var attemptsAtReject int
+	finale.onSend = func(_ int, _ copilot.MessageOptions) {
+		surfaced := surfacedSubmitTool(t, fc)
+		reasonRejection, _ = surfaced.Handler(copilot.ToolInvocation{
+			ToolName: submitOutcomeToolName,
+			Arguments: map[string]any{
+				"outcome": "approved",
+				"reason":  "top-level prose on a typed step",
+			},
+		})
+		// Capture the recorded rejection before the valid submission resets
+		// the finalize bookkeeping.
+		s.mu.Lock()
+		kindAtReject, attemptsAtReject = s.finalizeFailureKind, s.finalizeAttempts
+		s.mu.Unlock()
+		validSubmission, _ = surfaced.Handler(copilot.ToolInvocation{
+			ToolName: submitOutcomeToolName,
+			Arguments: map[string]any{
+				"outcome": "approved",
+				"payload": map[string]any{"reason": "clean"},
+			},
+		})
+	}
+	finale.emitOnSend = []copilot.SessionEvent{
+		{Data: &copilot.AssistantMessageData{MessageID: "m1", Content: "submitting"}},
+		{Data: &copilot.SessionIdleData{}},
+	}
+
+	sender := &recordingSender{}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req := &v2.ExecuteRequest{
+		SessionId:        "adapter-surface",
+		Input:            map[string]string{"prompt": "review the diff and submit"},
+		AllowedOutcomes:  []string{"approved", "failed"},
+		OutcomeContracts: contracts,
+	}
+	if err := p.Execute(ctx, req, sender); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	if len(fc.resumeIDs) != 1 || fc.createCount != 0 {
+		t.Fatalf("opens = resumes %v / creates %d, want one resume / no create", fc.resumeIDs, fc.createCount)
+	}
+
+	// The rejection surfaced through the real registered tool at the decode
+	// layer: the unknown-parameter text naming "reason", NOT the handler's
+	// typed-reason-not-consumed wrong-lane message.
+	if reasonRejection.ResultType != "failure" {
+		t.Fatalf("tool-path reason submission = %q, want failure", reasonRejection.ResultType)
+	}
+	msg := reasonRejection.TextResultForLLM
+	if !strings.Contains(msg, "unknown parameter(s)") || !strings.Contains(msg, `"reason"`) {
+		t.Fatalf("decode-layer unknown-parameter rejection expected, got %q", msg)
+	}
+	if strings.Contains(msg, typedReasonNotConsumedMessage()) {
+		t.Fatalf("reason must not be declared on an identical-schema step; the handler's wrong-lane message fired instead: %q", msg)
+	}
+	if kindAtReject != "invalid_params" || attemptsAtReject == 0 {
+		t.Fatalf("rejection kind/attempts = %q/%d, want invalid_params/>0", kindAtReject, attemptsAtReject)
+	}
+	if reasonRejection.TextResultForLLM != reasonRejection.Error {
+		t.Errorf("rejection must carry the message as the result error too: %q / %q",
+			reasonRejection.TextResultForLLM, reasonRejection.Error)
+	}
+
+	// The payload-shaped submission through the same surfaced tool finalizes:
+	// the step surface itself is correct, only the wrong-lane member is gone.
+	if validSubmission.ResultType != "success" {
+		t.Fatalf("tool-path payload submission = %q (%s), want success", validSubmission.ResultType, validSubmission.TextResultForLLM)
+	}
+	r := resultFromSender(sender)
+	if r.GetOutcome() != "approved" {
+		t.Fatalf("step outcome = %q, want approved", r.GetOutcome())
 	}
 }

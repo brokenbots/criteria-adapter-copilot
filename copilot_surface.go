@@ -70,10 +70,20 @@ func declaredSubmitParamsFor(surface *stepToolSurface) []string {
 //     teaches the step's declared submission surface from the same wire inputs.
 //   - schema-carrying contracts (non-empty schema_json's pinned subset): the
 //     payload member embeds the contract schema wholesale and there is NO
-//     top-level reason member — the payload IS the output. Uniform-schema
-//     steps collapse to the shape; diverging steps branch per distinct schema
-//     (anyOf, so overlapping schemas stay valid for the client side as well).
-//   - untyped-contract steps keep the top-level reason member with a doc that
+//     top-level reason member — the payload IS the output. The reason lane is
+//     derived from the kept contracts themselves: a contract is schemaless
+//     iff its schema_json is EMPTY. The number of DISTINCT payload schemas is
+//     the payload member's shape (uniform collapse vs diverging anyOf), never
+//     an untyped-lane signal — two contracts sharing one schema_json are two
+//     typed contracts, not a step with a reason lane.
+//   - a non-empty but unparseable schema_json counts as schema-carrying (no
+//     top-level reason member) and contributes no payload branch: the surface
+//     cannot present what it cannot parse, and the malformed schema is
+//     flagged at finalize time by the pinned contract gate
+//     (v2.ValidatePayloadSchema -> parseOutcomeSchema returns a pinned issue
+//     that checkContractFinalize rejects in turn).
+//   - untyped-contract steps (at least one empty schema_json) keep the
+//     top-level reason member with a doc that
 //     teaches the real lanes (reason prose is display-only; durable findings
 //     ride comment/payload) — matching the handler, and keeping the KB-263
 //     fold/wrong-lane machinery reachable where it applies.
@@ -108,8 +118,25 @@ func submitSurfaceFromStep(allowed []string, contracts []*v2.OutcomeContract) *s
 	}
 	sort.Strings(enum)
 
+	// The reason lane and the typed-lane wording are derived from the kept
+	// CONTRACTS, not from the distinct-schema count: fewer branches than
+	// contracts happens whenever two contracts share one schema_json (or a
+	// typed contract's schema_json does not parse), and reading that as an
+	// untyped lane wrongly declared top-level `reason` on fully schema-
+	// carrying steps (review 5821523125). Unparseable schema_json is decided
+	// as schema-carrying: it contributes no payload branch (the surface
+	// cannot present what it cannot parse) but forbids the reason lane, and
+	// the pinned contract gate flags the malformed schema at finalize time.
+	hasSchemalessContract := false
+	hasSchemaCarryingContract := false
+	for _, contract := range kept {
+		if len(contract.GetSchemaJson()) == 0 {
+			hasSchemalessContract = true
+		} else {
+			hasSchemaCarryingContract = true
+		}
+	}
 	branches := distinctPayloadSchemas(kept)
-	hasUntypedLane := len(branches) < len(kept)
 	var requiresComment []string
 	allRequireComment := len(kept) > 0
 	for _, contract := range kept {
@@ -133,16 +160,16 @@ func submitSurfaceFromStep(allowed []string, contracts []*v2.OutcomeContract) *s
 		},
 		"payload": payloadParamDescription(branches),
 	}
-	if hasUntypedLane {
-		// At least one outcome is schemaless: the legacy reason lane stays a
-		// declared member — carrying reason prose on a schemaless contract's
+	if hasSchemalessContract {
+		// At least one contract's schema_json is empty: the legacy reason lane
+		// stays a declared member — carrying reason prose on a schemaless contract's
 		// outcome is a correct submission (KB-260) and must never be taught
 		// away. On mixed steps the doc also names the typed lane: there the
 		// payload is the output and a top-level reason is folded in when the
 		// contract's schema requires one, wrong-lane-rejected otherwise.
 		properties["reason"] = map[string]any{
 			"type":        "string",
-			"description": reasonParamDescription(len(branches) > 0),
+			"description": reasonParamDescription(hasSchemaCarryingContract),
 		}
 	}
 
@@ -157,7 +184,7 @@ func submitSurfaceFromStep(allowed []string, contracts []*v2.OutcomeContract) *s
 	}
 	sort.Strings(declared)
 
-	description := stepSurfaceToolDescription(len(branches) > 0, hasUntypedLane)
+	description := stepSurfaceToolDescription(hasSchemaCarryingContract, hasSchemalessContract)
 	params := map[string]any{
 		"type":                 "object",
 		"properties":           properties,
@@ -250,12 +277,16 @@ func commentParamDescription(required bool, requiresComment []string) string {
 }
 
 // reasonParamDescription teaches the reason member on steps with at least one
-// schemaless outcome. On untyped-contract steps reason prose is display-only —
+// schemaless outcome (a contract whose schema_json is empty). On untyped-contract
+// steps reason prose is display-only —
 // the durable surfaces are comment and payload. On mixed steps (some outcomes
 // schema-carrying) the doc must also name the typed lane there: the payload
 // is the output for the typed outcomes, and a top-level reason is folded in
 // when the contract's schema requires one, wrong-lane-rejected otherwise.
-// Neither form may be taught as the workflow-rendered findings lane — that is
+// A typed contract whose schema_json does not parse still counts as
+// schema-carrying, so its coexistence with a schemaless lane uses the mixed
+// wording. Neither form may be taught as the
+// workflow-rendered findings lane — that is
 // the contract-less lane's truth, not a contract-mode step's.
 func reasonParamDescription(mixed bool) string {
 	if mixed {
@@ -327,6 +358,9 @@ func cloneSchemaMap(schema map[string]any) map[string]any {
 // re-declared submit_outcome tool. It teaches the step-declared submission
 // lanes instead of the static description's four-parameter prose: the surface
 // schema (enum, payload shape, comment rule) is the contract for THIS step.
+// Both booleans derive from the step's contracts (not from branch counts): a
+// contract with a non-empty schema_json is typed — even when its schema does
+// not parse and the payload member can therefore not present it.
 func stepSurfaceToolDescription(typed, reasonDeclared bool) string {
 	var b strings.Builder
 	b.WriteString("Finalize the outcome for the current step. Call this exactly once with one of the outcomes in the schema's `outcome` enum below: this step's submission schema is re-declared from the step's finalization contracts, so it declares the required shape — the outcome choice, the `payload` schema per outcome (when any contract declares one, the payload IS the step's output and the findings belong under its declared fields), and the `comment` requirement per outcome. Submit exactly the declared shape; parameters outside this step's declared set are rejected, and failure to call this tool with a valid finalize for the step will fail it.")
@@ -440,7 +474,13 @@ func (s *sessionState) surfaceSessionConfigs() (*copilot.SessionConfig, *copilot
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stepSurface != nil && s.stepSessionConfig != nil {
-		return s.stepSessionConfig, s.stepResumeConfig
+		// ensureStepSurface binds the pair together (stepResumeConfig is
+		// built from the same session config), so a nil stepResumeConfig
+		// alongside a non-nil stepSessionConfig cannot happen; never hand a
+		// nil resume config to a resume call regardless.
+		if s.stepResumeConfig != nil {
+			return s.stepSessionConfig, s.stepResumeConfig
+		}
 	}
 	return s.sessionConfig, s.resumeConfig
 }
