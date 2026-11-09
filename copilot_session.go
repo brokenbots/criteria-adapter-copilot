@@ -395,6 +395,20 @@ func (s *sessionState) swapSession(sess copilotSession) {
 	}
 }
 
+// boundSubmitSurface returns the submit_outcome surface the SDK session is
+// currently bound to (nil = the static lane, KB-391). It is the strict
+// decode's allowlist source of truth: a step surface declares exactly its
+// rendered properties, so top-level reason on a typed step is an
+// unknown-parameter rejection at the decode layer.
+func (s *sessionState) boundSubmitSurface() *stepToolSurface {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stepSurface
+}
+
 // currentSession returns the SDK session currently backing this adapter
 // session. It shares swapSession's eventMu so mid-run swaps (CLI-child
 // restart recovery) cannot race reads from the retry loop, Execute, or close

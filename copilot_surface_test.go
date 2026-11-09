@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -477,5 +478,111 @@ func TestReopenSessionKeepsStepSurfaceBinding(t *testing.T) {
 	}
 	if s.stepSurface != surf {
 		t.Fatal("reopen must preserve the bound surface record")
+	}
+}
+
+// KB-391 scope item 6: on a typed step (payload-schema contract, no top-level
+// reason member on the bound surface) a reason key is rejected at the decode
+// layer as an unknown parameter — schema-level, not handler-level.
+func TestDecodeSubmitOutcomeArgsTypedStepRejectsTopLevelReason(t *testing.T) {
+	allowed, contracts := approvedStep(t)
+	surf := submitSurfaceFromStep(allowed, contracts)
+	if declaredSubmitParamsFor(surf) == nil || slices.Contains(declaredSubmitParamsFor(surf), "reason") {
+		t.Fatalf("typed surface must not declare reason: %v", declaredSubmitParamsFor(surf))
+	}
+
+	args, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: submitOutcomeToolName,
+		Arguments: map[string]any{"outcome": "approved", "reason": "all findings here"}}, surf)
+	if err == nil {
+		t.Fatal("top-level reason on a typed step must be rejected at the decode layer")
+	}
+	var typed *submitArgsDecodeError
+	if !errors.As(err, &typed) {
+		t.Fatalf("err = %T, want *submitArgsDecodeError", err)
+	}
+	if typed.kind != "invalid_params" {
+		t.Errorf("kind = %q, want invalid_params (schema-level, not the handler wrong-lane)", typed.kind)
+	}
+	if !strings.Contains(typed.message, `"reason"`) || !strings.Contains(typed.message, `"payload"`) {
+		t.Errorf("message must name reason as unknown and payload as declared, got %q", typed.message)
+	}
+	if !strings.Contains(typed.message, "payload") || strings.Contains(typed.message, `required \"reason\"`) {
+		t.Errorf("retry guidance must be payload-shape, got %q", typed.message)
+	}
+	if args.Outcome != "" {
+		t.Errorf("no partial decode expected, got %+v", args)
+	}
+
+	// A payload-shaped call decodes cleanly against the surface.
+	if _, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: submitOutcomeToolName,
+		Arguments: map[string]any{"outcome": "approved", "payload": map[string]any{"reason": "findings"}}}, surf); err != nil {
+		t.Errorf("payload-shaped call rejected: %v", err)
+	}
+}
+
+// An untyped-contract step surface still declares reason, so the retry
+// guidance stays the legacy findings-in-reason text.
+func TestDecodeSubmitOutcomeArgsUntypedSurfaceKeepsReasonGuidance(t *testing.T) {
+	surf := submitSurfaceFromStep([]string{"approved"},
+		[]*v2.OutcomeContract{contractTestContract(t, "approved", "", false, false)})
+	if surf == nil || !slices.Contains(declaredSubmitParamsFor(surf), "reason") {
+		t.Fatalf("untyped step surface must declare reason: %+v", surf)
+	}
+	_, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: submitOutcomeToolName,
+		Arguments: map[string]any{"outcome": "approved", "notes": "x"}}, surf)
+	var typed *submitArgsDecodeError
+	if !errors.As(err, &typed) || typed.kind != "invalid_params" {
+		t.Fatalf("err = %v, want invalid_params decode error", err)
+	}
+	if !strings.Contains(typed.message, `"notes"`) || !strings.Contains(typed.message, `"reason"`) {
+		t.Errorf("message must teach the reason member, got %q", typed.message)
+	}
+	if strings.Contains(typed.message, "payload schema members") {
+		t.Errorf("untyped surface guidance must stay reason-shaped, got %q", typed.message)
+	}
+}
+
+// End-to-end: with a typed surface bound to the session, the raw handler
+// reports the reason key as an unknown parameter, records invalid_params, and
+// consumes a finalize attempt; the same session with the static lane accepts
+// the identical call structurally (legacy lane byte-identical).
+func TestHandleSubmitOutcomeRawSurfaceAwareDecode(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+	allowed, contracts := approvedStep(t)
+	if p.ensureStepSurface(context.Background(), s, allowed, contracts) == nil {
+		t.Fatal("typed step must bind")
+	}
+	if fc.createCount != 0 {
+		t.Fatalf("bind must resume (creates=%d)", fc.createCount)
+	}
+
+	res, err := p.handleSubmitOutcomeRaw("adapter-surface", copilot.ToolInvocation{ToolName: submitOutcomeToolName,
+		Arguments: map[string]any{"outcome": "approved", "reason": "findings"}})
+	if err != nil {
+		t.Fatalf("raw handler must return ToolResult, not Go error: %v", err)
+	}
+	if res.ResultType == "success" {
+		t.Fatalf("reason call must fail, got %+v", res)
+	}
+	if !strings.Contains(res.TextResultForLLM, `"reason"`) {
+		t.Errorf("rejection must name the unknown reason param, got %q", res.TextResultForLLM)
+	}
+	s.mu.Lock()
+	kind, attempts := s.finalizeFailureKind, s.finalizeAttempts
+	s.mu.Unlock()
+	if kind != "invalid_params" || attempts != 1 {
+		t.Fatalf("recorded kind/attempts = %q/%d, want invalid_params/1", kind, attempts)
+	}
+}
+
+func TestDeclaredSubmitParamsFor(t *testing.T) {
+	if got := declaredSubmitParamsFor(nil); !reflect.DeepEqual(got, declaredSubmitOutcomeParams) {
+		t.Fatalf("nil surface = %v, want the static declared set", got)
+	}
+	// Same shape, different required-comment config: declared set is stable.
+	surf := submitSurfaceFromStep([]string{"approved"},
+		[]*v2.OutcomeContract{contractTestContract(t, "approved", reasonRequiredSchema, true, false)})
+	if !reflect.DeepEqual(declaredSubmitParamsFor(surf), []string{"comment", "outcome", "payload"}) {
+		t.Fatalf("typed surface declared set = %v", declaredSubmitParamsFor(surf))
 	}
 }

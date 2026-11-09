@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -157,7 +158,7 @@ func (e *submitArgsDecodeError) Error() string { return e.message }
 // lost the reviewer's findings text with no error and no retry signal — and
 // the rejection names the unexpected keys plus the declared set so the model
 // retries with the correct names inside the existing finalize budget.
-func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeArgs, error) {
+func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation, surface *stepToolSurface) (SubmitOutcomeArgs, error) {
 	if invocation.Arguments == nil {
 		return SubmitOutcomeArgs{}, nil
 	}
@@ -165,12 +166,22 @@ func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeAr
 	if err != nil {
 		return SubmitOutcomeArgs{}, fmt.Errorf("submit_outcome arguments could not be encoded: %w", err)
 	}
-	if unexpected := unexpectedSubmitArgsKeys(raw); len(unexpected) > 0 {
+	declared := declaredSubmitParamsFor(surface)
+	if unexpected := unexpectedSubmitArgsKeys(raw, declared); len(unexpected) > 0 {
+		// Retry guidance is surface-aware: on a lane whose surface still
+		// declares reason (static or untyped step) the findings text belongs
+		// in reason; on a typed step the payload schema's declared members
+		// are the submission surface, and there is no top-level reason at all
+		// (KB-391: the reason rejection is schema-level, at this decode).
+		guidance := "the step's findings text belongs in the required \"reason\" parameter."
+		if surface != nil && !slices.Contains(declared, "reason") {
+			guidance = "the payload is this step's output: findings and structured results belong under the declared payload schema members, and no top-level reason parameter exists."
+		}
 		return SubmitOutcomeArgs{}, &submitArgsDecodeError{
 			kind: "invalid_params",
 			message: fmt.Sprintf(
-				"submit_outcome received unknown parameter(s) %s; the declared parameters are %s. Retry with the declared names — the step's findings text belongs in the required \"reason\" parameter.",
-				quoteJoin(unexpected), quoteJoin(declaredSubmitOutcomeParams),
+				"submit_outcome received unknown parameter(s) %s; the declared parameters are %s. Retry with the declared names — %s",
+				quoteJoin(unexpected), quoteJoin(declared), guidance,
 			),
 		}
 	}
@@ -187,16 +198,17 @@ func decodeSubmitOutcomeArgs(invocation copilot.ToolInvocation) (SubmitOutcomeAr
 }
 
 // unexpectedSubmitArgsKeys returns the envelope keys outside the declared
-// parameter set, sorted for a deterministic rejection message. A non-object
-// envelope contributes no names — it is rejected by the struct decode with its
-// own guidance instead.
-func unexpectedSubmitArgsKeys(raw []byte) []string {
+// parameter set (caller-provided: the static declared set or the bound step
+// surface's rendered property names, KB-391), sorted for a deterministic
+// rejection message. A non-object envelope contributes no names — it is
+// rejected by the struct decode with its own guidance instead.
+func unexpectedSubmitArgsKeys(raw []byte, declaredParams []string) []string {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &envelope); err != nil || len(envelope) == 0 {
 		return nil
 	}
-	declared := make(map[string]struct{}, len(declaredSubmitOutcomeParams))
-	for _, key := range declaredSubmitOutcomeParams {
+	declared := make(map[string]struct{}, len(declaredParams))
+	for _, key := range declaredParams {
 		declared[key] = struct{}{}
 	}
 	var unexpected []string
@@ -226,7 +238,13 @@ func quoteJoin(items []string) string {
 // message; a ToolResult — not a Go error — is returned in every case so the
 // model can retry within the same turn.
 func (p *copilotAdapter) handleSubmitOutcomeRaw(adapterSessionID string, invocation copilot.ToolInvocation) (copilot.ToolResult, error) {
-	args, err := decodeSubmitOutcomeArgs(invocation)
+	// The strict decode allowlist is the surface the SDK session is currently
+	// bound to (KB-391): a typed step rejects a top-level reason key here —
+	// schema-level, decode-layer — rather than at the handler's wrong-lane
+	// fold, which remains authoritative only on lanes whose surface declares
+	// reason (static, untyped step).
+	surface := p.getSession(adapterSessionID).boundSubmitSurface()
+	args, err := decodeSubmitOutcomeArgs(invocation, surface)
 	if err != nil {
 		// A rejected call consumed one finalize attempt; the classification is
 		// the typed decode error's kind so operators can distinguish

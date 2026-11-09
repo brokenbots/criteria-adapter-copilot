@@ -1410,7 +1410,7 @@ func TestDecodeSubmitOutcomeArgsRejectsUnknownParams(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: "submit_outcome", Arguments: tc.args})
+			_, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: "submit_outcome", Arguments: tc.args}, nil)
 			var typed *submitArgsDecodeError
 			if !errors.As(err, &typed) {
 				t.Fatalf("err = %T(%v), want *submitArgsDecodeError", err, err)
@@ -1428,10 +1428,10 @@ func TestDecodeSubmitOutcomeArgsRejectsUnknownParams(t *testing.T) {
 
 	// Declared-only and legacy nil envelopes still decode.
 	if _, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: "submit_outcome",
-		Arguments: map[string]any{"outcome": "approved", "reason": "done"}}); err != nil {
+		Arguments: map[string]any{"outcome": "approved", "reason": "done"}}, nil); err != nil {
 		t.Errorf("declared args rejected: %v", err)
 	}
-	if args, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: "submit_outcome"}); err != nil || args.Outcome != "" {
+	if args, err := decodeSubmitOutcomeArgs(copilot.ToolInvocation{ToolName: "submit_outcome"}, nil); err != nil || args.Outcome != "" {
 		t.Errorf("nil envelope: err=%v args=%+v, want zero args and no error", err, args)
 	}
 }
