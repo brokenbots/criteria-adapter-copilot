@@ -272,7 +272,7 @@ func reasonParamDescription(mixed bool) string {
 func payloadParamDescription(branches []surfaceSchemaBranch) map[string]any {
 	if len(branches) == 0 {
 		return map[string]any{
-			"type": "object",
+			"type":        "object",
 			"description": "Optional JSON object payload, forwarded to the workflow verbatim.",
 		}
 	}
@@ -288,7 +288,7 @@ func payloadParamDescription(branches []surfaceSchemaBranch) map[string]any {
 		members[i] = member
 	}
 	return map[string]any{
-		"type": "object",
+		"type":        "object",
 		"description": "Required when the chosen outcome declares it (see the branches): the payload IS the step's output — the findings belong under the payload's declared fields, which are forwarded to the workflow verbatim.",
 		"anyOf":       members,
 	}

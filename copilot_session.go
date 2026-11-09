@@ -209,9 +209,9 @@ type sessionState struct {
 	// is bound so transport recovery preserves the re-declaration. All three
 	// are guarded by mu; reads on the hot path are pointer loads of values
 	// fixed at bind time.
-	stepSurface         *stepToolSurface
-	stepSessionConfig   *copilot.SessionConfig
-	stepResumeConfig    *copilot.ResumeSessionConfig
+	stepSurface       *stepToolSurface
+	stepSessionConfig *copilot.SessionConfig
+	stepResumeConfig  *copilot.ResumeSessionConfig
 
 	// KB-47 repair state. inRepairMode marks a step being re-finalized after a
 	// host ExecutionRejection; inRepairAttempt is the host-provided attempt

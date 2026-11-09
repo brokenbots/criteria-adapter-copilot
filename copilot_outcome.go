@@ -103,17 +103,19 @@ var submitOutcomeParamDocs = map[string][2]string{
 }
 
 // submitOutcomeToolParameters is the static parameter JSON Schema the
-// hand-built submit_outcome tool presents to the model. KB-216: it declares
-// the full parameter contract — additionalProperties false and per-parameter
+// hand-built submit_outcome tool presents to the model on contract-less
+// steps (and before a step surface binds). KB-216: it declares the full
+// parameter contract — additionalProperties false and per-parameter
 // descriptions that say what belongs where — so a call that does not match is
-// a loud rejection instead of a silently-accepted shape. KB-260 re-bind:
-// `outcome` is the only required member (the per-lane universal); reason's
-// requirement is lane-specific (required on contract-less steps — enforced
-// in-turn — and wrong-lane-rejected on typed steps). The enforceable
-// per-step specifics (allowed set, payload schema, require_comment) remain
-// prompt-conveyed and handler-validated, and there is no per-step enum or
-// required list on outcome (SDK tools bind per session), which is what makes
-// per-step contracts possible with a session-bound tool.
+// a loud rejection instead of a silently-accepted shape. `outcome` is the
+// only required member (the per-lane universal); reason's requirement is
+// lane-specific (required on contract-less steps — enforced in-turn — and an
+// unknown parameter at the decode layer on typed steps). KB-391
+// re-declaration: on a step that arrives with outcome contracts the session
+// tool is re-bound FROM those contracts (copilot_surface.go, digest-keyed),
+// so the outcome enum, the payload's schema members, and the required
+// comment member are schema-declared on the bound surface; this static
+// schema is the legacy lane, byte-identical for contract-less steps.
 func submitOutcomeToolParameters() map[string]any {
 	properties := make(map[string]any, len(declaredSubmitOutcomeParams))
 	for _, param := range declaredSubmitOutcomeParams {
