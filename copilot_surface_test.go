@@ -444,6 +444,53 @@ func TestEnsureStepSurfaceRebindsTypedStepViaResume(t *testing.T) {
 	}
 }
 
+func TestEnsureStepSurfaceSameIDResumeDoesNotDestroyConversation(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+	origSession := s.currentSession()
+	allowed, contracts := approvedStep(t)
+
+	if surf := p.ensureStepSurface(context.Background(), s, allowed, contracts); surf == nil {
+		t.Fatal("typed step must bind a step surface")
+	}
+	if len(fc.resumeIDs) == 0 || fc.resumeIDs[0] != origSession.SessionID() {
+		t.Fatalf("test precondition: re-open must resume %q, got %v", origSession.SessionID(), fc.resumeIDs)
+	}
+
+	// KB-396 regression: the re-bind resumes the same SDK session id, so the
+	// superseded wrapper shares the CLI conversation just re-opened. SDK
+	// v1.0.0 Session.Disconnect sends a session.destroy RPC for that id, so
+	// disconnecting the old wrapper destroyed the resumed conversation and
+	// the next send failed with JSON-RPC -32603 "Session not found for
+	// sessionId" against the real copilot CLI (KB-277 contracts suite regressed
+	// 107 ok/0 FAIL → 37 ok/70 FAIL at engine v0.5.59). The fake disconnect is
+	// a local detach, which is why the defect had to be pinned at this seam.
+	if got := origSession.(*fakeSession).disconnectCount; got != 0 {
+		t.Fatalf("superseded same-id session disconnected %d time(s): Disconnect destroys the resumed CLI conversation (KB-396)", got)
+	}
+	if got := s.currentSession().SessionID(); got != origSession.SessionID() {
+		t.Fatalf("re-opened session id %q, want the persisted id %q preserved end to end", got, origSession.SessionID())
+	}
+}
+
+func TestEnsureStepSurfaceFreshCreateDisconnectsReplacedSession(t *testing.T) {
+	p, fc, s := rebindFixture(t)
+	fc.resumeErr = errors.New("resume rejected")
+	origSession := s.currentSession()
+	allowed, contracts := approvedStep(t)
+
+	if surf := p.ensureStepSurface(context.Background(), s, allowed, contracts); surf == nil {
+		t.Fatal("typed step must bind a step surface")
+	}
+	if fc.createCount != 1 {
+		t.Fatalf("creates = %d, want 1 fresh create after a failed resume", fc.createCount)
+	}
+	// The counterpart of the KB-396 guard: a genuinely replaced session
+	// (fresh create, different id) must still be torn down best-effort.
+	if got := origSession.(*fakeSession).disconnectCount; got != 1 {
+		t.Fatalf("genuinely replaced session disconnected %d time(s), want 1", got)
+	}
+}
+
 func TestEnsureStepSurfaceConsecutiveSameShapeCostsNothing(t *testing.T) {
 	p, fc, s := rebindFixture(t)
 

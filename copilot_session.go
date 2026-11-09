@@ -378,19 +378,30 @@ func (s *sessionState) subscribeEvents(h copilot.SessionEventHandler) func() {
 // swapSession atomically replaces the SDK session backing an adapter session
 // after a CLI-child restart and re-attaches the event fanout to the new
 // session, so an in-flight turn keeps receiving events. The replaced session
-// is disconnected best-effort.
+// is disconnected best-effort, but never when it shares the re-opened
+// session's id: SDK v1.0.0 Session.Disconnect sends a session.destroy RPC
+// against that id, so disconnecting the old wrapper would destroy the very
+// CLI-side conversation the re-open (ensureStepSurface per-step re-bind,
+// CRI-272 reopenSession) just resumed, and the next send fails with
+// JSON-RPC -32603 "Session not found for sessionId: <uuid>" against the
+// real copilot CLI (fake-copilot treats Disconnect as a local detach, which
+// is why conformance could not see it).
 func (s *sessionState) swapSession(sess copilotSession) {
 	s.eventMu.Lock()
 	old := s.session
-	if s.fanout != nil {
+	var sameConversation bool
+	if fanout := s.fanout; fanout != nil {
 		if s.eventUnregister != nil {
 			s.eventUnregister()
 		}
-		s.eventUnregister = sess.On(s.fanout.handle)
+		s.eventUnregister = sess.On(fanout.handle)
 	}
 	s.session = sess
-	s.eventMu.Unlock()
 	if old != nil {
+		sameConversation = old.SessionID() == sess.SessionID()
+	}
+	s.eventMu.Unlock()
+	if old != nil && !sameConversation {
 		_ = old.Disconnect()
 	}
 }

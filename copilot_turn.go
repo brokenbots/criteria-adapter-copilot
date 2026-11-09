@@ -753,6 +753,19 @@ func (ts *turnState) failExhausted(s *sessionState, sink adapterhost.ExecuteEven
 	// kept (it is the operator evidence); only the legacy outcome.failure +
 	// failure result are skipped. Without a fallback contract — or with no
 	// contracts at all — today's legacy path is byte-for-byte unchanged.
+	//
+	// KB-396, synthetic-name routing evidence: these two exits plus
+	// fallbackResultEvent were verified untouched by the v0.5.20 merge
+	// (diff 93f49b8^..93f49b8 over copilot_turn.go/copilot_util.go — only the
+	// issue-gated push-boundary pre-flight diagnostic was added, and it never
+	// runs on these direct sends). So the F8b never-finalize viaOutcome flip
+	// ("failure" on v0.5.20 vs "default" on v0.5.19, identical engine
+	// v0.5.59) is not a result-event change: the only adapter delta that can
+	// shift that step is the KB-391 per-step tool-surface declaration, which
+	// changes the model-visible contract on mixed-surface steps. The
+	// v0.5.20 failure-arm routing for an unmapped synthetic name under the
+	// typed surface is therefore intentional re-bind behavior; KB-392's
+	// acceptance comparison should baseline it (KB-396 note).
 	s.mu.Lock()
 	fallbackName := s.fallbackContractName
 	s.mu.Unlock()
